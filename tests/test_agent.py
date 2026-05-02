@@ -258,6 +258,17 @@ def test_select_tool_groups_multiple(mock_llm):
     assert "query_cloud_logs" in names  # core
 
 
+def test_select_tool_groups_dedupes_overlapping_tools(mock_llm):
+    """Tools registered in multiple groups must appear only once when both
+    groups activate. Gemini rejects duplicate function declarations with
+    400 INVALID_ARGUMENT, which previously broke any message hitting both
+    the github and repo groups (e.g. "investigate the github issue ...")."""
+    _, agent = mock_llm
+    tools = agent._select_tool_groups("investigate the github issue with the data service")
+    names = [t.name for t in tools]
+    assert names.count("github_search_issues") == 1
+
+
 def test_select_tool_groups_much_smaller_than_all(mock_llm):
     """Dynamic selection should return significantly fewer tools than ALL_TOOLS."""
     _, agent = mock_llm

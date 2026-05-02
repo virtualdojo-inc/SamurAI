@@ -197,7 +197,13 @@ def _select_tool_groups(message: str, memory_tools: list | None = None) -> list:
             else:
                 selected.extend(group["tools"])
 
-    return selected
+    seen = set()
+    deduped = []
+    for t in selected:
+        if id(t) not in seen:
+            seen.add(id(t))
+            deduped.append(t)
+    return deduped
 
 SYSTEM_PROMPT = (
     "You are SamurAI, a DevOps and CRM assistant in Microsoft Teams. "
