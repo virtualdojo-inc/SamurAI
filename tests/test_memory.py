@@ -544,3 +544,54 @@ def test_extractor_location_defaults_to_us_central1():
         env={"GCP_PROJECT_ID": "vd-test"},  # GCP_LOCATION deliberately omitted
     )
     assert chat_cls.call_args.kwargs.get("location") == "us-central1"
+
+
+# --- ReflectionExecutor store= regression (2026-05-25 incident) ---
+
+
+def _capture_reflection_args(getter_name: str):
+    """Call an extractor and capture how ReflectionExecutor was invoked."""
+    import memory
+
+    chat_cls = MagicMock(return_value="fake-llm-client")
+    fake_store = MagicMock(name="fake-store")
+
+    with (
+        patch.dict(
+            os.environ,
+            {"GCP_PROJECT_ID": "vd-test", "GCP_LOCATION": "us-central1"},
+            clear=False,
+        ),
+        patch("memory.get_memory_store", return_value=fake_store),
+        patch("langchain_google_genai.ChatGoogleGenerativeAI", chat_cls),
+        patch("langmem.create_memory_store_manager") as mock_manager,
+        patch("langmem.ReflectionExecutor") as mock_executor_cls,
+    ):
+        mock_manager.return_value = MagicMock(name="fake-manager")
+        mock_executor_cls.return_value = MagicMock()
+        getattr(memory, getter_name)()
+        assert mock_executor_cls.called, (
+            f"{getter_name} did not call ReflectionExecutor"
+        )
+        return mock_executor_cls.call_args, fake_store
+
+
+def test_background_extractor_passes_store_to_reflection_executor():
+    """Regression: LangMem's ReflectionExecutor needs `store=` even when the
+    underlying manager already has one. Without it every conversation logs
+    "ReflectionExecutor could not resolve store to persist memories to"
+    and no user memories are saved."""
+    call, fake_store = _capture_reflection_args("get_background_extractor")
+    assert call.kwargs.get("store") is fake_store, (
+        f"ReflectionExecutor was called without store=. Args: {call}"
+    )
+
+
+def test_core_extractor_passes_store_to_reflection_executor():
+    call, fake_store = _capture_reflection_args("get_core_extractor")
+    assert call.kwargs.get("store") is fake_store
+
+
+def test_team_extractor_passes_store_to_reflection_executor():
+    call, fake_store = _capture_reflection_args("get_team_extractor")
+    assert call.kwargs.get("store") is fake_store

@@ -518,3 +518,59 @@ def test_update_row_rejects_non_numeric_row_id():
                 "cell_values": {"X": "y"},
             }
         )
+
+
+# --- 404 row-not-found hint (2026-05-25 incident) ---
+
+
+@patch("tools.smartsheet._put")
+@patch("tools.smartsheet._get")
+def test_update_row_404_hints_at_sheet_id_confusion(mock_get, mock_put):
+    """When Smartsheet returns 404 errorCode 1006 (row not found), the
+    re-raised error must explain the two common LLM mistakes (passing
+    sheet_id as row_id, or using the user-facing 'Row ID' column)."""
+    from tools.smartsheet import smartsheet_update_row
+
+    mock_get.return_value = {"data": [{"id": 9001, "title": "Priority"}]}
+    mock_put.side_effect = RuntimeError(
+        'Smartsheet API 404: {"refId":"abc","errorCode":1006,'
+        '"message":"Not Found","detail":{"rowId":1146352141553540}}'
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        smartsheet_update_row.invoke(
+            {
+                "sheet_id": "1146352141553540",
+                "row_id": "1146352141553540",  # sheet_id accidentally used as row_id
+                "cell_values": {"Priority": "High"},
+            }
+        )
+
+    msg = str(exc_info.value)
+    # Hint must call out the sheet_id-as-row_id confusion
+    assert "sheet_id" in msg.lower() and "row_id" in msg.lower()
+    # Hint must explain the Row ID column vs _row_id distinction
+    assert "_row_id" in msg
+    assert "Row ID" in msg
+    # Original error is preserved so the model can still see the raw 404
+    assert "404" in msg
+
+
+@patch("tools.smartsheet._put")
+@patch("tools.smartsheet._get")
+def test_update_row_non_404_errors_pass_through_unchanged(mock_get, mock_put):
+    """Only 404/1006 gets the hint treatment — other errors (auth, rate
+    limit, etc.) propagate as-is so the model doesn't get misleading advice."""
+    from tools.smartsheet import smartsheet_update_row
+
+    mock_get.return_value = {"data": [{"id": 9001, "title": "Priority"}]}
+    mock_put.side_effect = RuntimeError("Smartsheet API 429: rate limited")
+
+    with pytest.raises(RuntimeError, match="429"):
+        smartsheet_update_row.invoke(
+            {
+                "sheet_id": "111",
+                "row_id": "7458800573808516",
+                "cell_values": {"Priority": "High"},
+            }
+        )

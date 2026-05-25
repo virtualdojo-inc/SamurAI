@@ -302,7 +302,11 @@ def get_background_extractor():
                 "Do NOT save trivial information like greetings or routine status checks."
             ),
         )
-        _background_executor = ReflectionExecutor(manager)
+        # LangMem requires store= on ReflectionExecutor explicitly even when
+        # the underlying manager already has one — without this every
+        # [memory.extract] call fails with "ReflectionExecutor could not
+        # resolve store to persist memories to".
+        _background_executor = ReflectionExecutor(manager, store=store)
         logger.info("Background memory extractor ready")
     return _background_executor
 
@@ -344,7 +348,7 @@ def get_core_extractor():
                 "agent session solve similar problems faster."
             ),
         )
-        _core_executor = ReflectionExecutor(manager)
+        _core_executor = ReflectionExecutor(manager, store=store)
         logger.info("Core memory extractor ready")
     return _core_executor
 
@@ -384,7 +388,7 @@ def get_team_extractor():
                 "would benefit from knowing."
             ),
         )
-        _team_executor = ReflectionExecutor(manager)
+        _team_executor = ReflectionExecutor(manager, store=store)
         logger.info("Team memory extractor ready")
     return _team_executor
 

@@ -261,10 +261,34 @@ def smartsheet_update_row(
     if not cells:
         raise RuntimeError("cell_values is empty; nothing to update.")
 
-    return _put(
-        f"/sheets/{sheet_id_str}/rows",
-        json_body=[{"id": row_id_int, "cells": cells}],
-    )
+    try:
+        return _put(
+            f"/sheets/{sheet_id_str}/rows",
+            json_body=[{"id": row_id_int, "cells": cells}],
+        )
+    except RuntimeError as e:
+        # Smartsheet returns 404 with errorCode 1006 ("Not Found") when
+        # the rowId doesn't exist on the sheet. Two common causes:
+        # (a) the LLM passed the sheet_id as row_id by accident, or
+        # (b) the LLM passed the user-facing "Row ID" column value (a
+        # short int displayed in the sheet) instead of `_row_id` (the
+        # 16-digit API ID). Re-raise with an actionable hint.
+        msg = str(e)
+        if "404" in msg and ("1006" in msg or "Not Found" in msg):
+            hint = (
+                f"Smartsheet returned 404 Not Found for row_id={row_id_int} "
+                f"on sheet {sheet_id_str}. The row ID you passed does not "
+                f"exist on this sheet. Common mistakes:\n"
+                f"  - Did you pass the sheet_id ({sheet_id_str}) as the "
+                f"row_id by accident? sheet_id and row_id are different.\n"
+                f"  - Did you pass the user-facing 'Row ID' column value "
+                f"(a small int like 56 or 101)? That's a display value, not "
+                f"the API row ID. Use the `_row_id` field on each row "
+                f"returned by smartsheet_get_sheet — it's a ~16-digit number.\n"
+                f"Original error: {msg}"
+            )
+            raise RuntimeError(hint) from e
+        raise
 
 
 SMARTSHEET_TOOLS = [
