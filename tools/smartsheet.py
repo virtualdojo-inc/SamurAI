@@ -69,6 +69,12 @@ def smartsheet_list_sheets(modified_since: Optional[str] = None) -> dict:
     Returns:
         A dict with `total` (int) and `sheets` (list of {id, name, modified_at,
         access_level, permalink}). Returns at most 100 sheets.
+
+        IDs are returned as STRINGS, not numbers, because Smartsheet sheet
+        IDs are 16-digit 64-bit integers and LLMs lose precision on the last
+        few digits when they appear as JSON numbers. Pass the id back to
+        smartsheet_get_sheet / smartsheet_update_row exactly as it was
+        returned here — do not "clean it up" by converting to an int.
     """
     params: dict = {"pageSize": 100}
     if modified_since:
@@ -76,7 +82,10 @@ def smartsheet_list_sheets(modified_since: Optional[str] = None) -> dict:
     data = _get("/sheets", params=params)
     sheets = [
         {
-            "id": s["id"],
+            # Stringify the ID so the LLM can't accidentally truncate the
+            # 16-digit number. The Smartsheet REST API accepts string IDs
+            # in URL paths, so round-tripping str→URL is safe.
+            "id": str(s["id"]),
             "name": s["name"],
             "modified_at": s.get("modifiedAt"),
             "access_level": s.get("accessLevel"),
@@ -89,14 +98,18 @@ def smartsheet_list_sheets(modified_since: Optional[str] = None) -> dict:
 
 @tool
 def smartsheet_get_sheet(
-    sheet_id: int,
+    sheet_id: str,
     max_rows: int = 100,
     column_names: Optional[list[str]] = None,
 ) -> dict:
     """Read rows from a Smartsheet sheet as compact {column: value} dicts.
 
     Args:
-        sheet_id: The numeric Smartsheet sheet ID (from smartsheet_list_sheets).
+        sheet_id: The Smartsheet sheet ID as a STRING (from
+            smartsheet_list_sheets — pass it through exactly as returned).
+            Smartsheet sheet IDs are 16-digit 64-bit integers; passing them
+            as JSON numbers risks the LLM truncating the last few digits
+            into a 404. Always quote it.
         max_rows: Maximum rows to return (default 100). The sheet may have more;
             check `total_rows` in the response.
         column_names: Optional list of column titles to include. If omitted, all
@@ -105,10 +118,11 @@ def smartsheet_get_sheet(
     Returns:
         A dict with `name`, `total_rows`, `columns` (list of titles in order),
         and `rows` (list of {column_title: display_value, ...}). Each row
-        also includes `_row_id` (the API row ID, required for
+        also includes `_row_id` (string — pass it through verbatim to
         smartsheet_update_row) and `_row_number` (display position).
         Empty cells are omitted from each row dict.
     """
+    sheet_id = str(sheet_id)
     params = {"exclude": "filteredOutRows,nonexistentCells"}
     sheet = _get(f"/sheets/{sheet_id}", params=params)
 
@@ -135,7 +149,9 @@ def smartsheet_get_sheet(
                 continue
             compact[title] = value
         if compact:
-            compact["_row_id"] = row.get("id")
+            # _row_id is stringified for the same reason as sheet_id: LLMs
+            # truncate the last digits of 16-digit numeric IDs in tool calls.
+            compact["_row_id"] = str(row["id"]) if row.get("id") is not None else None
             compact["_row_number"] = row.get("rowNumber")
             rows_out.append(compact)
 
@@ -149,8 +165,8 @@ def smartsheet_get_sheet(
 
 @tool
 def smartsheet_update_row(
-    sheet_id: int,
-    row_id: int,
+    sheet_id: str,
+    row_id: str,
     cell_values: dict,
 ) -> dict:
     """Update one or more cells on a single existing Smartsheet row.
@@ -170,11 +186,13 @@ def smartsheet_update_row(
     4. Read back with smartsheet_get_sheet to verify the change landed.
 
     Args:
-        sheet_id: The numeric Smartsheet sheet ID.
-        row_id: The numeric API row ID to update — the `_row_id` field on
-            the row returned by smartsheet_get_sheet. Do NOT pass the
-            user-facing "Row ID" column or `_row_number` — those are
-            display values, not the API ID.
+        sheet_id: The Smartsheet sheet ID as a STRING (from
+            smartsheet_list_sheets). Always quote it — LLMs lose precision
+            on 16-digit numeric IDs and produce 404s.
+        row_id: The API row ID as a STRING — the `_row_id` field on the
+            row returned by smartsheet_get_sheet. Pass it through verbatim.
+            Do NOT pass the user-facing "Row ID" column or `_row_number` —
+            those are display values, not the API ID.
         cell_values: Mapping of column title -> new cell value. Column
             titles are matched against the live sheet; unknown titles
             raise (with the available titles listed) rather than silently
@@ -188,7 +206,21 @@ def smartsheet_update_row(
         A dict with `message` ("SUCCESS" on success), `resultCode`, and
         the updated row payload from Smartsheet.
     """
-    cols = _get(f"/sheets/{sheet_id}/columns", params={"includeAll": "true"})
+    # Normalize the IDs at the boundary. The LLM-facing signature is str
+    # (precision protection) but Smartsheet's JSON body expects an integer
+    # `id` field. Python ints have unlimited precision, so str -> int is
+    # lossless inside the process.
+    sheet_id_str = str(sheet_id)
+    try:
+        row_id_int = int(str(row_id))
+    except ValueError:
+        raise RuntimeError(
+            f"row_id must be a numeric ID (got {row_id!r}). Pass the _row_id "
+            f"field from smartsheet_get_sheet verbatim — not the user-facing "
+            f"'Row ID' column."
+        )
+
+    cols = _get(f"/sheets/{sheet_id_str}/columns", params={"includeAll": "true"})
     col_by_title = {c["title"]: c["id"] for c in cols.get("data", [])}
 
     # Build a normalized index for fuzzy matching. Ambiguous normalized keys
@@ -229,7 +261,10 @@ def smartsheet_update_row(
     if not cells:
         raise RuntimeError("cell_values is empty; nothing to update.")
 
-    return _put(f"/sheets/{sheet_id}/rows", json_body=[{"id": row_id, "cells": cells}])
+    return _put(
+        f"/sheets/{sheet_id_str}/rows",
+        json_body=[{"id": row_id_int, "cells": cells}],
+    )
 
 
 SMARTSHEET_TOOLS = [

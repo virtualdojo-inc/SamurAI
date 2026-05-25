@@ -85,7 +85,9 @@ def test_list_sheets_returns_compact_records(mock_get):
     assert result["total"] == 2
     assert len(result["sheets"]) == 2
     first = result["sheets"][0]
-    assert first["id"] == 111
+    # IDs are STRINGIFIED to prevent LLM precision loss on 16-digit IDs.
+    assert first["id"] == "111"
+    assert isinstance(first["id"], str)
     assert first["name"] == "Issue Tracker"
     assert first["modified_at"] == "2026-05-20T12:00:00Z"
     assert first["access_level"] == "OWNER"
@@ -113,7 +115,7 @@ def test_get_sheet_returns_compact_rows(mock_get):
     from tools.smartsheet import smartsheet_get_sheet
 
     mock_get.return_value = _sheet_detail_payload()
-    result = smartsheet_get_sheet.invoke({"sheet_id": 111})
+    result = smartsheet_get_sheet.invoke({"sheet_id": "111"})
 
     assert result["name"] == "Issue Tracker"
     assert result["total_rows"] == 3
@@ -137,7 +139,7 @@ def test_get_sheet_column_filter(mock_get):
 
     mock_get.return_value = _sheet_detail_payload()
     result = smartsheet_get_sheet.invoke(
-        {"sheet_id": 111, "column_names": ["Priority", "Status"]}
+        {"sheet_id": "111", "column_names": ["Priority", "Status"]}
     )
 
     assert result["columns"] == ["Priority", "Status"]
@@ -150,7 +152,7 @@ def test_get_sheet_respects_max_rows(mock_get):
     from tools.smartsheet import smartsheet_get_sheet
 
     mock_get.return_value = _sheet_detail_payload()
-    result = smartsheet_get_sheet.invoke({"sheet_id": 111, "max_rows": 1})
+    result = smartsheet_get_sheet.invoke({"sheet_id": "111", "max_rows": 1})
 
     assert len(result["rows"]) == 1
     assert result["rows"][0]["_row_number"] == 1
@@ -161,7 +163,7 @@ def test_get_sheet_excludes_nonexistent_cells(mock_get):
     from tools.smartsheet import smartsheet_get_sheet
 
     mock_get.return_value = _sheet_detail_payload()
-    smartsheet_get_sheet.invoke({"sheet_id": 111})
+    smartsheet_get_sheet.invoke({"sheet_id": "111"})
 
     path, kwargs = mock_get.call_args.args[0], mock_get.call_args.kwargs
     assert path == "/sheets/111"
@@ -236,8 +238,8 @@ def test_update_row_resolves_column_titles_to_ids(mock_get, mock_put):
 
     result = smartsheet_update_row.invoke(
         {
-            "sheet_id": 111,
-            "row_id": 7777,
+            "sheet_id": "111",
+            "row_id": "7777",
             "cell_values": {"Priority": "High", "Status": "In Progress"},
         }
     )
@@ -261,8 +263,8 @@ def test_update_row_rejects_unknown_column(mock_get):
     with pytest.raises(RuntimeError, match="Unknown column titles"):
         smartsheet_update_row.invoke(
             {
-                "sheet_id": 111,
-                "row_id": 7777,
+                "sheet_id": "111",
+                "row_id": "7777",
                 "cell_values": {"NotARealColumn": "x"},
             }
         )
@@ -276,7 +278,7 @@ def test_update_row_rejects_empty_cell_values(mock_get):
 
     with pytest.raises(RuntimeError, match="nothing to update"):
         smartsheet_update_row.invoke(
-            {"sheet_id": 111, "row_id": 7777, "cell_values": {}}
+            {"sheet_id": "111", "row_id": "7777", "cell_values": {}}
         )
 
 
@@ -301,8 +303,8 @@ def test_update_row_fuzzy_matches_python_identifier_style(mock_get, mock_put):
 
     result = smartsheet_update_row.invoke(
         {
-            "sheet_id": 111,
-            "row_id": 7777,
+            "sheet_id": "111",
+            "row_id": "7777",
             "cell_values": {"Github_Issue_No": "#711"},
         }
     )
@@ -324,8 +326,8 @@ def test_update_row_fuzzy_matches_extra_quotes(mock_get, mock_put):
 
     smartsheet_update_row.invoke(
         {
-            "sheet_id": 111,
-            "row_id": 7777,
+            "sheet_id": "111",
+            "row_id": "7777",
             "cell_values": {'"Github Issue No"': "#711"},
         }
     )
@@ -343,7 +345,7 @@ def test_update_row_fuzzy_matches_lowercase(mock_get, mock_put):
     mock_put.return_value = {"message": "SUCCESS"}
 
     smartsheet_update_row.invoke(
-        {"sheet_id": 111, "row_id": 7777, "cell_values": {"github issue no": "#711"}}
+        {"sheet_id": "111", "row_id": "7777", "cell_values": {"github issue no": "#711"}}
     )
 
     body = mock_put.call_args.kwargs["json_body"]
@@ -366,8 +368,8 @@ def test_update_row_rejects_ambiguous_normalized_match(mock_get):
     with pytest.raises(RuntimeError, match="matched multiple columns"):
         smartsheet_update_row.invoke(
             {
-                "sheet_id": 111,
-                "row_id": 7777,
+                "sheet_id": "111",
+                "row_id": "7777",
                 "cell_values": {"Github_Issue_No": "#711"},
             }
         )
@@ -389,11 +391,130 @@ def test_update_row_exact_match_still_wins_when_present(mock_get, mock_put):
 
     smartsheet_update_row.invoke(
         {
-            "sheet_id": 111,
-            "row_id": 7777,
+            "sheet_id": "111",
+            "row_id": "7777",
             "cell_values": {"Github_Issue_No": "#711"},
         }
     )
 
     body = mock_put.call_args.kwargs["json_body"]
     assert body[0]["cells"][0]["columnId"] == 9001  # exact match wins
+
+
+# --- 16-digit-ID precision protection (Devin May 25 incident) ---
+
+
+@patch("tools.smartsheet._get")
+def test_list_sheets_returns_ids_as_strings(mock_get):
+    """16-digit Smartsheet IDs must be returned as strings, not numbers.
+
+    Devin's May 25 session: smartsheet_list_sheets returned ID
+    1146352141553540 as a JSON number, the LLM transcribed it as
+    1146352141553536 on the next tool call (last 3 digits corrupted),
+    Smartsheet returned 404. Stringifying defends against this.
+    """
+    from tools.smartsheet import smartsheet_list_sheets
+
+    mock_get.return_value = {
+        "totalCount": 1,
+        "data": [
+            {
+                "id": 1146352141553540,  # the actual DH Tech tracker ID
+                "name": "Issue Tracker DH Tech",
+                "accessLevel": "EDITOR_SHARE",
+                "modifiedAt": "2026-05-25T12:00:00Z",
+                "permalink": "https://app.smartsheet.com/sheets/xyz",
+            }
+        ],
+    }
+    result = smartsheet_list_sheets.invoke({})
+    sheet = result["sheets"][0]
+
+    assert isinstance(sheet["id"], str)
+    # The exact 16 digits must round-trip — no precision loss
+    assert sheet["id"] == "1146352141553540"
+
+
+@patch("tools.smartsheet._get")
+def test_get_sheet_accepts_string_sheet_id(mock_get):
+    """The LLM-facing signature is str. Passing the ID as a string must
+    work end-to-end — that's the whole point."""
+    from tools.smartsheet import smartsheet_get_sheet
+
+    mock_get.return_value = {
+        "name": "X",
+        "totalRowCount": 0,
+        "columns": [],
+        "rows": [],
+    }
+    smartsheet_get_sheet.invoke({"sheet_id": "1146352141553540"})
+
+    # The URL must contain the exact 16-digit ID — not 1.14635214155354e+15
+    # or any other scientific-notation / float-rounded variant.
+    called_path = mock_get.call_args.args[0]
+    assert called_path == "/sheets/1146352141553540"
+
+
+@patch("tools.smartsheet._get")
+def test_get_sheet_stringifies_row_ids_in_output(mock_get):
+    """Row IDs are also 16-digit ints — must be stringified too so the LLM
+    can pass them to smartsheet_update_row without precision loss."""
+    from tools.smartsheet import smartsheet_get_sheet
+
+    mock_get.return_value = {
+        "name": "X",
+        "totalRowCount": 1,
+        "columns": [{"id": 1, "title": "A"}],
+        "rows": [
+            {
+                "id": 7458800573808516,
+                "rowNumber": 1,
+                "cells": [{"columnId": 1, "value": "hi", "displayValue": "hi"}],
+            }
+        ],
+    }
+    result = smartsheet_get_sheet.invoke({"sheet_id": "111"})
+    row = result["rows"][0]
+    assert isinstance(row["_row_id"], str)
+    assert row["_row_id"] == "7458800573808516"
+
+
+@patch("tools.smartsheet._put")
+@patch("tools.smartsheet._get")
+def test_update_row_accepts_16_digit_string_ids_round_trip(mock_get, mock_put):
+    """Pass the IDs through as strings end-to-end; the JSON body to
+    Smartsheet must carry the exact same digits."""
+    from tools.smartsheet import smartsheet_update_row
+
+    mock_get.return_value = {"data": [{"id": 9001, "title": "Priority"}]}
+    mock_put.return_value = {"message": "SUCCESS"}
+
+    smartsheet_update_row.invoke(
+        {
+            "sheet_id": "1146352141553540",
+            "row_id": "7458800573808516",
+            "cell_values": {"Priority": "High"},
+        }
+    )
+
+    # URL has the sheet_id verbatim
+    assert mock_put.call_args.args[0] == "/sheets/1146352141553540/rows"
+    # Body has the row_id as an int with no precision loss — Python int
+    # is arbitrary-precision so str -> int -> JSON round-trips losslessly
+    body = mock_put.call_args.kwargs["json_body"]
+    assert body[0]["id"] == 7458800573808516
+
+
+def test_update_row_rejects_non_numeric_row_id():
+    """A row_id that isn't a numeric string is almost certainly the
+    user-facing 'Row ID' column or something else wrong — fail loud."""
+    from tools.smartsheet import smartsheet_update_row
+
+    with pytest.raises(RuntimeError, match="numeric ID"):
+        smartsheet_update_row.invoke(
+            {
+                "sheet_id": "111",
+                "row_id": "not-a-number",
+                "cell_values": {"X": "y"},
+            }
+        )
