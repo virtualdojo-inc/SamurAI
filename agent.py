@@ -48,6 +48,12 @@ from tools.repo_sync import REPO_SYNC_TOOLS
 from tools.investigate import INVESTIGATE_TOOLS
 from tools.troubleshooting import TROUBLESHOOTING_TOOLS
 from tools.file_handler import FILE_HANDLER_TOOLS
+from tools.progress import (
+    PROGRESS_TOOLS,
+    clear_progress,
+    get_progress,
+    render_progress_markdown,
+)
 from verification import (
     verification_node,
     should_verify,
@@ -67,6 +73,7 @@ TOOL_GROUPS = {
             check_gcp_metrics,
             gcp_billing_summary,
             google_search,
+            *PROGRESS_TOOLS,
         ],
         "keywords": [],  # Always loaded
     },
@@ -222,6 +229,20 @@ SYSTEM_PROMPT = (
     "Do NOT refine filters or make follow-up queries unless the user asks.\n"
     "- Do NOT explicitly search or save to memory during routine queries — "
     "memory retrieval and extraction happen automatically in the background.\n\n"
+    "PROGRESS TRACKING for multi-step work:\n"
+    "- For any task that involves more than ~3 sequential tool calls or "
+    "naturally breaks into discrete steps, call `update_progress` at the "
+    "start with your plan (summary + pending items), and again after each "
+    "major step to mark items completed and update what's in_progress.\n"
+    "- This is the user's live view of what you're doing AND your recovery "
+    "net: if you hit a tool-call limit, the progress doc becomes your "
+    "summary and lets the user say 'continue' to resume cleanly. If you "
+    "never call it, the user gets a generic 'I gathered info' message.\n"
+    "- SKIP for trivial one-shot queries (single log query, list PRs, send "
+    "one message, look up one CRM record). Overhead isn't worth it.\n"
+    "- If the user's message says 'continue' / 'resume' / 'keep going' and "
+    "the system has injected a prior plan into context, pick up from "
+    "the in_progress / pending items — do NOT redo completed work.\n\n"
     "FILE HANDLING:\n"
     "When a user uploads a file and asks you to fill in, edit, or modify it:\n"
     "1. Use get_spreadsheet_info to understand the structure.\n"
@@ -735,6 +756,108 @@ def _extract_text(content) -> str:
     return content
 
 
+_CONTINUE_KEYWORDS = (
+    "continue", "resume", "keep going", "pick up", "carry on",
+    "where were you", "where were we", "go on",
+)
+
+
+def _is_continue_intent(message: str) -> bool:
+    """Detect whether the user's message is a request to resume prior work.
+
+    Exact-token match against a short keyword list — substring matching
+    would hit false positives ("continue" inside "continuous"). Long
+    messages (>40 chars) never match; those are real requests, not resumes.
+    """
+    if not message:
+        return False
+    stripped = message.strip().lower().rstrip(".!?")
+    if len(stripped) > 40:
+        return False
+    return stripped in _CONTINUE_KEYWORDS
+
+
+async def _synthesize_partial_findings(
+    user_message: str,
+    tool_log: list[str],
+    progress: dict | None,
+    reason: str,
+) -> str:
+    """Generate a real recovery message when the agent ran out of tool calls.
+
+    Fires a single Flash-Lite call in a fresh context (no tools, no history)
+    with the original user question, the agent's self-reported progress
+    doc (if any), and the tool log as supporting evidence. Returns a
+    natural-language summary citing what was found, what's pending, and
+    asking if the user wants to continue.
+
+    Mirrors verification.py's design — separate client, fresh context,
+    single shot. Verifier catches fabrications; this one fills gaps.
+    """
+    synth_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash-lite", **_GCP_KWARGS
+    )
+
+    log_tail = "\n".join(tool_log[-30:]) if tool_log else "(no tools called)"
+    progress_block = (
+        f"\nThe agent's self-reported plan at the time of stopping:\n"
+        f"{render_progress_markdown(progress)}\n"
+        if progress
+        else ""
+    )
+
+    reason_line = {
+        "recursion_limit": "Ran out of tool-call budget before finishing.",
+        "empty_response": "Finished the tool work but didn't generate a reply.",
+    }.get(reason, "Stopped without a reply.")
+
+    prompt = (
+        "You are summarizing a partial agent investigation for a user on "
+        "Microsoft Teams. The agent stopped before producing a response — "
+        f"{reason_line}\n\n"
+        "Write a reply under 200 words that:\n"
+        "1. Names the concrete things that were found (cite specifics from "
+        "the tool log — issue numbers, file paths, row IDs).\n"
+        "2. Names what's still uncertain or unfinished.\n"
+        "3. Asks if the user wants to continue, or suggests a more focused "
+        "follow-up question they could ask.\n\n"
+        "Ground every specific claim in the tool log or the plan below. "
+        "Do not invent details. If the data is too thin for a real summary, "
+        "say so plainly.\n\n"
+        f"User's original question:\n{user_message}\n"
+        f"{progress_block}\n"
+        f"Tool calls made (most recent {min(len(tool_log), 30)} of "
+        f"{len(tool_log)}):\n{log_tail}"
+    )
+
+    try:
+        response = await synth_llm.ainvoke([SystemMessage(content=prompt)])
+        text = _extract_text(response.content)
+        return text.strip() if text else ""
+    except Exception as e:
+        logger.warning("[run_agent] synthesizer call failed: %s", e)
+        return ""
+
+
+def _generic_recovery_message(progress: dict | None) -> str:
+    """Fallback recovery message when the synthesizer can't be reached.
+
+    Better than the legacy generic line because it at least surfaces the
+    agent's self-reported plan if one exists.
+    """
+    if progress:
+        rendered = render_progress_markdown(progress)
+        return (
+            "I hit my tool-call limit before finishing. Here's where I was:\n\n"
+            f"{rendered}\n\n"
+            "Say **continue** to resume from here."
+        )
+    return (
+        "I've gathered a lot of information but hit my tool call limit. "
+        "Here's what I have so far — ask me to continue if you need more detail."
+    )
+
+
 async def run_agent(
     user_message: str,
     conversation_id: str = "default",
@@ -767,6 +890,21 @@ async def run_agent(
             )
         except Exception:
             context_parts.append(f"Timezone: {user_timezone}")
+
+    # If this is a continue/resume request AND we have a prior plan for this
+    # conversation, inject the plan into the message so the agent picks up
+    # from where it stopped instead of asking "continue what?"
+    resumed_from_plan = False
+    if _is_continue_intent(user_message):
+        prior = get_progress(conversation_id)
+        if prior:
+            user_message = (
+                f"{user_message}\n\n"
+                f"[Resuming the prior plan — pick up from in_progress / pending "
+                f"items, do NOT redo completed work]\n"
+                f"{render_progress_markdown(prior)}"
+            )
+            resumed_from_plan = True
 
     message = user_message
     if is_background_task:
@@ -903,6 +1041,8 @@ async def run_agent(
         "smartsheet_list_sheets": "Listing Smartsheets",
         "smartsheet_get_sheet": "Reading Smartsheet rows",
         "smartsheet_update_row": "Updating Smartsheet row",
+        # Progress tracking
+        "update_progress": "Updating plan",
     }
 
     final_messages = []
@@ -911,12 +1051,16 @@ async def run_agent(
     _tool_call_log: list[str] = []  # Track tool calls for memory extraction
     _tools_invoked: list[str] = []  # Tool names the agent asked to run this call
     _teams_recipients: list[str] = []  # Emails send_teams_message targeted
+    _hit_recursion_limit = False  # Set if GraphRecursionError fires
 
-    async for event in graph.astream(
+    from langgraph.errors import GraphRecursionError
+
+    try:
+      async for event in graph.astream(
         {"messages": [HumanMessage(content=message)]},
         config=config,
         stream_mode="updates",
-    ):
+      ):
         # event is a dict like {"agent": {"messages": [...]}} or {"tools": {"messages": [...]}}
         if "agent" in event:
             final_messages = event["agent"].get("messages", [])
@@ -949,6 +1093,19 @@ async def run_agent(
                             except Exception:
                                 pass
 
+                        # Surface the plan to the user the moment the agent
+                        # commits to it, not after update_progress returns.
+                        # The args ARE the plan — we don't need the result.
+                        for tc in last_msg.tool_calls:
+                            if tc.get("name") != "update_progress":
+                                continue
+                            try:
+                                rendered = render_progress_markdown(tc.get("args") or {})
+                                if rendered:
+                                    await status_callback(rendered)
+                            except Exception:
+                                pass
+
         elif "tools" in event:
             final_messages = event["tools"].get("messages", [])
 
@@ -978,23 +1135,57 @@ async def run_agent(
                         )
                     except Exception:
                         pass
+    except GraphRecursionError as e:
+        # The agent hit the hard tool-call limit. Don't propagate — we have
+        # _tool_call_log and the progress doc in scope and can produce a real
+        # recovery message. Without this catch the error escapes to app.py
+        # where the log is no longer accessible.
+        _hit_recursion_limit = True
+        logger.warning(
+            "[run_agent] GraphRecursionError after %d tool calls — synthesizing recovery",
+            len(_tool_call_log),
+        )
+        print(
+            f"[run_agent] recursion_limit_hit conv={conversation_id} "
+            f"tools={len(_tool_call_log)} err={type(e).__name__}",
+            flush=True,
+        )
 
     elapsed = time.time() - start
     logger.info("[run_agent] user=%s elapsed=%.2fs", user_name or user_id, elapsed)
 
-    if not final_messages:
+    response_text = ""
+    if final_messages:
+        response_text = _extract_text(final_messages[-1].content) or ""
+
+    # If the agent hit the recursion limit OR ended with an empty AIMessage
+    # (tool calls but no text), synthesize a real recovery reply from the
+    # tool log + progress doc instead of returning the legacy generic line.
+    # Env-gated: SAMURAI_SYNTHESIZE_ON_LIMIT=off skips synth and uses the
+    # plain fallback (which still includes the plan if one exists).
+    needs_recovery = _hit_recursion_limit or not (response_text or "").strip()
+    if needs_recovery:
+        progress_entry = get_progress(conversation_id)
+        synth_enabled = (
+            os.environ.get("SAMURAI_SYNTHESIZE_ON_LIMIT", "on").lower() != "off"
+        )
+        if synth_enabled and (progress_entry or _tool_call_log):
+            response_text = await _synthesize_partial_findings(
+                user_message=user_message,
+                tool_log=_tool_call_log,
+                progress=progress_entry,
+                reason="recursion_limit" if _hit_recursion_limit else "empty_response",
+            )
+        if not (response_text or "").strip():
+            response_text = _generic_recovery_message(progress_entry)
+    else:
+        # The agent completed successfully — clear the conversation's
+        # progress so a stale plan doesn't haunt the next turn.
+        clear_progress(conversation_id)
+
+    if not response_text:
         logger.error("[run_agent] empty messages in result for thread=%s", conversation_id)
         return "I wasn't able to generate a response. Please try again."
-
-    response_text = _extract_text(final_messages[-1].content)
-
-    # If the agent hit the iteration limit, the last message may have tool calls
-    # but no text. Provide a fallback response.
-    if not response_text or not response_text.strip():
-        response_text = (
-            "I've gathered a lot of information but hit my tool call limit. "
-            "Here's what I have so far — ask me to continue if you need more detail."
-        )
 
     # Background memory extraction — auto-saves facts from conversation
     try:
