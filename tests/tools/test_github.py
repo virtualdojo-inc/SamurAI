@@ -368,3 +368,22 @@ def test_search_issues_state_filter(mock_gh):
         "query"
     ) or mock_gh.return_value.search_issues.call_args.args[0]
     assert "state:closed" in query_arg
+
+
+@patch("tools.github._github")
+def test_search_issues_handles_paginated_list_index_error(mock_gh):
+    """PyGitHub's PaginatedList raises IndexError on the empty case when sliced
+    (not []) — caught Devin's Monday session where 10 parallel searches all
+    crashed with 'list index out of range' for queries returning zero results."""
+    from tools.github import github_search_issues
+
+    paginated = MagicMock()
+    paginated.__getitem__ = MagicMock(side_effect=IndexError("list index out of range"))
+    mock_gh.return_value.search_issues.return_value = paginated
+
+    out = github_search_issues.invoke(
+        {"query": "nothing matches this", "repo": "Quote-ly/quotely-data-service"}
+    )
+    assert "No issues" in out
+    assert "IndexError" not in out
+    assert "list index out of range" not in out

@@ -278,3 +278,122 @@ def test_update_row_rejects_empty_cell_values(mock_get):
         smartsheet_update_row.invoke(
             {"sheet_id": 111, "row_id": 7777, "cell_values": {}}
         )
+
+
+# --- Column-title fuzzy matching (2026-05 Devin incident) ---
+
+
+@patch("tools.smartsheet._put")
+@patch("tools.smartsheet._get")
+def test_update_row_fuzzy_matches_python_identifier_style(mock_get, mock_put):
+    """Gemini keeps formatting 'Github Issue No' as 'Github_Issue_No' (Python
+    identifier style) and getting Unknown-column errors. Fuzzy match should
+    rescue these and route to the correct column."""
+    from tools.smartsheet import smartsheet_update_row
+
+    mock_get.return_value = {
+        "data": [
+            {"id": 9001, "title": "Github Issue No"},
+            {"id": 9002, "title": "Priority"},
+        ]
+    }
+    mock_put.return_value = {"message": "SUCCESS", "resultCode": 0}
+
+    result = smartsheet_update_row.invoke(
+        {
+            "sheet_id": 111,
+            "row_id": 7777,
+            "cell_values": {"Github_Issue_No": "#711"},
+        }
+    )
+
+    assert result["message"] == "SUCCESS"
+    body = mock_put.call_args.kwargs["json_body"]
+    assert body[0]["cells"][0]["columnId"] == 9001
+    assert body[0]["cells"][0]["value"] == "#711"
+
+
+@patch("tools.smartsheet._put")
+@patch("tools.smartsheet._get")
+def test_update_row_fuzzy_matches_extra_quotes(mock_get, mock_put):
+    """Model sometimes wraps the title in extra quotes: '\"Github Issue No\"'."""
+    from tools.smartsheet import smartsheet_update_row
+
+    mock_get.return_value = {"data": [{"id": 9001, "title": "Github Issue No"}]}
+    mock_put.return_value = {"message": "SUCCESS"}
+
+    smartsheet_update_row.invoke(
+        {
+            "sheet_id": 111,
+            "row_id": 7777,
+            "cell_values": {'"Github Issue No"': "#711"},
+        }
+    )
+
+    body = mock_put.call_args.kwargs["json_body"]
+    assert body[0]["cells"][0]["columnId"] == 9001
+
+
+@patch("tools.smartsheet._put")
+@patch("tools.smartsheet._get")
+def test_update_row_fuzzy_matches_lowercase(mock_get, mock_put):
+    from tools.smartsheet import smartsheet_update_row
+
+    mock_get.return_value = {"data": [{"id": 9001, "title": "Github Issue No"}]}
+    mock_put.return_value = {"message": "SUCCESS"}
+
+    smartsheet_update_row.invoke(
+        {"sheet_id": 111, "row_id": 7777, "cell_values": {"github issue no": "#711"}}
+    )
+
+    body = mock_put.call_args.kwargs["json_body"]
+    assert body[0]["cells"][0]["columnId"] == 9001
+
+
+@patch("tools.smartsheet._get")
+def test_update_row_rejects_ambiguous_normalized_match(mock_get):
+    """If two columns normalize to the same form, the fuzzy match must NOT
+    silently pick one — that would corrupt the wrong column."""
+    from tools.smartsheet import smartsheet_update_row
+
+    mock_get.return_value = {
+        "data": [
+            {"id": 9001, "title": "Github Issue No"},
+            {"id": 9002, "title": "GITHUBISSUENO"},  # normalizes to same form
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match="matched multiple columns"):
+        smartsheet_update_row.invoke(
+            {
+                "sheet_id": 111,
+                "row_id": 7777,
+                "cell_values": {"Github_Issue_No": "#711"},
+            }
+        )
+
+
+@patch("tools.smartsheet._put")
+@patch("tools.smartsheet._get")
+def test_update_row_exact_match_still_wins_when_present(mock_get, mock_put):
+    """Exact title should always be preferred — fuzzy match is a fallback."""
+    from tools.smartsheet import smartsheet_update_row
+
+    mock_get.return_value = {
+        "data": [
+            {"id": 9001, "title": "Github_Issue_No"},  # exact match
+            {"id": 9002, "title": "Github Issue No"},  # fuzzy match
+        ]
+    }
+    mock_put.return_value = {"message": "SUCCESS"}
+
+    smartsheet_update_row.invoke(
+        {
+            "sheet_id": 111,
+            "row_id": 7777,
+            "cell_values": {"Github_Issue_No": "#711"},
+        }
+    )
+
+    body = mock_put.call_args.kwargs["json_body"]
+    assert body[0]["cells"][0]["columnId"] == 9001  # exact match wins

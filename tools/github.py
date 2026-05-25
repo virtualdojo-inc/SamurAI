@@ -213,8 +213,17 @@ def github_search_issues(
     except Exception as e:
         return f"Search failed: {type(e).__name__}: {e}"
 
+    # PyGitHub's PaginatedList raises IndexError on the empty case when
+    # sliced (rather than returning []). Catch it and treat as "no
+    # matches" — otherwise every zero-result search crashes with
+    # "list index out of range".
+    try:
+        issues = list(results[:count])
+    except IndexError:
+        issues = []
+
     lines = []
-    for issue in results[:count]:
+    for issue in issues:
         labels = ", ".join(l.name for l in issue.labels) if issue.labels else "none"
         kind = "PR" if issue.pull_request is not None else "issue"
         lines.append(

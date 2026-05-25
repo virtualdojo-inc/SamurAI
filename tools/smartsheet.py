@@ -9,6 +9,18 @@ from langchain_core.tools import tool
 _API_BASE = "https://api.smartsheet.com/2.0"
 
 
+def _normalize_col(title: str) -> str:
+    """Collapse a column title to alphanumerics + lowercase.
+
+    Smartsheet column titles often contain spaces ("Github Issue No"), but
+    LLMs reliably try to call them with Python-identifier formatting
+    ("Github_Issue_No") or quoted-string formatting (`'"Github Issue No"'`).
+    Normalizing both sides to alphanumerics lets the model use whichever
+    form comes naturally.
+    """
+    return "".join(c.lower() for c in title if c.isalnum())
+
+
 def _token() -> str:
     tok = os.environ.get("SMARTSHEET_API_TOKEN")
     if not tok:
@@ -166,7 +178,11 @@ def smartsheet_update_row(
         cell_values: Mapping of column title -> new cell value. Column
             titles are matched against the live sheet; unknown titles
             raise (with the available titles listed) rather than silently
-            no-op. Pass only the cells you want to change.
+            no-op. Pass only the cells you want to change. Titles are
+            matched flexibly — "Github Issue No", "Github_Issue_No", and
+            "github issue no" all resolve to the same column — but the
+            EXACT title from smartsheet_get_sheet is always safest. Do
+            not wrap the title in extra quotes.
 
     Returns:
         A dict with `message` ("SUCCESS" on success), `resultCode`, and
@@ -175,14 +191,36 @@ def smartsheet_update_row(
     cols = _get(f"/sheets/{sheet_id}/columns", params={"includeAll": "true"})
     col_by_title = {c["title"]: c["id"] for c in cols.get("data", [])}
 
+    # Build a normalized index for fuzzy matching. Ambiguous normalized keys
+    # (two columns that collapse to the same form) are recorded but not
+    # used — those must be passed by exact title.
+    norm_index: dict[str, list[int]] = {}
+    for title, cid in col_by_title.items():
+        norm_index.setdefault(_normalize_col(title), []).append(cid)
+
     cells = []
     unknown = []
+    ambiguous = []
     for title, value in cell_values.items():
-        if title not in col_by_title:
+        cid = col_by_title.get(title)
+        if cid is None:
+            candidates = norm_index.get(_normalize_col(title), [])
+            if len(candidates) == 1:
+                cid = candidates[0]
+            elif len(candidates) > 1:
+                ambiguous.append(title)
+                continue
+        if cid is None:
             unknown.append(title)
             continue
-        cells.append({"columnId": col_by_title[title], "value": value})
+        cells.append({"columnId": cid, "value": value})
 
+    if ambiguous:
+        raise RuntimeError(
+            f"Column titles {ambiguous} matched multiple columns on sheet "
+            f"{sheet_id} after normalization. Pass the exact title from "
+            f"smartsheet_get_sheet. Available columns: {sorted(col_by_title)}"
+        )
     if unknown:
         raise RuntimeError(
             f"Unknown column titles for sheet {sheet_id}: {unknown}. "
