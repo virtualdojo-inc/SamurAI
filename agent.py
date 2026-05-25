@@ -899,6 +899,10 @@ async def run_agent(
         # FedRAMP docs
         "fedramp_discard_draft": "Discarding draft",
         "fedramp_scan_container_vulnerabilities": "Scanning container vulnerabilities",
+        # Smartsheet
+        "smartsheet_list_sheets": "Listing Smartsheets",
+        "smartsheet_get_sheet": "Reading Smartsheet rows",
+        "smartsheet_update_row": "Updating Smartsheet row",
     }
 
     final_messages = []
