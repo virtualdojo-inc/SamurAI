@@ -1,10 +1,28 @@
 """Tests for tools/repo_sync.py — local repo sync and code reading tools."""
 
 import os
+import shutil
 import subprocess
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_repo_sync_state():
+    """Reset module-level state between tests so the last-synced cache and
+    the per-(repo, branch) lock dict don't leak across tests."""
+    import tools.repo_sync as rs
+
+    rs._last_synced_branch.clear()
+    with rs._sync_locks_guard:
+        rs._sync_locks.clear()
+    yield
+    rs._last_synced_branch.clear()
+    with rs._sync_locks_guard:
+        rs._sync_locks.clear()
 
 
 # --- sync_repo ---
@@ -661,3 +679,240 @@ def test_list_repo_files_hides_dotfiles(tmp_path):
     finally:
         import shutil
         shutil.rmtree(local_dir)
+
+
+# --- Concurrency / branch-default regression tests (May 2026 Jason incident) ---
+
+
+def test_sync_repo_serializes_concurrent_calls_to_same_branch(tmp_path, monkeypatch):
+    """Concurrent sync_repo calls to the same (repo, branch) must not overlap.
+
+    Without the lock, three parallel investigate() calls each fired their own
+    sync_repo and raced on rm -rf + git clone, producing 'could not open
+    .git/objects/pack/tmp_pack_...' and 'could not lock config file' errors.
+    """
+    import tools.repo_sync as rs
+
+    monkeypatch.setattr(rs, "REPO_BASE_DIR", str(tmp_path))
+
+    concurrent = 0
+    max_concurrent = 0
+    counter_lock = threading.Lock()
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal concurrent, max_concurrent
+        if cmd and cmd[0] in ("git", "rm"):
+            with counter_lock:
+                concurrent += 1
+                max_concurrent = max(max_concurrent, concurrent)
+            time.sleep(0.05)
+            with counter_lock:
+                concurrent -= 1
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("tools.github._github_token", return_value="fake-token"),
+        patch("tools.repo_sync._get_remote_sha", return_value="sha-abc"),
+        patch("tools.repo_sync._get_local_sha", return_value=None),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        threads = [
+            threading.Thread(
+                target=lambda: rs.sync_repo.invoke(
+                    {"repo": "Quote-ly/quotely-data-service", "branch": "development"}
+                )
+            )
+            for _ in range(3)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    assert max_concurrent == 1, (
+        f"sync_repo on same (repo, branch) ran {max_concurrent}-way concurrently; "
+        f"lock did not serialize"
+    )
+
+
+def test_sync_repo_allows_concurrent_calls_on_different_branches(tmp_path, monkeypatch):
+    """The lock keys on (repo, branch) — different branches must not block each other."""
+    import tools.repo_sync as rs
+
+    monkeypatch.setattr(rs, "REPO_BASE_DIR", str(tmp_path))
+
+    in_flight: set[str] = set()
+    saw_overlap = False
+    counter_lock = threading.Lock()
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal saw_overlap
+        branch_arg = None
+        if cmd and cmd[0] == "git" and "clone" in cmd:
+            try:
+                branch_arg = cmd[cmd.index("--branch") + 1]
+            except (ValueError, IndexError):
+                branch_arg = "?"
+        if branch_arg:
+            with counter_lock:
+                in_flight.add(branch_arg)
+                if len(in_flight) >= 2:
+                    saw_overlap = True
+            time.sleep(0.05)
+            with counter_lock:
+                in_flight.discard(branch_arg)
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("tools.github._github_token", return_value="fake-token"),
+        patch("tools.repo_sync._get_remote_sha", return_value="sha-xyz"),
+        patch("tools.repo_sync._get_local_sha", return_value=None),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        t_main = threading.Thread(
+            target=lambda: rs.sync_repo.invoke(
+                {"repo": "Quote-ly/quotely-data-service", "branch": "main"}
+            )
+        )
+        t_dev = threading.Thread(
+            target=lambda: rs.sync_repo.invoke(
+                {"repo": "Quote-ly/quotely-data-service", "branch": "development"}
+            )
+        )
+        t_main.start()
+        t_dev.start()
+        t_main.join()
+        t_dev.join()
+
+    assert saw_overlap, (
+        "sync_repo on different branches did not overlap; lock keys may be too coarse"
+    )
+
+
+def test_sync_repo_records_last_synced_branch_on_clone(tmp_path, monkeypatch):
+    import tools.repo_sync as rs
+
+    monkeypatch.setattr(rs, "REPO_BASE_DIR", str(tmp_path))
+
+    with (
+        patch("tools.github._github_token", return_value="fake-token"),
+        patch("tools.repo_sync._get_remote_sha", return_value="sha-new"),
+        patch("tools.repo_sync._get_local_sha", return_value=None),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")),
+    ):
+        rs.sync_repo.invoke(
+            {"repo": "Quote-ly/quotely-data-service", "branch": "development"}
+        )
+
+    assert rs._last_synced_branch.get("Quote-ly/quotely-data-service") == "development"
+
+
+def test_sync_repo_records_last_synced_branch_when_up_to_date():
+    import tools.repo_sync as rs
+
+    with (
+        patch("tools.github._github_token", return_value="fake-token"),
+        patch("tools.repo_sync._get_remote_sha", return_value="same"),
+        patch("tools.repo_sync._get_local_sha", return_value="same"),
+    ):
+        result = rs.sync_repo.invoke(
+            {"repo": "Quote-ly/quotely-data-service", "branch": "development"}
+        )
+
+    assert "Already up to date" in result
+    assert rs._last_synced_branch.get("Quote-ly/quotely-data-service") == "development"
+
+
+def test_search_repo_code_falls_back_to_last_synced_branch():
+    """When branch is omitted, readers must default to the most-recently-synced branch.
+
+    This was the proximate cause of the May 2026 'no access to development'
+    incident: sync_repo(branch='development') and search_repo_code (no
+    branch kwarg) fired in the same parallel batch, and search defaulted
+    to 'main' which wasn't synced.
+    """
+    from tools.repo_sync import search_repo_code, _repo_dir
+    import tools.repo_sync as rs
+
+    repo = "Quote-ly/quotely-data-service"
+    branch = "development"
+    local_dir = _repo_dir(repo, branch)
+    os.makedirs(local_dir, exist_ok=True)
+
+    test_file = os.path.join(local_dir, "marker.py")
+    with open(test_file, "w") as f:
+        f.write("DEV_ONLY_TOKEN = 1\n")
+
+    rs._last_synced_branch[repo] = branch
+
+    try:
+        result = search_repo_code.invoke({"query": "DEV_ONLY_TOKEN", "repo": repo})
+        assert "DEV_ONLY_TOKEN" in result
+        assert "marker.py" in result
+    finally:
+        shutil.rmtree(local_dir)
+
+
+def test_read_repo_file_falls_back_to_last_synced_branch():
+    from tools.repo_sync import read_repo_file, _repo_dir
+    import tools.repo_sync as rs
+
+    repo = "Quote-ly/quotely-data-service"
+    branch = "development"
+    local_dir = _repo_dir(repo, branch)
+    os.makedirs(local_dir, exist_ok=True)
+
+    with open(os.path.join(local_dir, "x.py"), "w") as f:
+        f.write("dev_marker\n")
+
+    rs._last_synced_branch[repo] = branch
+
+    try:
+        result = read_repo_file.invoke({"file_path": "x.py", "repo": repo})
+        assert "dev_marker" in result
+    finally:
+        shutil.rmtree(local_dir)
+
+
+def test_not_synced_message_lists_actually_synced_branches():
+    """The error must reflect filesystem state, not parrot the caller's branch.
+
+    Previously it said "Call sync_repo(... branch='main') first" even when
+    the caller had just synced 'development', which led the model to chase
+    the wrong branch.
+    """
+    from tools.repo_sync import search_repo_code, _repo_dir
+
+    repo = "Quote-ly/quotely-data-service"
+    dev_dir = _repo_dir(repo, "development")
+    main_dir = _repo_dir(repo, "main")
+    if os.path.isdir(main_dir):
+        shutil.rmtree(main_dir)
+    os.makedirs(dev_dir, exist_ok=True)
+
+    try:
+        result = search_repo_code.invoke(
+            {"query": "anything", "repo": repo, "branch": "main"}
+        )
+        assert "not synced" in result.lower()
+        assert "development" in result, (
+            f"not-synced message should list locally synced branches; got: {result!r}"
+        )
+    finally:
+        shutil.rmtree(dev_dir)
+
+
+def test_not_synced_message_handles_repo_with_no_local_branches():
+    from tools.repo_sync import read_repo_file, _repo_dir
+
+    repo = "Quote-ly/Fedramp"
+    local_dir = _repo_dir(repo, "main")
+    repo_root = os.path.dirname(local_dir)
+    if os.path.isdir(repo_root):
+        shutil.rmtree(repo_root)
+
+    result = read_repo_file.invoke(
+        {"file_path": "README.md", "repo": repo, "branch": "main"}
+    )
+    assert "not synced" in result.lower()
+    assert "none" in result

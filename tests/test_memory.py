@@ -386,6 +386,7 @@ def test_get_background_extractor_returns_executor():
 
     with (
         patch("memory.get_memory_store", return_value=MagicMock()),
+        patch("memory._create_extractor_llm", return_value=MagicMock()),
         patch("langmem.create_memory_store_manager", return_value=MagicMock()),
         patch("langmem.ReflectionExecutor") as mock_executor_cls,
     ):
@@ -400,6 +401,7 @@ def test_get_background_extractor_is_singleton():
 
     with (
         patch("memory.get_memory_store", return_value=MagicMock()),
+        patch("memory._create_extractor_llm", return_value=MagicMock()),
         patch("langmem.create_memory_store_manager", return_value=MagicMock()),
         patch("langmem.ReflectionExecutor") as mock_executor_cls,
     ):
@@ -418,6 +420,7 @@ def test_get_core_extractor_returns_executor():
 
     with (
         patch("memory.get_memory_store", return_value=MagicMock()),
+        patch("memory._create_extractor_llm", return_value=MagicMock()),
         patch("langmem.create_memory_store_manager", return_value=MagicMock()),
         patch("langmem.ReflectionExecutor") as mock_executor_cls,
     ):
@@ -432,6 +435,7 @@ def test_get_core_extractor_is_singleton():
 
     with (
         patch("memory.get_memory_store", return_value=MagicMock()),
+        patch("memory._create_extractor_llm", return_value=MagicMock()),
         patch("langmem.create_memory_store_manager", return_value=MagicMock()),
         patch("langmem.ReflectionExecutor") as mock_executor_cls,
     ):
@@ -450,6 +454,7 @@ def test_get_team_extractor_returns_executor():
 
     with (
         patch("memory.get_memory_store", return_value=MagicMock()),
+        patch("memory._create_extractor_llm", return_value=MagicMock()),
         patch("langmem.create_memory_store_manager", return_value=MagicMock()),
         patch("langmem.ReflectionExecutor") as mock_executor_cls,
     ):
@@ -464,6 +469,7 @@ def test_get_team_extractor_is_singleton():
 
     with (
         patch("memory.get_memory_store", return_value=MagicMock()),
+        patch("memory._create_extractor_llm", return_value=MagicMock()),
         patch("langmem.create_memory_store_manager", return_value=MagicMock()),
         patch("langmem.ReflectionExecutor") as mock_executor_cls,
     ):
@@ -472,3 +478,69 @@ def test_get_team_extractor_is_singleton():
         e2 = get_team_extractor()
 
     assert e1 is e2
+
+
+# --- Vertex-auth regression for the LangMem extractors (May 2026) ---
+
+
+def _capture_extractor_llm(getter_name: str, env: dict | None = None):
+    """Call one of the extractor singletons with everything mocked and return
+    the model arg that was passed to create_memory_store_manager."""
+    import memory
+
+    chat_cls = MagicMock(return_value="fake-llm-client")
+    env_patch = patch.dict(
+        os.environ,
+        env if env is not None else {"GCP_PROJECT_ID": "vd-test", "GCP_LOCATION": "us-east1"},
+        clear=False,
+    )
+    with (
+        env_patch,
+        patch("memory.get_memory_store", return_value=MagicMock()),
+        patch("langchain_google_genai.ChatGoogleGenerativeAI", chat_cls),
+        patch("langmem.create_memory_store_manager") as mock_manager,
+        patch("langmem.ReflectionExecutor", return_value=MagicMock()),
+    ):
+        mock_manager.return_value = MagicMock()
+        getattr(memory, getter_name)()
+        assert mock_manager.called, f"{getter_name} did not call create_memory_store_manager"
+        model_arg = mock_manager.call_args.args[0]
+    return chat_cls, model_arg
+
+
+def test_background_extractor_uses_vertex_chat_client():
+    """Must construct ChatGoogleGenerativeAI with vertexai=True, not pass a
+    'google_genai:...' string (which routes through the Developer API and
+    requires GOOGLE_API_KEY — Cloud Run authenticates via service account)."""
+    chat_cls, model_arg = _capture_extractor_llm("get_background_extractor")
+    assert model_arg == "fake-llm-client"
+    chat_cls.assert_called_once()
+    kwargs = chat_cls.call_args.kwargs
+    assert kwargs.get("vertexai") is True
+    assert kwargs.get("model") == "gemini-2.0-flash-lite"
+    assert kwargs.get("project") == "vd-test"
+    assert kwargs.get("location") == "us-east1"
+
+
+def test_core_extractor_uses_vertex_chat_client():
+    chat_cls, model_arg = _capture_extractor_llm("get_core_extractor")
+    assert model_arg == "fake-llm-client"
+    chat_cls.assert_called_once()
+    assert chat_cls.call_args.kwargs.get("vertexai") is True
+
+
+def test_team_extractor_uses_vertex_chat_client():
+    chat_cls, model_arg = _capture_extractor_llm("get_team_extractor")
+    assert model_arg == "fake-llm-client"
+    chat_cls.assert_called_once()
+    assert chat_cls.call_args.kwargs.get("vertexai") is True
+
+
+def test_extractor_location_defaults_to_us_central1():
+    """If GCP_LOCATION is unset, the extractor should fall back to us-central1
+    (matching the bot's primary region)."""
+    chat_cls, _ = _capture_extractor_llm(
+        "get_background_extractor",
+        env={"GCP_PROJECT_ID": "vd-test"},  # GCP_LOCATION deliberately omitted
+    )
+    assert chat_cls.call_args.kwargs.get("location") == "us-central1"

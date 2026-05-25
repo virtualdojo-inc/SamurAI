@@ -64,6 +64,26 @@ def _create_embed_fn():
     return embed
 
 
+def _create_extractor_llm():
+    """Build the ChatGoogleGenerativeAI client used by the LangMem extractors.
+
+    Same Vertex-auth caveat as _create_embed_fn above: passing the model as a
+    string to create_memory_store_manager() resolves via init_chat_model,
+    which defaults to the Gemini Developer API path and requires
+    GOOGLE_API_KEY — which Cloud Run doesn't have (it authenticates via
+    service account). Construct the client explicitly with vertexai=True so
+    it routes through Vertex AI like the rest of the bot.
+    """
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash-lite",
+        vertexai=True,
+        project=os.environ.get("GCP_PROJECT_ID"),
+        location=os.environ.get("GCP_LOCATION", "us-central1"),
+    )
+
+
 # ── Memory Store (InMemoryStore + SQLite persistence) ─────────────────
 
 
@@ -267,7 +287,7 @@ def get_background_extractor():
 
         store = get_memory_store()
         manager = create_memory_store_manager(
-            "google_genai:gemini-2.0-flash-lite",
+            _create_extractor_llm(),
             namespace=USER_NAMESPACE,
             store=store,
             enable_inserts=True,
@@ -299,7 +319,7 @@ def get_core_extractor():
 
         store = get_memory_store()
         manager = create_memory_store_manager(
-            "google_genai:gemini-2.0-flash-lite",
+            _create_extractor_llm(),
             namespace=CORE_NAMESPACE,
             store=store,
             enable_inserts=True,
@@ -341,7 +361,7 @@ def get_team_extractor():
 
         store = get_memory_store()
         manager = create_memory_store_manager(
-            "google_genai:gemini-2.0-flash-lite",
+            _create_extractor_llm(),
             namespace=TEAM_NAMESPACE,
             store=store,
             enable_inserts=True,

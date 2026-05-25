@@ -3,6 +3,7 @@
 import logging
 import os
 import subprocess
+import threading
 
 from langchain_core.tools import tool
 
@@ -16,6 +17,54 @@ ALLOWED_REPOS = {
     "Quote-ly/SamurAI",
     "Quote-ly/Fedramp",
 }
+
+# Per-(repo, branch) lock. LangGraph's ToolNode runs sync tools in worker
+# threads, so concurrent sync_repo calls to the same path race on rm -rf +
+# git clone — the loser sees "could not open .git/objects/pack/tmp_pack_..."
+# or "could not lock config file".
+_sync_locks: dict[tuple[str, str], threading.Lock] = {}
+_sync_locks_guard = threading.Lock()
+
+# Most-recently-synced branch per repo. Lets readers default to the branch
+# the caller just synced when the model omits the kwarg in a parallel batch.
+_last_synced_branch: dict[str, str] = {}
+
+
+def _get_sync_lock(repo: str, branch: str) -> threading.Lock:
+    key = (repo, branch)
+    with _sync_locks_guard:
+        lock = _sync_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _sync_locks[key] = lock
+        return lock
+
+
+def _resolve_branch(repo: str, branch: str | None) -> str:
+    """Default to the most-recently-synced branch for this repo, else 'main'."""
+    if branch is not None:
+        return branch
+    return _last_synced_branch.get(repo, "main")
+
+
+def _not_synced_message(repo: str, branch: str) -> str:
+    """Tell the model what's actually synced, not a hardcoded 'main' suggestion."""
+    repo_root = os.path.join(REPO_BASE_DIR, repo.split("/")[-1])
+    have: list[str] = []
+    if os.path.isdir(repo_root):
+        try:
+            have = sorted(
+                e for e in os.listdir(repo_root)
+                if os.path.isdir(os.path.join(repo_root, e))
+            )
+        except OSError:
+            have = []
+    have_str = ", ".join(have) if have else "none"
+    return (
+        f"Repo not synced yet: branch '{branch}' of {repo}. "
+        f"Locally synced branches: {have_str}. "
+        f"Call sync_repo(repo='{repo}', branch='{branch}') first."
+    )
 
 
 def _repo_dir(repo: str, branch: str) -> str:
@@ -88,65 +137,71 @@ def sync_repo(
     clone_url = f"https://x-access-token:{token}@github.com/{repo}.git"
     local_dir = _repo_dir(repo, branch)
 
-    # Check if we need to sync
-    remote_sha = _get_remote_sha(repo, branch)
-    if not remote_sha:
-        return f"Error: Could not reach {repo} branch '{branch}'. Check the branch name."
+    # Serialize concurrent callers on the same (repo, branch). Without this,
+    # parallel sync_repo invocations (e.g. from multiple investigate() calls
+    # in the same turn) race on rm -rf + git clone into the same directory.
+    with _get_sync_lock(repo, branch):
+        # Check if we need to sync
+        remote_sha = _get_remote_sha(repo, branch)
+        if not remote_sha:
+            return f"Error: Could not reach {repo} branch '{branch}'. Check the branch name."
 
-    local_sha = _get_local_sha(local_dir)
+        local_sha = _get_local_sha(local_dir)
 
-    if local_sha == remote_sha:
-        return (
-            f"Already up to date.\n"
-            f"Repo: {repo} ({branch})\n"
-            f"SHA: {remote_sha[:8]}\n"
-            f"Local: {local_dir}"
-        )
+        if local_sha == remote_sha:
+            _last_synced_branch[repo] = branch
+            return (
+                f"Already up to date.\n"
+                f"Repo: {repo} ({branch})\n"
+                f"SHA: {remote_sha[:8]}\n"
+                f"Local: {local_dir}"
+            )
 
-    # Clone or re-clone
-    try:
-        if os.path.exists(local_dir):
-            # Remove stale copy and re-clone (shallow repos can't pull cleanly)
-            subprocess.run(["rm", "-rf", local_dir], check=True, timeout=30)
+        # Clone or re-clone
+        try:
+            if os.path.exists(local_dir):
+                # Remove stale copy and re-clone (shallow repos can't pull cleanly)
+                subprocess.run(["rm", "-rf", local_dir], check=True, timeout=30)
 
-        os.makedirs(os.path.dirname(local_dir), exist_ok=True)
+            os.makedirs(os.path.dirname(local_dir), exist_ok=True)
 
-        result = subprocess.run(
-            [
-                "git", "clone",
-                "--depth", "1",
-                "--branch", branch,
-                "--single-branch",
-                clone_url,
-                local_dir,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            err = result.stderr[:200]
-            return f"Error cloning {repo} ({branch}): {err}"
+            result = subprocess.run(
+                [
+                    "git", "clone",
+                    "--depth", "1",
+                    "--branch", branch,
+                    "--single-branch",
+                    clone_url,
+                    local_dir,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                err = result.stderr[:200]
+                return f"Error cloning {repo} ({branch}): {err}"
 
-        logger.info("Synced %s/%s to %s (SHA: %s)", repo, branch, local_dir, remote_sha[:8])
-        return (
-            f"Synced successfully.\n"
-            f"Repo: {repo} ({branch})\n"
-            f"SHA: {remote_sha[:8]}\n"
-            f"Local: {local_dir}"
-        )
+            _last_synced_branch[repo] = branch
+            logger.info("Synced %s/%s to %s (SHA: %s)", repo, branch, local_dir, remote_sha[:8])
+            return (
+                f"Synced successfully.\n"
+                f"Repo: {repo} ({branch})\n"
+                f"SHA: {remote_sha[:8]}\n"
+                f"Local: {local_dir}"
+            )
 
-    except subprocess.TimeoutExpired:
-        return f"Error: Clone timed out for {repo} ({branch}). The repo may be too large."
-    except Exception as e:
-        return f"Error syncing {repo} ({branch}): {e}"
+        except subprocess.TimeoutExpired:
+            return f"Error: Clone timed out for {repo} ({branch}). The repo may be too large."
+        except Exception as e:
+            return f"Error syncing {repo} ({branch}): {e}"
 
 
 @tool
 def read_repo_file(
     file_path: str,
     repo: str = "Quote-ly/quotely-data-service",
-    branch: str = "main",
+    branch: str | None = None,
 ) -> str:
     """Read a file from a locally synced repo.
 
@@ -155,18 +210,18 @@ def read_repo_file(
     Args:
         file_path: Path relative to repo root (e.g. 'main.py', 'app/config.py').
         repo: Repository in 'owner/repo' format.
-        branch: Branch name.
+        branch: Branch name. Defaults to the most-recently-synced branch for
+            this repo, or 'main' if none has been synced this session.
     """
     if repo not in ALLOWED_REPOS:
         return f"Error: '{repo}' is not a whitelisted repo."
 
+    branch = _resolve_branch(repo, branch)
     local_dir = _repo_dir(repo, branch)
     full_path = os.path.join(local_dir, file_path)
 
     if not os.path.exists(local_dir):
-        return (
-            f"Repo not synced yet. Call sync_repo(repo='{repo}', branch='{branch}') first."
-        )
+        return _not_synced_message(repo, branch)
 
     if not os.path.exists(full_path):
         return f"File not found: {file_path} in {repo} ({branch})"
@@ -192,7 +247,7 @@ def read_repo_file_range(
     start_line: int,
     end_line: int,
     repo: str = "Quote-ly/quotely-data-service",
-    branch: str = "main",
+    branch: str | None = None,
 ) -> str:
     """Read a specific line range from a file in a locally synced repo.
 
@@ -207,7 +262,8 @@ def read_repo_file_range(
         start_line: 1-indexed start line (inclusive).
         end_line: 1-indexed end line (inclusive). Clamped to EOF.
         repo: Repository in 'owner/repo' format.
-        branch: Branch name.
+        branch: Branch name. Defaults to the most-recently-synced branch for
+            this repo, or 'main' if none has been synced this session.
     """
     if repo not in ALLOWED_REPOS:
         return f"Error: '{repo}' is not a whitelisted repo."
@@ -218,13 +274,12 @@ def read_repo_file_range(
             f"(start_line must be >= 1 and <= end_line)."
         )
 
+    branch = _resolve_branch(repo, branch)
     local_dir = _repo_dir(repo, branch)
     full_path = os.path.join(local_dir, file_path)
 
     if not os.path.exists(local_dir):
-        return (
-            f"Repo not synced yet. Call sync_repo(repo='{repo}', branch='{branch}') first."
-        )
+        return _not_synced_message(repo, branch)
 
     if not os.path.exists(full_path):
         return f"File not found: {file_path} in {repo} ({branch})"
@@ -258,7 +313,7 @@ def read_repo_file_range(
 def search_repo_code(
     query: str,
     repo: str = "Quote-ly/quotely-data-service",
-    branch: str = "main",
+    branch: str | None = None,
     file_pattern: str = "",
     context_lines: int = 2,
 ) -> str:
@@ -269,7 +324,8 @@ def search_repo_code(
     Args:
         query: Search pattern (regex supported).
         repo: Repository in 'owner/repo' format.
-        branch: Branch name.
+        branch: Branch name. Defaults to the most-recently-synced branch for
+            this repo, or 'main' if none has been synced this session.
         file_pattern: Optional glob to filter files (e.g. '*.py', '*.vue').
         context_lines: Lines of surrounding context to include per match (grep -C).
             Default 2. Set to 0 for match-only output.
@@ -277,12 +333,11 @@ def search_repo_code(
     if repo not in ALLOWED_REPOS:
         return f"Error: '{repo}' is not a whitelisted repo."
 
+    branch = _resolve_branch(repo, branch)
     local_dir = _repo_dir(repo, branch)
 
     if not os.path.exists(local_dir):
-        return (
-            f"Repo not synced yet. Call sync_repo(repo='{repo}', branch='{branch}') first."
-        )
+        return _not_synced_message(repo, branch)
 
     cmd = ["grep", "-rn"]
     if context_lines and context_lines > 0:
@@ -328,7 +383,7 @@ def search_repo_code(
 def list_repo_files(
     path: str = "",
     repo: str = "Quote-ly/quotely-data-service",
-    branch: str = "main",
+    branch: str | None = None,
 ) -> str:
     """List files and directories in a locally synced repo.
 
@@ -337,18 +392,18 @@ def list_repo_files(
     Args:
         path: Directory path relative to repo root. Empty for root.
         repo: Repository in 'owner/repo' format.
-        branch: Branch name.
+        branch: Branch name. Defaults to the most-recently-synced branch for
+            this repo, or 'main' if none has been synced this session.
     """
     if repo not in ALLOWED_REPOS:
         return f"Error: '{repo}' is not a whitelisted repo."
 
+    branch = _resolve_branch(repo, branch)
     local_dir = _repo_dir(repo, branch)
     target = os.path.join(local_dir, path) if path else local_dir
 
     if not os.path.exists(local_dir):
-        return (
-            f"Repo not synced yet. Call sync_repo(repo='{repo}', branch='{branch}') first."
-        )
+        return _not_synced_message(repo, branch)
 
     if not os.path.exists(target):
         return f"Path not found: {path} in {repo} ({branch})"
