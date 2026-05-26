@@ -367,7 +367,11 @@ async def _stage_1(user_messages: str, tool_call: dict) -> Literal["safe", "revi
         tool_args_json=json.dumps(tool_call.get("args") or {}, default=str),
     )
     try:
-        resp = await _get_stage1_llm().ainvoke([SystemMessage(content=prompt)])
+        # Vertex Gemini requires at least one user-role message — a
+        # system-only call returns "contents are required". Send the
+        # whole prompt as a HumanMessage; the instructions are
+        # self-contained.
+        resp = await _get_stage1_llm().ainvoke([HumanMessage(content=prompt)])
         text = _extract_text(resp.content).strip().lower()
         # Anchor on the first word — tolerant of trailing punctuation /
         # explanation if the model strays from "one word".
@@ -392,7 +396,7 @@ async def _stage_2(
         denial_count=denial_count,
     )
     try:
-        resp = await _get_stage2_llm().ainvoke([SystemMessage(content=prompt)])
+        resp = await _get_stage2_llm().ainvoke([HumanMessage(content=prompt)])
         raw = _extract_text(resp.content).strip()
         # Strip code fences if Gemini wrapped the JSON in ```json ... ```
         if raw.startswith("```"):

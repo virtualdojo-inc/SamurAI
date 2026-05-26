@@ -852,7 +852,9 @@ async def _synthesize_partial_findings(
     )
 
     try:
-        response = await synth_llm.ainvoke([SystemMessage(content=prompt)])
+        # Vertex Gemini requires a user-role message in contents; a
+        # system-only call returns "contents are required".
+        response = await synth_llm.ainvoke([HumanMessage(content=prompt)])
         text = _extract_text(response.content)
         return text.strip() if text else ""
     except Exception as e:

@@ -344,7 +344,10 @@ async def test_judge_prompts_isolate_inputs(monkeypatch):
     assert stage1_llm.ainvoke.await_count == 1
     sent_messages = stage1_llm.ainvoke.await_args.args[0]
     assert len(sent_messages) == 1
-    assert isinstance(sent_messages[0], SystemMessage)
+    # HumanMessage required by Vertex Gemini (contents must contain at
+    # least one user-role message). The message type itself isn't a
+    # security property — what matters is the content stays isolated.
+    assert isinstance(sent_messages[0], HumanMessage)
     prompt_text = sent_messages[0].content
 
     # NONE of the decoys must appear in the prompt.
