@@ -54,6 +54,11 @@ from tools.progress import (
     get_progress,
     render_progress_markdown,
 )
+from judge import (
+    judge_writes_node,
+    should_judge_writes,
+    route_after_judge,
+)
 from verification import (
     verification_node,
     should_verify,
@@ -668,14 +673,19 @@ async def _build_graph(user_id: str = "default"):
     def should_continue(state: MessagesState):
         """Route after the agent node.
 
-        - If the agent produced tool calls, run them.
-        - Else if verification is enabled (env SAMURAI_VERIFY_MODE !=
-          off), route to the verification node.
+        - If the agent produced write tool calls AND the judge is enabled,
+          route to the judge for evaluation.
+        - If the agent produced only read tool calls (or the judge is off),
+          run them directly.
+        - Else if verification is enabled, route to the verification node.
         - Else end the graph.
         """
         last = state["messages"][-1]
         if getattr(last, "tool_calls", None):
-            return "tools"
+            # should_judge_writes returns "judge" / "tools" / "end".
+            # "end" is unreachable here (we know tool_calls exists), but
+            # it's safe — the conditional edge map handles it.
+            return should_judge_writes(state)
         # No tool calls — draft is ready. Route to verification or END.
         return should_verify(state)
 
@@ -692,13 +702,24 @@ async def _build_graph(user_id: str = "default"):
     graph.add_node("agent", call_model)
     graph.add_node("tools", tool_node)
     graph.add_node("verify", verification_node)
+    graph.add_node("judge", judge_writes_node)
     graph.add_edge(START, "agent")
     graph.add_conditional_edges(
         "agent",
         should_continue,
-        {"tools": "tools", "verify": "verify", "end": END},
+        {
+            "tools": "tools",
+            "judge": "judge",
+            "verify": "verify",
+            "end": END,
+        },
     )
     graph.add_edge("tools", "agent")
+    graph.add_conditional_edges(
+        "judge",
+        route_after_judge,
+        {"tools": "tools", "agent": "agent", END: END},
+    )
     graph.add_conditional_edges(
         "verify",
         should_continue_after_verification,
