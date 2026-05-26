@@ -9,12 +9,11 @@ Design and rationale: see `docs/judge-design.md`.
 Research basis: Anthropic Claude Code Auto Mode (2026-03-24).
 https://www.anthropic.com/engineering/claude-code-auto-mode
 
-Modes (env var SAMURAI_JUDGE_WRITES):
-  - "off"      : routing predicate skips the judge. Zero overhead.
-  - "shadow"   : judge runs end-to-end and logs verdicts, but never
-                 blocks. Use to measure FPR before flipping to enforce.
-  - "enforce"  : judge blocks on "block" verdict; passes "approve" and
-                 "pass" through.
+The judge is ENABLED BY DEFAULT. Set SAMURAI_JUDGE_WRITES=off to
+disable. Any other value (including unset) keeps it on.
+
+When active, the judge blocks on Stage 2 "block" verdict and passes
+"approve" and "pass" through. No shadow mode — either active or off.
 """
 
 from __future__ import annotations
@@ -431,7 +430,8 @@ def should_judge_writes(state) -> str:
     - "tools" : tool calls present but none are writes, or env is off
     - "judge" : at least one tool call is in WRITE_TOOL_NAMES
     """
-    mode = os.environ.get("SAMURAI_JUDGE_WRITES", "off").lower()
+    # Enabled by default. Only the literal "off" disables the judge.
+    mode = os.environ.get("SAMURAI_JUDGE_WRITES", "").lower()
     messages = state["messages"]
     if not messages:
         return "end"
@@ -493,7 +493,9 @@ async def judge_writes_node(state) -> dict:
     Returns the standard LangGraph `{"messages": [...]}` dict. Empty
     list means "no judge intervention — let the tools run."
     """
-    mode = os.environ.get("SAMURAI_JUDGE_WRITES", "off").lower()
+    # The routing predicate (should_judge_writes) only sends us writes
+    # in enforce mode, so reaching this node means mode == "enforce".
+    # No need to re-check.
     messages = state["messages"]
     if not messages:
         return {"messages": []}
@@ -503,9 +505,7 @@ async def judge_writes_node(state) -> dict:
 
     # Check the accumulation backstop BEFORE doing any work.
     consecutive, total = _count_prior_denials(messages)
-    if mode == "enforce" and (
-        consecutive >= _MAX_CONSECUTIVE_DENIALS or total >= _MAX_TOTAL_DENIALS
-    ):
+    if consecutive >= _MAX_CONSECUTIVE_DENIALS or total >= _MAX_TOTAL_DENIALS:
         print(
             f"[judge.escalate] consecutive={consecutive} total={total} "
             f"thresholds=({_MAX_CONSECUTIVE_DENIALS},{_MAX_TOTAL_DENIALS})",
@@ -525,28 +525,16 @@ async def judge_writes_node(state) -> dict:
 
         s1 = await _stage_1(user_messages, tc)
         if s1 == "safe":
-            print(
-                f"[judge.stage1] tool={name} verdict=safe mode={mode}",
-                flush=True,
-            )
+            print(f"[judge.stage1] tool={name} verdict=safe", flush=True)
             continue
 
         verdict, reason = await _stage_2(user_messages, tc, total)
         print(
-            f"[judge.stage2] tool={name} verdict={verdict} mode={mode} "
-            f"reason={reason!r}",
+            f"[judge.stage2] tool={name} verdict={verdict} reason={reason!r}",
             flush=True,
         )
         if verdict == "block":
-            if mode == "shadow":
-                # Shadow mode: log what we would have blocked, but pass.
-                print(
-                    f"[judge.shadow] would_block tool={name} reason={reason!r}",
-                    flush=True,
-                )
-                continue
-            if mode == "enforce":
-                blocks.append(_make_block_tool_message(tc["id"], reason))
+            blocks.append(_make_block_tool_message(tc["id"], reason))
         # approve / pass / shadow-block all fall through (no block emitted)
 
     return {"messages": blocks}

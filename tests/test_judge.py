@@ -228,32 +228,39 @@ async def test_stage2_block_emits_synthetic_tool_message(monkeypatch):
     assert "BLOCKED" in block.content
 
 
-@pytest.mark.asyncio
-async def test_shadow_mode_logs_but_does_not_block(monkeypatch, capsys):
-    """Shadow mode runs both stages, prints the verdict, returns empty."""
-    monkeypatch.setenv("SAMURAI_JUDGE_WRITES", "shadow")
-    import judge
+def test_judge_is_enabled_by_default(monkeypatch):
+    """The judge runs by default — no env var needed. Only the literal
+    "off" disables it. Any other value (typo, unset, empty) keeps it on."""
+    from judge import should_judge_writes
 
-    with (
-        patch("judge._get_stage1_llm", return_value=_stub_llm("review")),
-        patch("judge._get_stage2_llm", return_value=_stub_llm(
-            json.dumps({"verdict": "block", "reason": "would-be block"})
-        )),
-    ):
+    monkeypatch.delenv("SAMURAI_JUDGE_WRITES", raising=False)
+    state = {
+        "messages": [
+            HumanMessage(content="x"),
+            _ai_with_tool_call(
+                "smartsheet_update_row",
+                {"sheet_id": "1", "row_id": "abc", "cell_values": {}},
+            ),
+        ]
+    }
+    assert should_judge_writes(state) == "judge"
+
+
+def test_judge_typo_in_env_var_still_runs_judge(monkeypatch):
+    """Defensive: if someone sets SAMURAI_JUDGE_WRITES=on / true / yes
+    expecting that to enable it, the judge still runs. Only "off"
+    disables — anything else is treated as on."""
+    from judge import should_judge_writes
+
+    for value in ("on", "true", "yes", "enforce", "enabled", "1"):
+        monkeypatch.setenv("SAMURAI_JUDGE_WRITES", value)
         state = {
             "messages": [
                 HumanMessage(content="x"),
-                _ai_with_tool_call(
-                    "smartsheet_update_row",
-                    {"sheet_id": "1", "row_id": "abc", "cell_values": {}},
-                ),
+                _ai_with_tool_call("send_teams_message", {}),
             ]
         }
-        result = await judge.judge_writes_node(state)
-
-    assert result == {"messages": []}
-    captured = capsys.readouterr()
-    assert "[judge.shadow] would_block" in captured.out
+        assert should_judge_writes(state) == "judge", f"failed for value={value!r}"
 
 
 @pytest.mark.asyncio

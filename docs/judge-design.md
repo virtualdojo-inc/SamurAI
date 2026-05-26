@@ -49,8 +49,8 @@ measured that excluding it produces a lower false-negative rate.
 | 2 | `gemini-3-flash-preview` | JSON `{verdict, reason}` | Only when Stage 1 returns `review` |
 
 Anthropic uses Sonnet 4.6 for both stages. We start with Flash-Lite + Flash
-(~100x cheaper at our volume) and use shadow-mode data to decide if we need
-to escalate the model choice. Their reported FPR numbers (8.5% → 0.4%
+(~100x cheaper at our volume). If FPR is too high in production we'll
+tune the prompts or escalate the model choice. Their reported FPR numbers (8.5% → 0.4%
 after Stage 2) are our target; if we don't get close, the model choice is
 the first knob.
 
@@ -153,23 +153,33 @@ One new node (`judge`), one new conditional predicate (`should_judge_writes`
 on the `agent → ...` edge), one new conditional predicate (`route_after_judge`
 on the `judge → ...` edge).
 
-## Env gates and rollout
+## Env gate
 
 `SAMURAI_JUDGE_WRITES`:
-- `off` (default): routing predicate sends every write to `tools` directly. Zero overhead. Safe-by-default until we're ready.
-- `shadow`: judge runs end-to-end, logs `[judge.shadow] tool=X verdict=Y reason="..."`, **never blocks**. Use for ~1 week to measure FPR and tune prompts.
-- `enforce`: judge blocks on `block` verdict, passes on `approve` and `pass`.
 
-Mirrors `verification.py:VERIFICATION_MODE` exactly so the operational
-muscle memory transfers.
+- **Default (env unset, or any value other than `off`): ENABLED.** Judge
+  runs Stage 1 + Stage 2 on every write tool call and blocks on the
+  `block` verdict.
+- `off`: routing predicate sends every write to `tools` directly. Zero
+  overhead. The kill switch.
 
-Rollout sequence:
-1. Ship in `off` mode. Verify no graph regression.
-2. Flip to `shadow` for ~1 week. Grep Cloud Logging for `[judge.shadow]`.
-   Spot-check verdicts against ground truth.
-3. Tune Stage 1 / Stage 2 prompts based on real false positives.
-4. Flip to `enforce`. Monitor backstop triggers as the leading indicator
-   of either real safety wins or judge over-eagerness.
+There is no shadow mode. The judge is binary: on or off. Rationale for
+enable-by-default: the judge is the production safety net for write
+actions; a soft-launch / opt-in flag is complexity that lets the
+safeguard sit inactive. If false positives become a problem we either
+tune the prompts or flip `off` while we fix.
+
+To disable in an emergency:
+```
+gcloud run services update samurai-bot \
+  --region=us-central1 --project=virtualdojo-samurai \
+  --update-env-vars SAMURAI_JUDGE_WRITES=off
+```
+
+Observability: every Stage 1 verdict logs `[judge.stage1] ...`, every
+Stage 2 verdict logs `[judge.stage2] ...`, every backstop trigger logs
+`[judge.escalate] ...`. Grep Cloud Logging on those prefixes to see
+what the judge is actually doing in prod.
 
 ## Cost and latency
 
@@ -218,7 +228,8 @@ agent.py                            (~40 line edit: imports + graph wiring)
 | `test_stage1_review_triggers_stage2` | Stage 2 does fire when Stage 1 returns `review` |
 | `test_stage2_approve_passes_through` | Empty messages returned, agent proceeds to tools |
 | `test_stage2_block_returns_synthetic_tool_message` | Block creates the right `_judge_block` ToolMessage |
-| `test_shadow_mode_logs_but_does_not_block` | Verdicts logged, return is always empty messages |
+| `test_judge_is_enabled_by_default` | Judge runs without any env var set |
+| `test_judge_typo_in_env_var_still_runs_judge` | Only the literal "off" disables; any other value keeps it on |
 | `test_three_consecutive_denials_escalates` | Backstop fires on 3 consecutive |
 | `test_twenty_total_denials_escalates` | Backstop fires on 20 total |
 | `test_judge_prompts_isolate_inputs` | **The critical guard**: judge prompts contain user messages + tool args ONLY. No AIMessage content, no ToolMessage content, no system prompts. Tested by inspecting the actual prompt strings sent to mocked LLM clients with a state full of decoy contamination attempts. |
@@ -245,7 +256,7 @@ agent.py                            (~40 line edit: imports + graph wiring)
 3. **Plan-mode approval integration** — using `update_progress` plans
    as a basis to relax the judge for writes inside an already-approved
    plan. Anthropic's *"approve the strategy, not each step"* idea. Best
-   done after shadow data shows what the false-positive rate is.
+   done after production data shows what the false-positive rate is.
 
 4. **Tiered judge by tool risk** (low / medium / high writes) — start
    uniform; split later if FPR data shows certain tools deserve lighter
