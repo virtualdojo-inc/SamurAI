@@ -106,8 +106,12 @@ def run_engineering_pipeline(force: bool = False) -> dict:
         if not force and ingest.get("skipped") == "no-merges":
             summary["compile"] = {"skipped": "no-merges"}
         else:
+            # A deliberate human trigger (force) does a FULL sync — compile every
+            # changed stub in one go. The scheduled tick stays bounded and
+            # converges over nights.
+            max_docs = None if force else ENG_MAX_DOCS
             try:
-                summary["compile"] = kb_compile_eng.compile_engineering(max_docs=ENG_MAX_DOCS)
+                summary["compile"] = kb_compile_eng.compile_engineering(max_docs=max_docs)
             except Exception as e:
                 summary["compile"] = {"error": f"{type(e).__name__}: {e}"}
     finally:
