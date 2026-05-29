@@ -1,13 +1,17 @@
 name: Deploy to Cloud Run
 
-# Build the container and deploy to Cloud Run on every push to main.
-# Tests are a hard gate: deploy only runs if the suite passes.
-# Auth is keyless via Workload Identity Federation (no stored SA key).
+# Build + deploy to Cloud Run on push to main, with a safe blue/green rollout:
+#   1. Tests gate everything.
+#   2. Deploy the new revision with NO traffic, behind a candidate tag.
+#   3. Health-check the candidate via its tagged URL (prod is untouched).
+#   4. Promote to 100% only if healthy; verify prod after promote.
+#   5. If the post-promote check fails, roll traffic back to the previous revision.
+# A failed candidate never receives production traffic, so a bad build cannot
+# take the bot down. Auth is keyless via Workload Identity Federation.
 
 on:
   push:
     branches: [main]
-    # Skip deploys for docs-only / CI-only changes.
     paths-ignore:
       - "docs/**"
       - "**/*.md"
@@ -39,6 +43,10 @@ jobs:
     permissions:
       contents: read
       id-token: write   # required for Workload Identity Federation
+    env:
+      SERVICE: ${{ vars.GCP_SERVICE }}
+      REGION: ${{ vars.GCP_REGION }}
+      PROJECT: ${{ vars.GCP_PROJECT }}
     steps:
       - uses: actions/checkout@v4
 
@@ -52,10 +60,72 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Deploy to Cloud Run
+      - name: Deploy candidate (no traffic) → verify → promote or roll back
         run: |
-          gcloud run deploy "${{ vars.GCP_SERVICE }}" \
+          set -euo pipefail
+          TAG="cand-${GITHUB_SHA::7}"
+
+          # --- Capture the currently-serving revision BEFORE we change anything ---
+          PREV=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format=json \
+            | python3 -c "import sys,json; t=json.load(sys.stdin).get('status',{}).get('traffic',[]); s=[x for x in t if x.get('percent',0)>0 and not x.get('tag')]; print(s[0].get('revisionName','') if s else '')")
+          echo "Previous serving revision: ${PREV:-<none (first deploy)>}"
+
+          # --- Build + deploy the new revision with NO production traffic ---
+          echo "::group::Deploy candidate ($TAG)"
+          gcloud run deploy "$SERVICE" \
             --source . \
-            --region "${{ vars.GCP_REGION }}" \
-            --project "${{ vars.GCP_PROJECT }}" \
+            --region "$REGION" \
+            --project "$PROJECT" \
+            --no-traffic \
+            --tag "$TAG" \
             --quiet
+          echo "::endgroup::"
+
+          # --- Resolve the candidate revision + its tagged URL ---
+          CAND=$(gcloud run revisions list --service="$SERVICE" --region="$REGION" --project="$PROJECT" \
+            --sort-by=~metadata.creationTimestamp --limit=1 --format='value(metadata.name)')
+          CAND_URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format=json \
+            | python3 -c "import sys,json; t=json.load(sys.stdin).get('status',{}).get('traffic',[]); m=[x for x in t if x.get('tag')=='$TAG']; print(m[0].get('url','') if m else '')")
+          echo "Candidate revision: $CAND"
+          echo "Candidate URL: $CAND_URL"
+          if [ -z "$CAND_URL" ]; then echo "Could not resolve candidate tag URL"; exit 1; fi
+
+          # --- Health-check the candidate (prod still on PREV) ---
+          health_ok() {
+            local url="$1"
+            for i in $(seq 1 12); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${url%/}/health" || echo "000")
+              echo "  health attempt $i: HTTP $code"
+              if [ "$code" = "200" ]; then return 0; fi
+              sleep 10
+            done
+            return 1
+          }
+
+          if ! health_ok "$CAND_URL"; then
+            echo "::error::Candidate $CAND failed health check. Production stays on $PREV (untouched)."
+            exit 1
+          fi
+          echo "Candidate healthy. Promoting to 100% traffic."
+
+          # --- Promote candidate to 100% ---
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" --project "$PROJECT" \
+            --to-revisions "$CAND=100" --quiet
+
+          # --- Verify production after promote; roll back to PREV on failure ---
+          SVC_URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format='value(status.url)')
+          if ! health_ok "$SVC_URL"; then
+            echo "::error::Post-promote health check failed."
+            if [ -n "$PREV" ]; then
+              echo "Rolling back to previous revision: $PREV"
+              gcloud run services update-traffic "$SERVICE" --region "$REGION" --project "$PROJECT" \
+                --to-revisions "$PREV=100" --quiet
+            fi
+            exit 1
+          fi
+
+          # --- Clean up the candidate tag (avoids an idle tagged endpoint) ---
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" --project "$PROJECT" \
+            --remove-tags "$TAG" --quiet || true
+
+          echo "✅ Deployed and verified revision $CAND serving 100% traffic."

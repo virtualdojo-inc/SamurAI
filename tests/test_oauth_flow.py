@@ -10,7 +10,6 @@ import pytest
 def patched_app():
     """Import app.py with Bot Framework adapter and agent mocked."""
     with (
-        patch("langchain_google_vertexai.ChatVertexAI", MagicMock()),
         patch("botbuilder.core.BotFrameworkAdapter") as mock_adapter_cls,
     ):
         mock_adapter = MagicMock()
@@ -186,28 +185,27 @@ async def test_connect_phrase_stores_conv_ref(patched_app):
 @pytest.mark.asyncio
 async def test_inject_auth_message_calls_graph():
     """inject_auth_message should invoke the graph with an auth confirmation message."""
-    with patch("langchain_google_vertexai.ChatVertexAI", MagicMock()):
-        import agent
+    import agent
 
-        importlib.reload(agent)
+    importlib.reload(agent)
 
-        mock_graph = MagicMock()
-        mock_graph.ainvoke = AsyncMock(
-            return_value={"messages": [MagicMock(content="ok")]}
-        )
-        agent._user_graphs["user-abc"] = mock_graph
+    mock_graph = MagicMock()
+    mock_graph.ainvoke = AsyncMock(
+        return_value={"messages": [MagicMock(content="ok")]}
+    )
+    agent._user_graphs["user-abc"] = mock_graph
 
-        await agent.inject_auth_message("user-abc", "conv-123")
+    await agent.inject_auth_message("user-abc", "conv-123")
 
-        mock_graph.ainvoke.assert_called_once()
-        call_args = mock_graph.ainvoke.call_args[0][0]
-        messages = call_args["messages"]
-        assert len(messages) == 1
-        assert "authenticated" in messages[0].content.lower()
-        assert "VirtualDojo CRM" in messages[0].content
+    mock_graph.ainvoke.assert_called_once()
+    call_args = mock_graph.ainvoke.call_args[0][0]
+    messages = call_args["messages"]
+    assert len(messages) == 1
+    assert "authenticated" in messages[0].content.lower()
+    assert "VirtualDojo CRM" in messages[0].content
 
-        # Clean up
-        agent._user_graphs.pop("user-abc", None)
+    # Clean up
+    agent._user_graphs.pop("user-abc", None)
 
 
 # --- Card action handlers ignore empty activity.value ---
