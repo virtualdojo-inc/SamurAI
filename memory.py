@@ -67,17 +67,17 @@ def _create_embed_fn():
 def _create_extractor_llm():
     """Build the ChatGoogleGenerativeAI client used by the LangMem extractors.
 
-    Same Vertex-auth caveat as _create_embed_fn above: passing the model as a
-    string to create_memory_store_manager() resolves via init_chat_model,
-    which defaults to the Gemini Developer API path and requires
-    GOOGLE_API_KEY — which Cloud Run doesn't have (it authenticates via
-    service account). Construct the client explicitly with vertexai=True so
-    it routes through Vertex AI like the rest of the bot.
+    Same Vertex-auth caveat as _create_embed_fn: passing the model as a string
+    to create_memory_store_manager() resolves via init_chat_model, which
+    defaults to the Gemini Developer API path and requires GOOGLE_API_KEY —
+    which Cloud Run doesn't have (it authenticates via service account).
+    Construct the client explicitly with vertexai=True so it routes through
+    Vertex AI like the rest of the bot.
     """
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     return ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash-lite",
+        model="gemini-2.5-flash-lite",
         vertexai=True,
         project=os.environ.get("GCP_PROJECT_ID"),
         location=os.environ.get("GCP_LOCATION", "us-central1"),
@@ -374,7 +374,7 @@ def get_team_extractor():
                 "Extract TEAM KNOWLEDGE from this conversation that is specific to "
                 "the VirtualDojo team and its projects. Focus on:\n"
                 "- Project decisions and architecture choices\n"
-                "- Infrastructure facts (e.g., 'quotely-data-service uses "
+                "- Infrastructure facts (e.g., 'virtualdojo-inc/virtualdojo uses "
                 "claude_automation/bugfix for autofix')\n"
                 "- Internal processes (e.g., 'FedRAMP evidence collection runs monthly')\n"
                 "- Team conventions and workflows\n"

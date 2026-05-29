@@ -243,7 +243,7 @@ async def test_retrieve_relevant_memories_with_results():
     core_result = MagicMock()
     core_result.value = {"content": "Check PRs for bugfix/issue-N branches"}
     team_result = MagicMock()
-    team_result.value = {"content": "quotely-data-service uses autofix label"}
+    team_result.value = {"content": "virtualdojo-inc/virtualdojo uses autofix label"}
     user_result = MagicMock()
     user_result.value = {"content": "Devin prefers short responses"}
 
@@ -517,7 +517,7 @@ def test_background_extractor_uses_vertex_chat_client():
     chat_cls.assert_called_once()
     kwargs = chat_cls.call_args.kwargs
     assert kwargs.get("vertexai") is True
-    assert kwargs.get("model") == "gemini-2.0-flash-lite"
+    assert kwargs.get("model") == "gemini-2.5-flash-lite"
     assert kwargs.get("project") == "vd-test"
     assert kwargs.get("location") == "us-east1"
 

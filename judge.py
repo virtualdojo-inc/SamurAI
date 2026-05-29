@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -192,11 +193,34 @@ def _get_stage1_llm():
     return _stage1_llm
 
 
+# Controlled-generation schema for Stage 2. Gemini enforces this on the
+# server side, so the response is guaranteed to be a JSON object with
+# exactly these two keys and a verdict drawn from the enum. Eliminates
+# the code-fence / stray-prose / wrong-shape failure modes that
+# response_mime_type alone does not prevent. Empty responses from
+# safety-filter blocks can still occur — that path is handled by the
+# retry + fail-open logic in _stage_2.
+_STAGE_2_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {
+            "type": "string",
+            "enum": ["approve", "block", "pass"],
+        },
+        "reason": {"type": "string"},
+    },
+    "required": ["verdict", "reason"],
+}
+
+
 def _get_stage2_llm():
     global _stage2_llm
     if _stage2_llm is None:
         _stage2_llm = ChatGoogleGenerativeAI(
-            model="gemini-3-flash-preview", **_GCP_KWARGS
+            model="gemini-3.5-flash",
+            response_mime_type="application/json",
+            response_schema=_STAGE_2_RESPONSE_SCHEMA,
+            **_GCP_KWARGS,
         )
     return _stage2_llm
 
@@ -341,6 +365,28 @@ def _make_block_tool_message(tool_call_id: str, reason: str) -> ToolMessage:
     )
 
 
+def _make_sibling_skip_tool_message(tool_call_id: str, tool_name: str) -> ToolMessage:
+    """Synthetic message for a tool_call whose sibling in the same batch was blocked.
+
+    Gemini requires the number of function_response parts to equal the
+    number of function_call parts in a turn — leaving any tool_call
+    without a matching ToolMessage triggers a 400 INVALID_ARGUMENT on
+    the next agent call. When the judge blocks one call in a multi-call
+    AIMessage and routes back to `agent` (skipping `tools`), every other
+    tool_call must also be paired here, or the whole batch desyncs.
+    """
+    return ToolMessage(
+        name=_BLOCK_TOOL_NAME,
+        tool_call_id=tool_call_id,
+        status="error",
+        content=(
+            f"SKIPPED: a sibling tool call in this batch was blocked by "
+            f"the safety judge, so `{tool_name}` was not executed. "
+            f"Re-issue any still-needed calls after addressing the block."
+        ),
+    )
+
+
 def _make_escalation_ai_message(consecutive: int, total: int) -> AIMessage:
     """Backstop: emit an AIMessage that route_after_judge sends to END."""
     return AIMessage(
@@ -385,39 +431,76 @@ async def _stage_1(user_messages: str, tool_call: dict) -> Literal["safe", "revi
         return "review"
 
 
+def _parse_stage2_response(raw: str) -> tuple[Literal["approve", "block", "pass"], str]:
+    """Parse a Stage 2 LLM response into (verdict, reason).
+
+    Tolerant of three observed failure modes:
+    - JSON mode strays and wraps output in ```json ... ``` fences
+    - Model emits prose before/after the JSON object
+    - Top-level value is not a dict (e.g. a JSON list) — coerce to pass
+    """
+    text = raw.strip()
+    # Strip ```json ... ``` or plain ``` ... ``` fences if present.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        return "pass", "(non-dict response)"
+    verdict_raw = data.get("verdict", "pass")
+    verdict = str(verdict_raw).lower() if verdict_raw is not None else "pass"
+    if verdict not in ("approve", "block", "pass"):
+        verdict = "pass"
+    reason = (data.get("reason") or "").strip() or "(no reason given)"
+    return verdict, reason  # type: ignore[return-value]
+
+
 async def _stage_2(
     user_messages: str, tool_call: dict, denial_count: int
 ) -> tuple[Literal["approve", "block", "pass"], str]:
-    """Chain-of-thought classifier. Returns (verdict, reason)."""
+    """Chain-of-thought classifier. Returns (verdict, reason).
+
+    Retries once on parse failure or transient LLM errors. Gemini under
+    load occasionally returns malformed JSON or empty content even in
+    JSON mode; a single re-call usually clears it. If both attempts
+    fail, fall back to "pass" (fail-open) — the judge exists to catch
+    model mistakes, so breaking the agent when the judge itself breaks
+    is worse than letting the call ship.
+    """
     prompt = _STAGE_2_PROMPT.format(
         user_messages=user_messages,
         tool_name=tool_call.get("name", "?"),
         tool_args_json=json.dumps(tool_call.get("args") or {}, default=str),
         denial_count=denial_count,
     )
-    try:
-        resp = await _get_stage2_llm().ainvoke([HumanMessage(content=prompt)])
-        raw = _extract_text(resp.content).strip()
-        # Strip code fences if Gemini wrapped the JSON in ```json ... ```
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        data = json.loads(raw)
-        verdict = data.get("verdict", "pass").lower()
-        if verdict not in ("approve", "block", "pass"):
-            verdict = "pass"
-        reason = (data.get("reason") or "").strip() or "(no reason given)"
-        return verdict, reason  # type: ignore[return-value]
-    except Exception as e:
-        logger.warning(
-            "[judge] stage_2 call failed, defaulting to pass (do not block): %s", e
-        )
-        # Fail-open on judge errors. The whole point of the judge is to
-        # catch model mistakes; if the judge itself is broken, the right
-        # default is to let the call through, not to break the agent.
-        return "pass", f"judge_error: {type(e).__name__}"
+    last_err: Exception | None = None
+    last_raw: str | None = None
+    for attempt in (1, 2):
+        try:
+            resp = await _get_stage2_llm().ainvoke([HumanMessage(content=prompt)])
+            raw = _extract_text(resp.content).strip()
+            last_raw = raw
+            if not raw:
+                raise ValueError("empty response")
+            return _parse_stage2_response(raw)
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "[judge] stage_2 attempt %d failed (%s: %s); raw=%r",
+                attempt,
+                type(e).__name__,
+                e,
+                (last_raw or "")[:300],
+            )
+    # Both attempts failed — fail-open with diagnostic info.
+    return "pass", f"judge_error: {type(last_err).__name__}"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -521,6 +604,7 @@ async def judge_writes_node(state) -> dict:
     user_messages = _extract_user_messages(messages)
 
     blocks: list[ToolMessage] = []
+    blocked_ids: set[str] = set()
     for tc in last.tool_calls:
         name = tc.get("name", "")
         if name not in WRITE_TOOL_NAMES:
@@ -539,6 +623,20 @@ async def judge_writes_node(state) -> dict:
         )
         if verdict == "block":
             blocks.append(_make_block_tool_message(tc["id"], reason))
+            blocked_ids.add(tc["id"])
         # approve / pass / shadow-block all fall through (no block emitted)
+
+    # If we issued any block, route_after_judge will send the graph back
+    # to `agent` (not `tools`), so any tool_call without a ToolMessage
+    # here would leave Gemini's function_call / function_response counts
+    # unbalanced on the next turn → 400 INVALID_ARGUMENT. Pair every
+    # unblocked sibling call with a synthetic skip message.
+    if blocks:
+        for tc in last.tool_calls:
+            if tc["id"] in blocked_ids:
+                continue
+            blocks.append(
+                _make_sibling_skip_tool_message(tc["id"], tc.get("name", "?"))
+            )
 
     return {"messages": blocks}

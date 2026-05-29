@@ -45,7 +45,7 @@ def mock_llm():
 def test_static_tools_list(mock_llm):
     _, agent = mock_llm
     assert len(agent.STATIC_TOOLS) == len(agent.ALL_TOOLS)
-    assert len(agent.ALL_TOOLS) == 82  # Static tools (memory tools added per-user separately)
+    assert len(agent.ALL_TOOLS) == 85  # Static tools (memory tools added per-user separately)
     tool_names = {t.name for t in agent.STATIC_TOOLS}
     assert "query_cloud_logs" in tool_names
     assert "list_cloud_run_services" in tool_names
@@ -57,6 +57,8 @@ def test_static_tools_list(mock_llm):
     assert "github_search_issues" in tool_names
     assert "github_get_issue_details" in tool_names
     assert "github_create_issue" in tool_names
+    assert "github_get_issue_type" in tool_names
+    assert "github_set_issue_type" in tool_names
     assert "github_list_workflow_runs" in tool_names
     assert "github_get_workflow_run_details" in tool_names
     # Social media tools
@@ -126,7 +128,7 @@ def test_system_prompt_defined(mock_llm):
     assert "FedRAMP" in agent.SYSTEM_PROMPT
     assert "OSCAL" in agent.SYSTEM_PROMPT
     assert "FR2615441197" in agent.SYSTEM_PROMPT
-    assert "Quote-ly/Fedramp" in agent.SYSTEM_PROMPT
+    assert "virtualdojo-inc/Fedramp" in agent.SYSTEM_PROMPT
     assert "fedramp_collect_evidence" in agent.SYSTEM_PROMPT or "fedramp_evidence_summary" in agent.SYSTEM_PROMPT
     # Step budget guidance (prevents recursion limit exhaustion)
     assert "STEP BUDGET" in agent.SYSTEM_PROMPT
@@ -383,14 +385,19 @@ def test_needs_pro_model_for_troubleshooting(mock_llm):
     assert agent._needs_pro_model([HumanMessage(content="the API is broken, what's wrong?")])
     assert agent._needs_pro_model([HumanMessage(content="analyze code in config.py for the bug")])
     assert agent._needs_pro_model([HumanMessage(content="I see a traceback in the logs")])
+    # Operational / log-analysis phrasings — added 2026-05 because Flash
+    # was being chosen for these and quality suffered.
+    assert agent._needs_pro_model([HumanMessage(content="check the logs for errors")])
+    assert agent._needs_pro_model([HumanMessage(content="review the samurai gcloud logs")])
+    assert agent._needs_pro_model([HumanMessage(content="list cloud run services")])
+    assert agent._needs_pro_model([HumanMessage(content="any errors lately?")])
+    assert agent._needs_pro_model([HumanMessage(content="what happened during the outage?")])
 
 
 def test_needs_flash_model_for_simple_queries(mock_llm):
     _, agent = mock_llm
     from langchain_core.messages import HumanMessage
 
-    assert not agent._needs_pro_model([HumanMessage(content="check the logs for errors")])
-    assert not agent._needs_pro_model([HumanMessage(content="list cloud run services")])
     assert not agent._needs_pro_model([HumanMessage(content="show open PRs")])
     assert not agent._needs_pro_model([HumanMessage(content="send a message to Cyrus")])
     assert not agent._needs_pro_model([HumanMessage(content="list my background tasks")])
@@ -413,17 +420,17 @@ def test_pro_model_keywords_defined(mock_llm):
 @pytest.mark.asyncio
 async def test_build_graph_creates_two_llms(mock_llm):
     mock_cls_instance, agent = mock_llm
-    # ChatGoogleGenerativeAI should be called twice (flash + pro)
+    # ChatGoogleGenerativeAI should be called at least three times:
+    # flash (tool-deciding), pro (complex reasoning), synth (fast final draft).
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     agent._user_graphs.clear()
     await agent._build_graph("test-user")
-    # The mock class is called twice — once for flash, once for pro
-    assert ChatGoogleGenerativeAI.call_count >= 2
+    assert ChatGoogleGenerativeAI.call_count >= 3
     calls = ChatGoogleGenerativeAI.call_args_list
-    models = [c.kwargs.get("model") or c.args[0] if c.args else c.kwargs.get("model") for c in calls[-2:]]
-    assert "gemini-3-flash-preview" in models
-    assert "gemini-3.1-pro-preview" in models
+    models = [c.kwargs.get("model") for c in calls]
+    assert "gemini-3.5-flash" in models
+    assert "gemini-2.5-flash-lite" in models
 
 
 def _mock_astream(final_content="ok"):

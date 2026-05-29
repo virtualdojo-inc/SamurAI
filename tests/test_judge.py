@@ -228,6 +228,132 @@ async def test_stage2_block_emits_synthetic_tool_message(monkeypatch):
     assert "BLOCKED" in block.content
 
 
+async def _judge_with_block_stub(messages, block_only_first: bool = True):
+    """Run judge_writes_node with stage1=review. By default, stage2 blocks
+    only the first write call it sees and approves the rest — this lets
+    us assert the sibling-pairing fix without every call ending in BLOCKED.
+    """
+    import judge
+
+    if block_only_first:
+        block_resp = MagicMock(content=json.dumps({"verdict": "block", "reason": "wrong target"}))
+        approve_resp = MagicMock(content=json.dumps({"verdict": "approve", "reason": "looks fine"}))
+        stage2 = MagicMock()
+        stage2.ainvoke = AsyncMock(side_effect=[block_resp, approve_resp, approve_resp, approve_resp])
+    else:
+        stage2 = _stub_llm(json.dumps({"verdict": "block", "reason": "wrong target"}))
+
+    with (
+        patch("judge._get_stage1_llm", return_value=_stub_llm("review")),
+        patch("judge._get_stage2_llm", return_value=stage2),
+    ):
+        return await judge.judge_writes_node({"messages": messages})
+
+
+@pytest.mark.asyncio
+async def test_blocked_write_pairs_sibling_write_with_skip_message(monkeypatch):
+    """When the judge blocks one write in a multi-write batch, every other
+    tool_call must still get a paired ToolMessage. Otherwise Gemini's
+    function_call / function_response counts get out of sync on the next
+    agent turn and the whole conversation 400s with INVALID_ARGUMENT.
+
+    Regression: see Cloud Run revision samurai-bot-00136-2qz on 2026-05-26.
+    """
+    monkeypatch.setenv("SAMURAI_JUDGE_WRITES", "enforce")
+
+    ai = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "smartsheet_update_row",
+                "args": {"sheet_id": "1", "row_id": "1", "cell_values": {}},
+                "id": "call-A",
+                "type": "tool_call",
+            },
+            {
+                "name": "github_create_issue",
+                "args": {"repo": "virtualdojo-inc/virtualdojo", "title": "x"},
+                "id": "call-B",
+                "type": "tool_call",
+            },
+        ],
+    )
+    result = await _judge_with_block_stub(
+        [HumanMessage(content="do two writes"), ai]
+    )
+
+    msgs = result["messages"]
+    paired_ids = {m.tool_call_id for m in msgs if isinstance(m, ToolMessage)}
+    assert paired_ids == {"call-A", "call-B"}
+    by_id = {m.tool_call_id: m for m in msgs}
+    assert "BLOCKED" in by_id["call-A"].content
+    assert "SKIPPED" in by_id["call-B"].content
+
+
+@pytest.mark.asyncio
+async def test_blocked_write_pairs_sibling_read_with_skip_message(monkeypatch):
+    """Read-only sibling in a mixed batch also needs a paired ToolMessage
+    when a write sibling is blocked."""
+    monkeypatch.setenv("SAMURAI_JUDGE_WRITES", "enforce")
+
+    ai = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "smartsheet_update_row",
+                "args": {"sheet_id": "1", "row_id": "1", "cell_values": {}},
+                "id": "call-W",
+                "type": "tool_call",
+            },
+            {
+                "name": "smartsheet_get_sheet",
+                "args": {"sheet_id": "1"},
+                "id": "call-R",
+                "type": "tool_call",
+            },
+        ],
+    )
+    result = await _judge_with_block_stub(
+        [HumanMessage(content="read and write"), ai]
+    )
+
+    msgs = result["messages"]
+    paired_ids = {m.tool_call_id for m in msgs if isinstance(m, ToolMessage)}
+    assert paired_ids == {"call-W", "call-R"}
+
+
+@pytest.mark.asyncio
+async def test_no_block_emits_no_skip_messages(monkeypatch):
+    """If nothing is blocked, the judge stays out of the way — the `tools`
+    node handles every call, so no synthetic messages should be added."""
+    monkeypatch.setenv("SAMURAI_JUDGE_WRITES", "enforce")
+    import judge
+
+    ai = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "smartsheet_update_row",
+                "args": {"sheet_id": "1", "row_id": "1", "cell_values": {}},
+                "id": "call-A",
+                "type": "tool_call",
+            },
+            {
+                "name": "smartsheet_get_sheet",
+                "args": {"sheet_id": "1"},
+                "id": "call-R",
+                "type": "tool_call",
+            },
+        ],
+    )
+    with patch("judge._get_stage1_llm", return_value=_stub_llm("safe")):
+        result = await judge.judge_writes_node(
+            {"messages": [HumanMessage(content="all good"), ai]}
+        )
+
+    assert result["messages"] == []
+
+
 def test_judge_is_enabled_by_default(monkeypatch):
     """The judge runs by default — no env var needed. Only the literal
     "off" disables it. Any other value (typo, unset, empty) keeps it on."""
@@ -601,4 +727,90 @@ async def test_stage2_unparseable_json_defaults_to_pass(monkeypatch):
         }
         result = await judge.judge_writes_node(state)
 
+    assert result == {"messages": []}
+
+
+def test_parse_stage2_response_strips_code_fences():
+    """Gemini sometimes wraps JSON-mode output in ```json ... ``` fences."""
+    from judge import _parse_stage2_response
+
+    fenced = '```json\n{"verdict": "block", "reason": "wrong target"}\n```'
+    verdict, reason = _parse_stage2_response(fenced)
+    assert verdict == "block"
+    assert reason == "wrong target"
+
+
+def test_parse_stage2_response_handles_prose_around_json():
+    """Stray text before/after the JSON object — regex fallback recovers it."""
+    from judge import _parse_stage2_response
+
+    noisy = 'Here is my verdict: {"verdict": "approve", "reason": "ok"} hope this helps'
+    verdict, reason = _parse_stage2_response(noisy)
+    assert verdict == "approve"
+    assert reason == "ok"
+
+
+def test_parse_stage2_response_non_dict_returns_pass():
+    """If the model returns a JSON list / scalar, fall back to pass."""
+    from judge import _parse_stage2_response
+
+    verdict, reason = _parse_stage2_response('["approve"]')
+    assert verdict == "pass"
+
+
+@pytest.mark.asyncio
+async def test_stage2_retries_once_on_parse_failure(monkeypatch):
+    """First call returns garbage, second call returns valid JSON — judge
+    should use the retry result, not fail-open prematurely."""
+    monkeypatch.setenv("SAMURAI_JUDGE_WRITES", "enforce")
+    import judge
+
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(side_effect=[
+        MagicMock(content="garbage"),
+        MagicMock(content=json.dumps({"verdict": "block", "reason": "caught on retry"})),
+    ])
+    with (
+        patch("judge._get_stage1_llm", return_value=_stub_llm("review")),
+        patch("judge._get_stage2_llm", return_value=llm),
+    ):
+        state = {
+            "messages": [
+                HumanMessage(content="x"),
+                _ai_with_tool_call("smartsheet_update_row", {"sheet_id": "1", "row_id": "y", "cell_values": {}}),
+            ]
+        }
+        result = await judge.judge_writes_node(state)
+
+    # Retry produced a block → synthetic block ToolMessage should be in output.
+    assert llm.ainvoke.await_count == 2
+    assert len(result["messages"]) == 1
+    assert "BLOCKED" in result["messages"][0].content
+
+
+@pytest.mark.asyncio
+async def test_stage2_retries_once_on_empty_response(monkeypatch):
+    """Gemini sometimes returns empty content under safety filters. The
+    retry path treats empty content as a transient failure and re-calls."""
+    monkeypatch.setenv("SAMURAI_JUDGE_WRITES", "enforce")
+    import judge
+
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(side_effect=[
+        MagicMock(content=""),
+        MagicMock(content=json.dumps({"verdict": "approve", "reason": "fine"})),
+    ])
+    with (
+        patch("judge._get_stage1_llm", return_value=_stub_llm("review")),
+        patch("judge._get_stage2_llm", return_value=llm),
+    ):
+        state = {
+            "messages": [
+                HumanMessage(content="x"),
+                _ai_with_tool_call("smartsheet_update_row", {"sheet_id": "1", "row_id": "y", "cell_values": {}}),
+            ]
+        }
+        result = await judge.judge_writes_node(state)
+
+    assert llm.ainvoke.await_count == 2
     assert result == {"messages": []}

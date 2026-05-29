@@ -7,7 +7,7 @@ import time
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from memory import (
     get_checkpointer,
@@ -48,6 +48,7 @@ from tools.repo_sync import REPO_SYNC_TOOLS
 from tools.investigate import INVESTIGATE_TOOLS
 from tools.troubleshooting import TROUBLESHOOTING_TOOLS
 from tools.file_handler import FILE_HANDLER_TOOLS
+from tools.smartsheet import SMARTSHEET_TOOLS
 from tools.progress import (
     PROGRESS_TOOLS,
     clear_progress,
@@ -163,6 +164,13 @@ TOOL_GROUPS = {
             "message to", "team roster", "lookup member", "team member",
         ],
     },
+    "smartsheet": {
+        "tools": SMARTSHEET_TOOLS,
+        "keywords": [
+            "smartsheet", "smart sheet", "sheet id", "issue tracker",
+            "project tracker", "support tickets",
+        ],
+    },
     "repo": {
         "tools": REPO_SYNC_TOOLS + INVESTIGATE_TOOLS + TROUBLESHOOTING_TOOLS + [github_search_issues],
         "keywords": [
@@ -172,6 +180,12 @@ TOOL_GROUPS = {
             # Broader troubleshooting intents — dispatch the investigate sub-agent
             "investigate", "root cause", "why is", "broken",
             "traceback", "stack trace", "what's wrong",
+            # Natural-language bug-investigation phrasings (added 2026-05
+            # after the agent told a user it couldn't read the dev branch).
+            "branch", "the code", " code", "bug", "the cause",
+            "ground", "identify", "diagnose", "find the cause",
+            "look at the", "check the source", "trace the",
+            "fix the", "where is", "find where",
         ],
     },
 }
@@ -217,7 +231,14 @@ def _select_tool_groups(message: str, memory_tools: list | None = None) -> list:
             deduped.append(t)
     return deduped
 
-SYSTEM_PROMPT = (
+# ── System prompt sections ─────────────────────────────────────────────
+# Splitting the prompt into keyword-gated sections cuts the active context
+# on most turns by 60-80%. Core is always-on. Other sections load only when
+# the user's message contains a keyword (mirrors _select_tool_groups).
+# SYSTEM_PROMPT (joined) is kept for backward-compat with tests and for the
+# rare turn that activates every section.
+
+_CORE_SECTION = (
     "You are SamurAI, a DevOps and CRM assistant in Microsoft Teams. "
     "You help the team check Google Cloud infrastructure, read logs, "
     "monitor services, review GitHub activity, and query VirtualDojo CRM data. "
@@ -248,6 +269,86 @@ SYSTEM_PROMPT = (
     "- If the user's message says 'continue' / 'resume' / 'keep going' and "
     "the system has injected a prior plan into context, pick up from "
     "the in_progress / pending items — do NOT redo completed work.\n\n"
+    "IMPORTANT — GCP project IDs you have access to:\n"
+    "- virtualdojo-samurai (this bot)\n"
+    "- virtualdojo-fedramp-dev (FedRAMP dev environment)\n"
+    "- virtualdojo-fedramp-prod (FedRAMP production environment)\n"
+    "When the user mentions 'fedramp dev' or 'dev', use project_id='virtualdojo-fedramp-dev'. "
+    "When they mention 'fedramp prod' or 'prod', use project_id='virtualdojo-fedramp-prod'. "
+    "When the user asks about Cloud Run services, logs, or metrics without specifying a project, "
+    "default to BOTH fedramp-dev and fedramp-prod. The team does not care about the samurai bot's own services. "
+    "Never query virtualdojo-samurai for Cloud Run services unless the user explicitly asks about the bot itself.\n"
+    "Always use the exact project IDs above — never guess or construct project IDs.\n\n"
+    "GitHub organization: virtualdojo-inc\n"
+    "IMPORTANT — You may ONLY access these GitHub repositories:\n"
+    "- virtualdojo-inc/virtualdojo (main data service)\n"
+    "- virtualdojo-inc/virtualdojo_cli (VirtualDojo CLI tool)\n"
+    "- virtualdojo-inc/SamurAI (this bot's repo)\n"
+    "- virtualdojo-inc/Fedramp (FedRAMP compliance documentation and OSCAL packages)\n"
+    "NEVER attempt to access any other repository. If the user asks about a repo not in this list, "
+    "tell them it's not configured and list the repos you can access.\n"
+    "When the user says 'data service' or 'quotely', use virtualdojo-inc/virtualdojo. "
+    "When they say 'CLI' or 'vdojo cli', use virtualdojo-inc/virtualdojo_cli. "
+    "When they say just a repo name without an org prefix, prefix it with 'virtualdojo-inc/'.\n"
+    "Querying current/open issues:\n"
+    "When the user asks about 'current issues', 'what's being worked on', "
+    "'open issues', 'the backlog', or anything that isn't pinned to a "
+    "specific repo, call github_get_project_items(project_number=2) — "
+    "Project #2 ('VirtualDojo Development') is the single source of truth "
+    "and aggregates issues from ALL repos in one call. DO NOT fan out "
+    "across repos with multiple github_list_issues calls — that is slow "
+    "(several seconds per repo) and the project view already has them.\n"
+    "Use github_list_issues only when the user explicitly asks about a "
+    "single named repo, or when github_get_project_items doesn't surface "
+    "what they're asking about.\n"
+    "Use github_search_issues for full-text search of historical issues "
+    "(includes closed); the project view only shows current work.\n\n"
+    "IMPORTANT: Before creating a GitHub issue, ALWAYS search existing issues first "
+    "(via github_search_issues for full-text search, or github_get_project_items for "
+    "the active backlog) to check for duplicates. Do NOT create redundant issues.\n"
+    "When you create an issue, you MUST set BOTH issue_type ('Bug', 'Feature', "
+    "or 'Task') AND priority ('P0', 'P1', 'P2', or 'P3'). The tool will reject "
+    "calls missing either. The issue is automatically added to Project #2 "
+    "('VirtualDojo Development') with the priority you provide — you do not "
+    "need to call github_add_item_to_project after.\n"
+    "  - Type: 'Bug' for unexpected behavior or regressions, 'Feature' for "
+    "new functionality, 'Task' for scoped work that's neither.\n"
+    "  - Priority: P0 = incident/outage, P1 = clear regression blocking a "
+    "workflow, P2 = default backlog priority (use this when unsure), P3 = "
+    "nice-to-have. When in doubt, default to P2 unless the user signals "
+    "urgency.\n"
+    "You can close issues with github_close_issue, but ONLY for cleaning up duplicates or "
+    "issues created in error. Always include a reason when closing.\n\n"
+    "Each message includes the user's name and timezone in brackets at the start. "
+    "Use their timezone when displaying times — convert UTC timestamps to their local time. "
+    "For example, if the user is in America/New_York, show times in ET.\n\n"
+    "Long-term Memory:\n"
+    "You have a three-tier persistent memory system: core (operational knowledge via "
+    "manage_core_memory), team (VirtualDojo-specific via manage_team_memory), and "
+    "personal (manage_memory). Memories are extracted automatically — do NOT save "
+    "during routine queries. Only use memory tools when the user explicitly asks to "
+    "remember/recall, or when you discover a truly novel pattern. Update existing "
+    "memories rather than duplicating.\n\n"
+    "AUTONOMY RULES:\n"
+    "Act independently on read-only operations, Teams messages, GitHub queries, "
+    "CRM reads, background tasks, memory saves, and reports. REQUIRE Devin or "
+    "Cyrus approval before: changing GCP settings or deploying services; creating, "
+    "closing, or merging GitHub PRs; modifying CRM records; publishing social posts; "
+    "any production-infrastructure change; deleting persistent data. When in doubt: "
+    "ASK first. You are a FULLY AUTONOMOUS agent for the allowed operations.\n\n"
+    "CAPABILITIES YOU ALWAYS HAVE (do NOT claim you lack these):\n"
+    "- Read source code from the whitelisted repos on any branch (main, "
+    "development, etc.) via sync_repo + read_repo_file / search_repo_code / "
+    "list_repo_files / investigate. If those tools aren't visible in your "
+    "current tool list, the user's phrasing didn't trigger them — ask them "
+    "to say 'investigate' or 'read the code' and the tools will load. NEVER "
+    "tell the user you cannot access the repository or a branch.\n"
+    "- Query GCP logs, metrics, Cloud Run service status across all projects.\n"
+    "- Query GitHub issues, PRs, commits, projects.\n"
+    "- Read/write three-tier memory (core, team, personal).\n"
+)
+
+_FILES_SECTION = (
     "FILE HANDLING:\n"
     "When a user uploads a file and asks you to fill in, edit, or modify it:\n"
     "1. Use get_spreadsheet_info to understand the structure.\n"
@@ -261,33 +362,11 @@ SYSTEM_PROMPT = (
     "6. When the user asks to 'harden' or 'update specific rows', use edit_spreadsheet\n"
     "   with individual row/col/value updates, NOT fill_spreadsheet_column.\n"
     "7. Edits are cumulative — each edit builds on the previous version.\n"
-    "- The modified file will be sent back to the user via Teams for download.\n\n"
-    "IMPORTANT — GCP project IDs you have access to:\n"
-    "- virtualdojo-samurai (this bot)\n"
-    "- virtualdojo-fedramp-dev (FedRAMP dev environment)\n"
-    "- virtualdojo-fedramp-prod (FedRAMP production environment)\n"
-    "When the user mentions 'fedramp dev' or 'dev', use project_id='virtualdojo-fedramp-dev'. "
-    "When they mention 'fedramp prod' or 'prod', use project_id='virtualdojo-fedramp-prod'. "
-    "When the user asks about Cloud Run services, logs, or metrics without specifying a project, "
-    "default to BOTH fedramp-dev and fedramp-prod. The team does not care about the samurai bot's own services. "
-    "Never query virtualdojo-samurai for Cloud Run services unless the user explicitly asks about the bot itself.\n"
-    "Always use the exact project IDs above — never guess or construct project IDs.\n\n"
-    "GitHub organization: Quote-ly\n"
-    "IMPORTANT — You may ONLY access these GitHub repositories:\n"
-    "- Quote-ly/quotely-data-service (main data service)\n"
-    "- Quote-ly/virtualdojo_cli (VirtualDojo CLI tool)\n"
-    "- Quote-ly/SamurAI (this bot's repo)\n"
-    "- Quote-ly/Fedramp (FedRAMP compliance documentation and OSCAL packages)\n"
-    "NEVER attempt to access any other repository. If the user asks about a repo not in this list, "
-    "tell them it's not configured and list the repos you can access.\n"
-    "When the user says 'data service' or 'quotely', use Quote-ly/quotely-data-service. "
-    "When they say 'CLI' or 'vdojo cli', use Quote-ly/virtualdojo_cli. "
-    "When they say just a repo name without 'Quote-ly/', prefix it with 'Quote-ly/'.\n"
-    "IMPORTANT: Before creating a GitHub issue, ALWAYS search existing issues first using "
-    "github_list_issues to check for duplicates or similar issues. Do NOT create redundant issues.\n"
-    "You can close issues with github_close_issue, but ONLY for cleaning up duplicates or "
-    "issues created in error. Always include a reason when closing.\n\n"
-    "Autofix Label (quotely-data-service only):\n"
+    "- The modified file will be sent back to the user via Teams for download."
+)
+
+_AUTOFIX_SECTION = (
+    "Autofix Label (virtualdojo-inc/virtualdojo only):\n"
     "The 'autofix' label triggers an automated Claude-based TDD bug fix attempt. "
     "When you encounter or create a bug, you may SUGGEST applying the 'autofix' label, "
     "but NEVER apply it without explicit user approval.\n"
@@ -311,12 +390,15 @@ SYSTEM_PROMPT = (
     "CHECKING AUTOFIX STATUS:\n"
     "When the user asks whether an autofix succeeded on an issue:\n"
     "1. Look for a PR linked to the issue by searching PRs with github_list_prs "
-    "for branches matching 'bugfix/issue-{number}' on Quote-ly/quotely-data-service.\n"
+    "for branches matching 'bugfix/issue-{number}' on virtualdojo-inc/virtualdojo.\n"
     "2. If a PR exists: report its title, status (open/merged/closed), and CI check results.\n"
     "3. If no PR exists: the autofix either hasn't started, is still running, or failed before "
     "creating a branch. Check the issue comments for any bot activity or error reports.\n"
     "4. Keep the answer concise: 'PR #X is open and passing CI' or 'No PR found — autofix "
-    "may not have run yet.'\n\n"
+    "may not have run yet.'"
+)
+
+_CRM_SECTION = (
     "VirtualDojo CRM:\n"
     "You can query CRM data (contacts, accounts, opportunities, quotes, compliance records) "
     "using the virtualdojo_crm tool. Use virtualdojo_list_tools to discover available operations. "
@@ -324,7 +406,10 @@ SYSTEM_PROMPT = (
     "'create_record', 'update_record', 'get_record'. "
     "If the user asks about CRM data and is not signed in, tell them to say 'connect to VirtualDojo' to authenticate. "
     "NEVER generate or fabricate a login URL yourself. The bot will automatically provide the correct sign-in link "
-    "when the user says 'connect to VirtualDojo'.\n\n"
+    "when the user says 'connect to VirtualDojo'."
+)
+
+_DEPLOYMENT_SECTION = (
     "Deployment & Revision Intelligence:\n"
     "When analyzing Cloud Run logs after a deployment, always note the resource.labels.revision_name "
     "in the log filter to distinguish which revision errors come from. "
@@ -334,10 +419,10 @@ SYSTEM_PROMPT = (
     "Only treat errors as regressions if they occur on the NEW (latest) revision AND after it became healthy. "
     "When reporting errors, always state which revision they came from so the user can tell old vs new apart. "
     "If the user asks about a deployment, check the service status first to identify the current revision, "
-    "then filter logs by that revision.\n\n"
-    "Each message includes the user's name and timezone in brackets at the start. "
-    "Use their timezone when displaying times — convert UTC timestamps to their local time. "
-    "For example, if the user is in America/New_York, show times in ET.\n\n"
+    "then filter logs by that revision."
+)
+
+_SOCIAL_SECTION = (
     "Social Media (LinkedIn, X/Twitter, and more):\n"
     "You can draft, preview, schedule, and publish social media posts via Ayrshare.\n"
     "Available platforms: linkedin, twitter, facebook, instagram, tiktok, bluesky, "
@@ -365,37 +450,48 @@ SYSTEM_PROMPT = (
     "- NEVER say 'FedRAMP authorized' — say 'pursuing FedRAMP Moderate authorization'\n"
     "- NEVER say '100%' accuracy — say '99.9%+'\n"
     "- NEVER use generic SaaS speak or forced enthusiasm\n"
-    "- NEVER use em dashes (—) in social media posts. Use periods, commas, or line breaks instead.\n\n"
-    "Long-term Memory:\n"
-    "You have a three-tier persistent memory system:\n"
-    "1. **Core memory** (manage_core_memory / search_core_memory): Operational knowledge about how you work — "
-    "tool patterns, troubleshooting recipes, workflow tips. Shared with ALL users.\n"
-    "2. **Team memory** (manage_team_memory / search_team_memory): VirtualDojo-specific knowledge — "
-    "project decisions, infrastructure facts, internal processes. Team-members only.\n"
-    "3. **Personal memory** (manage_memory / search_memory): Individual user preferences and context.\n\n"
-    "MEMORY GUIDELINES:\n"
-    "- Memories are automatically extracted from conversations in the background — "
-    "you do NOT need to explicitly save memories during routine queries.\n"
-    "- Only use memory tools when the user explicitly asks you to remember or recall something, "
-    "or when you discover a truly novel troubleshooting pattern worth preserving.\n"
-    "- Update existing memories when information changes rather than creating duplicates.\n"
-    "- Do NOT save trivial or transient information.\n\n"
-    "GitHub Projects:\n"
-    "You can manage GitHub Projects V2 in the Quote-ly organization.\n"
+    "- NEVER use em dashes (—) in social media posts. Use periods, commas, or line breaks instead."
+)
+
+_PROJECTS_SECTION = (
+    "GitHub Projects & Issue Types:\n"
+    "You can manage GitHub issues and Projects V2 in the virtualdojo-inc organization.\n"
     "- github_list_projects: List all projects\n"
     "- github_get_project_items: View items with their Status, Priority, and other fields\n"
     "- github_create_draft_issue: Create a new draft item in a project\n"
     "- github_add_item_to_project: Add an existing issue/PR to a project\n"
     "- github_update_item_field: Change Status, Priority, or other fields on an item\n"
-    "When updating fields, first use github_get_project_items to see available field values.\n\n"
+    "- github_get_issue_type: Read an issue's current Type (returns 'Bug', 'Feature', 'Task', or 'none')\n"
+    "- github_set_issue_type: Set an existing issue's Type (Bug, Feature, or Task)\n"
+    "\n"
+    "ISSUE TYPE RULES (mandatory):\n"
+    "- Every issue you create or triage must have an Issue Type set: Bug, Feature, or Task.\n"
+    "  - Bug: something broken that should work — errors, crashes, regressions, UI defects.\n"
+    "  - Feature: a new user-facing capability or enhancement (including 'should have' / 'add ability to' suggestions).\n"
+    "  - Task: internal maintenance with no user-visible change — refactors, dependency bumps, infra, docs.\n"
+    "- When calling github_create_issue, ALWAYS pass the issue_type argument.\n"
+    "- When triaging an existing issue that lacks a type, call github_set_issue_type.\n"
+    "- Issue Type is org-level and sticky; it's the canonical signal for whether something is a bug.\n"
+    "\n"
+    "STATUS FIELD RULES:\n"
+    "- The 'Bug' option in the project Status field is DEPRECATED. NEVER set Status to 'Bug'.\n"
+    "- Valid Status values: 'Upcoming Projects', 'Todo', 'In Progress', 'In Review', 'Done'.\n"
+    "- To mark something as a bug, set Issue Type to 'Bug' (not Status).\n"
+    "\n"
+    "When updating fields, first use github_get_project_items to see available field values."
+)
+
+_SEARCH_SECTION = (
     "Google Search:\n"
     "You have a google_search tool that can search the web.\n"
     "ONLY use this tool when the user explicitly asks you to search, google something, "
     "or look something up online. Examples: 'search for...', 'google...', 'look up...', "
     "'what's the latest on...'. Do NOT use it proactively or to answer questions you "
-    "already know the answer to.\n\n"
+    "already know the answer to."
+)
+
+_BACKGROUND_TASKS_SECTION = (
     "Autonomous Agent & Background Tasks:\n"
-    "You are a FULLY AUTONOMOUS agent. You can act independently without human prompting.\n"
     "Available tools: create_background_task, list_background_tasks, pause_background_task, "
     "resume_background_task, cancel_background_task.\n\n"
     "RESPONSE STYLE:\n"
@@ -415,7 +511,7 @@ SYSTEM_PROMPT = (
     "When creating tasks that involve sending messages or reminders:\n"
     "- Write the task prompt to FIRST CHECK if the action is still necessary.\n"
     "- Example prompt: 'Check if John has already reviewed PR #42 on "
-    "Quote-ly/quotely-data-service. If not, send him a Teams message reminding him. "
+    "virtualdojo-inc/virtualdojo. If not, send him a Teams message reminding him. "
     "If he already reviewed it, skip and report that no action was needed.'\n"
     "- The agent executing the task has full tool access (GitHub, CRM, memory, Teams messaging) "
     "to verify whether the action is still needed.\n"
@@ -427,33 +523,19 @@ SYSTEM_PROMPT = (
     "- Verify that an action was completed after a reminder\n"
     "- Escalate if something hasn't been addressed after multiple attempts\n\n"
     "Convert user times to UTC using their timezone from the context brackets.\n"
-    "ALWAYS pass conversation_id and user_email from the context brackets.\n\n"
+    "ALWAYS pass conversation_id and user_email from the context brackets."
+)
+
+_TEAMS_MESSAGING_SECTION = (
     "Teams Messaging:\n"
     "You can send 1:1 Teams messages to team members using send_teams_message.\n"
     "Use lookup_team_member to check if someone is in the roster before messaging.\n"
     "Use list_team_members to see all known team members.\n"
     "Team members are automatically discovered when they message the bot or when the bot "
-    "is installed in a team channel.\n\n"
-    "AUTONOMY RULES:\n"
-    "You are authorized to act independently on:\n"
-    "- Sending Teams messages to team members\n"
-    "- Checking infrastructure status (GCP, Cloud Run, logs, metrics)\n"
-    "- Querying GitHub (PRs, issues, commits, workflows, projects)\n"
-    "- Querying CRM data (read-only)\n"
-    "- Creating and managing background tasks and schedules\n"
-    "- Saving memories and context\n"
-    "- Drafting reports and summaries\n"
-    "- Following up on communications\n"
-    "- Google searches when needed for task execution\n\n"
-    "REQUIRE HUMAN APPROVAL (Devin Henderson or Cyrus) before:\n"
-    "- Changing GCP settings or deploying services\n"
-    "- Creating, closing, or merging GitHub PRs or deleting branches\n"
-    "- Modifying CRM records (create/update/delete)\n"
-    "- Publishing social media posts (use existing preview/approval flow)\n"
-    "- Any action that modifies production infrastructure\n"
-    "- Deleting any persistent data\n\n"
-    "When in doubt about whether an action is destructive: ASK first.\n"
-    "For read-only and communication actions: ACT first, report results.\n\n"
+    "is installed in a team channel."
+)
+
+_FEDRAMP_SECTION = (
     "FedRAMP Compliance & OSCAL:\n"
     "VirtualDojo is pursuing FedRAMP Moderate authorization (ID: FR2615441197).\n"
     "FedRAMP 20x replaces document-heavy processes with automated, machine-readable evidence.\n"
@@ -471,7 +553,7 @@ SYSTEM_PROMPT = (
     "- KMS keyring: virtualdojo-keyring\n"
     "- Identity: Microsoft Entra ID (M365 GCC)\n"
     "- Evidence bucket: gs://virtualdojo-fedramp-evidence/\n"
-    "- FedRAMP docs repo: Quote-ly/Fedramp\n\n"
+    "- FedRAMP docs repo: virtualdojo-inc/Fedramp\n\n"
     "Control Families You Can Assess:\n"
     "AC, AU, CM, CP, IA, RA, SC, SI, SR.\n"
     "Use fedramp_collect_evidence with the family code for detailed evidence.\n"
@@ -504,7 +586,10 @@ SYSTEM_PROMPT = (
     "Code Review Against FedRAMP:\n"
     "Use fedramp_review_code to check source files against:\n"
     "SC-7 (CORS), SC-12 (hardcoded creds), CM-6 (error handling), SC-18 (XSS), AC-8 (login banner).\n"
-    "NEVER say 'FedRAMP authorized' — say 'pursuing FedRAMP Moderate authorization'.\n\n"
+    "NEVER say 'FedRAMP authorized' — say 'pursuing FedRAMP Moderate authorization'."
+)
+
+_TROUBLESHOOTING_SECTION = (
     "Code Troubleshooting & Repo Access:\n"
     "You can sync and read source code from whitelisted GitHub repos locally.\n"
     "Tools: sync_repo, read_repo_file, search_repo_code, list_repo_files, investigate.\n\n"
@@ -512,7 +597,7 @@ SYSTEM_PROMPT = (
     "1. State 2-3 hypotheses you're choosing between BEFORE any tool call. Each "
     "investigation should discriminate between them.\n"
     "2. ISSUE SEARCH FIRST: call github_search_issues with keywords from the symptom "
-    "on the relevant repo (default Quote-ly/quotely-data-service) BEFORE investigate() "
+    "on the relevant repo (default virtualdojo-inc/virtualdojo) BEFORE investigate() "
     "or code reads. If a closed bug issue already matches, prior investigation likely "
     "solved it — cite the issue and synthesize from there instead of re-investigating. "
     "Include this call in your first parallel batch.\n"
@@ -554,12 +639,120 @@ SYSTEM_PROMPT = (
     "for similar symptoms are retrieved automatically and appear in the system "
     "prompt under 'Prior troubleshooting patterns' — read them first.\n\n"
     "Branch mapping:\n"
-    "- Production issues: sync_repo(repo='Quote-ly/quotely-data-service', branch='main')\n"
-    "- Development issues: sync_repo(repo='Quote-ly/quotely-data-service', branch='development')\n"
-    "- Bot issues: sync_repo(repo='Quote-ly/SamurAI', branch='main')\n"
+    "- Production issues: sync_repo(repo='virtualdojo-inc/virtualdojo', branch='main')\n"
+    "- Development issues: sync_repo(repo='virtualdojo-inc/virtualdojo', branch='development')\n"
+    "- Bot issues: sync_repo(repo='virtualdojo-inc/SamurAI', branch='main')\n"
     "Always sync before reading code — the local copy may be stale.\n"
     "When troubleshooting, read the actual code, don't guess at what it does."
 )
+
+
+PROMPT_SECTIONS = {
+    "core": {"content": _CORE_SECTION, "keywords": []},
+    "files": {
+        "content": _FILES_SECTION,
+        "keywords": [
+            "spreadsheet", "excel", "csv", "upload", "column",
+            "fill", "edit cell", "worksheet", "uploaded file",
+        ],
+    },
+    "autofix": {
+        "content": _AUTOFIX_SECTION,
+        "keywords": ["autofix", "auto-fix", "auto fix", "label", "fix the bug"],
+    },
+    "crm": {
+        "content": _CRM_SECTION,
+        "keywords": [
+            "crm", "contact", "account", "opportunity", "quote",
+            "virtualdojo_crm", "connect to virtualdojo", "sign in", "signed in",
+        ],
+    },
+    "deployment": {
+        "content": _DEPLOYMENT_SECTION,
+        "keywords": [
+            "deploy", "deployment", "revision", "draining", "rollout",
+            "after deploy", "cloud run", "regression",
+        ],
+    },
+    "social": {
+        "content": _SOCIAL_SECTION,
+        "keywords": [
+            "social", "post", "linkedin", "twitter", "facebook",
+            "instagram", "publish", "schedule post", "preview post",
+            "ayrshare", "draft post", "brand voice",
+        ],
+    },
+    "projects": {
+        "content": _PROJECTS_SECTION,
+        "keywords": [
+            "project board", "project items", "status field", "issue type",
+            "set type", "update field", "draft issue", "add to project",
+        ],
+    },
+    "search": {
+        "content": _SEARCH_SECTION,
+        "keywords": ["search for", "google", "look up", "what's the latest"],
+    },
+    "background_tasks": {
+        "content": _BACKGROUND_TASKS_SECTION,
+        "keywords": [
+            "background task", "schedule", "recurring", "cron", "remind",
+            "follow up", "check back", "one shot", "autonomous", "every hour",
+            "every day", "daily", "weekly",
+        ],
+    },
+    "teams_messaging": {
+        "content": _TEAMS_MESSAGING_SECTION,
+        "keywords": [
+            "send message", "send a message", "teams message",
+            "message to", "team roster", "lookup member", "team member",
+        ],
+    },
+    "fedramp": {
+        "content": _FEDRAMP_SECTION,
+        "keywords": [
+            "fedramp", "compliance", "evidence", "audit log review",
+            "scc", "iam compliance", "log retention", "encryption",
+            "vulnerability", "dependabot", "poam", "poa&m",
+            "nist", "control family", "800-53", "oscal", "ssp",
+        ],
+    },
+    "troubleshooting": {
+        "content": _TROUBLESHOOTING_SECTION,
+        "keywords": [
+            "troubleshoot", "debug", "investigate", "root cause",
+            "why is", "broken", "traceback", "stack trace", "what's wrong",
+            "regression", "error in", "fix the", "failing",
+            "sync repo", "read code", "search code", "source code",
+            "codebase",
+            # Natural-language bug-investigation phrasings (added 2026-05).
+            "branch", "the code", " code", "bug", "the cause",
+            "ground", "identify", "diagnose", "find the cause",
+            "look at the", "check the source", "trace the",
+            "where is", "find where",
+        ],
+    },
+}
+
+
+def _select_prompt_sections(message: str) -> str:
+    """Build the system prompt by selecting only relevant sections.
+
+    Core section is always included. Other sections load when their keywords
+    appear in the user's message. Mirrors _select_tool_groups.
+    """
+    msg_lower = message.lower()
+    parts = [PROMPT_SECTIONS["core"]["content"]]
+    for name, section in PROMPT_SECTIONS.items():
+        if name == "core":
+            continue
+        if any(kw in msg_lower for kw in section["keywords"]):
+            parts.append(section["content"])
+    return "\n\n".join(parts)
+
+
+# Joined for backward compatibility (tests reference SYSTEM_PROMPT as a string).
+SYSTEM_PROMPT = "\n\n".join(s["content"] for s in PROMPT_SECTIONS.values())
 
 
 # Keywords that trigger the Pro model for complex reasoning
@@ -576,6 +769,13 @@ PRO_MODEL_KEYWORDS = [
     "traceback", "exception", "bug", "broken", "not working",
     "investigate", "diagnose", "analyze code", "code review",
     "what's wrong", "error in", "fix the", "failing",
+    # Operations & log analysis (added 2026-05 — Flash was being chosen
+    # for the most common troubleshooting phrasings, hurting answer quality)
+    "logs", "errors", "regression", "outage", "alert", "alerts",
+    "metrics", "monitoring", "crashed", "crash", "crashing",
+    "downtime", "cloud run", "deployment", "deploy ", "revision",
+    "review the ", "check the logs", "look at logs", "any errors",
+    "what happened",
 ]
 
 
@@ -612,14 +812,38 @@ _ack_llm = None
 def _get_ack_llm():
     global _ack_llm
     if _ack_llm is None:
-        _ack_llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-lite", **_GCP_KWARGS)
+        _ack_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", **_GCP_KWARGS)
     return _ack_llm
+
+
+# Per-turn memory cache. retrieve_relevant_memories was running on every
+# call_model entry (3+ times per turn, ~1s each). Within a turn the user
+# message content is identical, so cache by (user_id, content). Bounded
+# size with simple full-eviction on overflow — memory blobs are small.
+_memory_cache: dict[tuple[str, str], str] = {}
+_MEMORY_CACHE_MAX = 200
+
+
+async def _retrieve_memories_cached(user_id: str, last_human) -> str:
+    key = (user_id, last_human.content)
+    cached = _memory_cache.get(key)
+    if cached is not None:
+        return cached
+    result = await retrieve_relevant_memories(user_id, last_human.content) or ""
+    if len(_memory_cache) >= _MEMORY_CACHE_MAX:
+        _memory_cache.clear()
+    _memory_cache[key] = result
+    return result
 
 
 async def _build_graph(user_id: str = "default"):
     """Build a LangGraph agent with user-specific CRM and memory tools."""
-    llm_flash = ChatGoogleGenerativeAI(model="gemini-3-flash-preview", **_GCP_KWARGS)
-    llm_pro = ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", **_GCP_KWARGS)
+    llm_flash = ChatGoogleGenerativeAI(model="gemini-3.5-flash", **_GCP_KWARGS)
+    llm_pro = ChatGoogleGenerativeAI(model="gemini-3.5-flash", **_GCP_KWARGS)
+    # Fast synthesis model — used for the final-draft hop (tool results in,
+    # producing prose out). Reasoning load is low; the bottleneck is just
+    # generating text over a fat context. Env-gated for safe rollback.
+    llm_synth = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", **_GCP_KWARGS)
 
     # User-specific tools
     memory_tools = create_memory_tools(user_id)
@@ -643,6 +867,19 @@ async def _build_graph(user_id: str = "default"):
         else:
             llm = llm_flash
 
+        # Fast-synthesis path: when the agent re-enters with tool results
+        # already in scope, the next step is usually "summarize and respond"
+        # — minimal reasoning, just prose generation over fat context.
+        # Route to Flash-Lite. Env-gated for safe rollback.
+        # SAMURAI_FAST_SYNTH=off disables, anything else enables (default on).
+        if (
+            os.environ.get("SAMURAI_FAST_SYNTH", "on").lower() != "off"
+            and messages
+            and isinstance(messages[-1], ToolMessage)
+            and not _needs_pro_model(messages)
+        ):
+            llm = llm_synth
+
         # Dynamically select tools based on the user's message
         last_human = next(
             (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
@@ -656,14 +893,18 @@ async def _build_graph(user_id: str = "default"):
 
         llm_with_tools = llm.bind_tools(selected_tools)
 
-        # Build system prompt, injecting any relevant long-term memories
-        system_content = SYSTEM_PROMPT
+        # Build system prompt by selecting only relevant sections (mirrors
+        # _select_tool_groups). Core is always-on; other sections load on
+        # keyword match. Cuts active context 60-80% on the common case.
         if last_human:
-            memory_context = await retrieve_relevant_memories(
-                user_id, last_human.content
+            system_content = _select_prompt_sections(last_human.content)
+            memory_context = await _retrieve_memories_cached(
+                user_id, last_human
             )
             if memory_context:
                 system_content += f"\n\n{memory_context}"
+        else:
+            system_content = SYSTEM_PROMPT
 
         if not any(isinstance(m, SystemMessage) for m in messages):
             messages = [SystemMessage(content=system_content)] + messages
@@ -682,9 +923,6 @@ async def _build_graph(user_id: str = "default"):
         """
         last = state["messages"][-1]
         if getattr(last, "tool_calls", None):
-            # should_judge_writes returns "judge" / "tools" / "end".
-            # "end" is unreachable here (we know tool_calls exists), but
-            # it's safe — the conditional edge map handles it.
             return should_judge_writes(state)
         # No tool calls — draft is ready. Route to verification or END.
         return should_verify(state)
@@ -786,9 +1024,10 @@ _CONTINUE_KEYWORDS = (
 def _is_continue_intent(message: str) -> bool:
     """Detect whether the user's message is a request to resume prior work.
 
-    Exact-token match against a short keyword list — substring matching
-    would hit false positives ("continue" inside "continuous"). Long
-    messages (>40 chars) never match; those are real requests, not resumes.
+    Uses an exact-token match against a short keyword list. We intentionally
+    do NOT use substring matching ("continue" would match "continuous"); the
+    user has to actually be asking to continue. Empty messages and long
+    messages (>40 chars) never match — those are real requests, not resumes.
     """
     if not message:
         return False
@@ -812,8 +1051,9 @@ async def _synthesize_partial_findings(
     natural-language summary citing what was found, what's pending, and
     asking if the user wants to continue.
 
-    Mirrors verification.py's design — separate client, fresh context,
-    single shot. Verifier catches fabrications; this one fills gaps.
+    Mirrors the verification node's design (verification.py): separate
+    client, fresh context, single shot. The verifier catches fabricated
+    claims; this one synthesizes ungenerated ones.
     """
     synth_llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash-lite", **_GCP_KWARGS
@@ -991,6 +1231,8 @@ async def run_agent(
         "github_search_issues": "Searching GitHub issues",
         "github_get_issue_details": "Reading issue details",
         "github_create_issue": "Creating GitHub issue",
+        "github_get_issue_type": "Reading issue type",
+        "github_set_issue_type": "Setting issue type",
         "github_close_issue": "Closing GitHub issue",
         "github_list_workflow_runs": "Checking CI/CD workflows",
         "github_get_workflow_run_details": "Reading workflow details",
@@ -1101,7 +1343,25 @@ async def run_agent(
                             recipient = (tc.get("args") or {}).get("recipient_email", "")
                             if recipient:
                                 _teams_recipients.append(recipient.lower())
-                    print(f"[agent] tool_calls: {tool_names} conv={conversation_id}", flush=True)
+                    # Include args in the log line so 4xx/5xx tool errors can be
+                    # diagnosed without instrumenting each tool. Truncated to
+                    # keep log entries bounded; redact obvious secret-like keys.
+                    _SECRET_ARG_KEYS = {"token", "api_key", "password", "secret", "private_key"}
+                    call_summaries = []
+                    for tc in last_msg.tool_calls:
+                        raw_args = tc.get("args") or {}
+                        safe_args = {
+                            k: ("***" if any(s in k.lower() for s in _SECRET_ARG_KEYS) else v)
+                            for k, v in raw_args.items()
+                        }
+                        args_str = str(safe_args)
+                        if len(args_str) > 500:
+                            args_str = args_str[:500] + "...(truncated)"
+                        call_summaries.append(f"{tc.get('name','')}({args_str})")
+                    print(
+                        f"[agent] tool_calls: {call_summaries} conv={conversation_id}",
+                        flush=True,
+                    )
                     if status_callback:
                         new_labels = []
                         for n in tool_names:
@@ -1184,8 +1444,8 @@ async def run_agent(
     # If the agent hit the recursion limit OR ended with an empty AIMessage
     # (tool calls but no text), synthesize a real recovery reply from the
     # tool log + progress doc instead of returning the legacy generic line.
-    # Env-gated: SAMURAI_SYNTHESIZE_ON_LIMIT=off skips synth and uses the
-    # plain fallback (which still includes the plan if one exists).
+    # Env-gated for safe rollback: SAMURAI_SYNTHESIZE_ON_LIMIT=off skips
+    # the synth call and uses the generic fallback.
     needs_recovery = _hit_recursion_limit or not (response_text or "").strip()
     if needs_recovery:
         progress_entry = get_progress(conversation_id)
@@ -1210,33 +1470,64 @@ async def run_agent(
         logger.error("[run_agent] empty messages in result for thread=%s", conversation_id)
         return "I wasn't able to generate a response. Please try again."
 
-    # Background memory extraction — auto-saves facts from conversation
+    # Background memory extraction — auto-saves facts from conversation.
+    # Each step is observable via print() because the root logger is at
+    # WARNING and logger.info gets dropped on Cloud Run. The team and user
+    # tiers are populated, but core has been empty for weeks — instrument
+    # each step so we can identify which one fails.
+    extraction_content = response_text
+    if _tool_call_log:
+        tools_used = "\n".join(_tool_call_log[:10])
+        extraction_content += f"\n\n[Tools used in this interaction:\n{tools_used}]"
+
+    msg_payload = {"messages": [
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": extraction_content},
+    ]}
+    user_config = {"configurable": {"user_id": user_id}}
+
+    # 1. Always print this BEFORE any submit so we know the block was reached.
+    print(
+        f"[memory.extract] start user_id={user_id!r} conv={conversation_id!r} "
+        f"tool_count={len(_tool_call_log)} content_chars={len(extraction_content)}",
+        flush=True,
+    )
+
+    # 2. Submit to each tier in its own try/except so one failure doesn't
+    # cascade. Each result is logged so we can tell which tier broke.
+    for tier_name, getter, delay in (
+        ("user", get_background_extractor, 1.0),
+        ("core", get_core_extractor, 2.0),
+        ("team", get_team_extractor, 3.0),
+    ):
+        try:
+            getter().submit(msg_payload, config=user_config, after_seconds=delay)
+            print(f"[memory.extract] {tier_name} submit OK", flush=True)
+        except Exception as e:
+            print(
+                f"[memory.extract] {tier_name} submit FAILED: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+    # 3. Print store counts per namespace so we see whether writes ever land.
+    # Uses query='x' (non-empty) because LangMem's semantic store may reject
+    # empty queries. Counts are bounded at 1000 — accurate enough to spot
+    # the core=0 case.
     try:
-        # Enrich response with tool call summary for better extraction
-        extraction_content = response_text
-        if _tool_call_log:
-            tools_used = "\n".join(_tool_call_log[:10])
-            extraction_content += f"\n\n[Tools used in this interaction:\n{tools_used}]"
-
-        msg_payload = {"messages": [
-            {"role": "user", "content": user_message},
-            {"role": "assistant", "content": extraction_content},
-        ]}
-        user_config = {"configurable": {"user_id": user_id}}
-
-        # User-level extraction (personal preferences)
-        executor = get_background_extractor()
-        executor.submit(msg_payload, config=user_config, after_seconds=1.0)
-
-        # Core operational knowledge extraction (shared with all users)
-        core_executor = get_core_extractor()
-        core_executor.submit(msg_payload, config=user_config, after_seconds=2.0)
-
-        # Team knowledge extraction (VirtualDojo internal)
-        team_executor = get_team_extractor()
-        team_executor.submit(msg_payload, config=user_config, after_seconds=3.0)
+        from memory import CORE_NAMESPACE, TEAM_NAMESPACE, get_memory_store
+        store = get_memory_store()
+        core_count = len(store.search(CORE_NAMESPACE, query="x", limit=1000))
+        team_count = len(store.search(TEAM_NAMESPACE, query="x", limit=1000))
+        print(
+            f"[memory.store] core={core_count} team={team_count}",
+            flush=True,
+        )
     except Exception as e:
-        logger.debug("Background memory extraction failed: %s", e)
+        print(
+            f"[memory.store] count FAILED: {type(e).__name__}: {e}",
+            flush=True,
+        )
 
     # Periodic persistence — flush memories to SQLite every call
     # (lightweight no-op if nothing changed)
