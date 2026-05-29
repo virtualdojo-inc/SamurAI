@@ -10,6 +10,7 @@ import pytest
 
 from kb import compile as kb_compile
 from kb import ingest_github
+from kb import ingest_smartsheet
 
 
 class FakeStorage:
@@ -114,6 +115,47 @@ def test_refresh_github_issues(monkeypatch):
     assert "[REDACTED-SECRET]" in fake.objs["support/raw/github-issues/issue-2.md"]
     # watermark stored
     assert fake.objs.get("support/raw/.state/github_last_sync.txt")
+
+
+# ---- smartsheet discovery + routing -----------------------------------------
+
+def test_smartsheet_classify():
+    # DH Tech Issue Tracker id → support (known id + name)
+    assert ingest_smartsheet._classify("1146352141553540", "DH Tech Issue Tracker") == "support"
+    # onboarding by name
+    assert ingest_smartsheet._classify("999", "Customer Onboarding 2026") == "onboarding"
+    # support by name keyword
+    assert ingest_smartsheet._classify("888", "Support Tickets") == "support"
+    # unknown → skipped
+    assert ingest_smartsheet._classify("777", "Q3 Revenue Forecast") is None
+
+
+def test_smartsheet_ingest_routes_by_scope(monkeypatch):
+    fake = FakeStorage()
+    monkeypatch.setattr(ingest_smartsheet, "storage", fake)
+
+    def _fake_get(path, params=None):
+        if path == "/sheets":
+            return {"data": [
+                {"id": 1146352141553540, "name": "DH Tech Issue Tracker"},
+                {"id": 222, "name": "Customer Onboarding"},
+                {"id": 333, "name": "Finance Forecast"},  # skipped
+            ]}
+        # sheet detail
+        sid = int(path.split("/")[-1])
+        return {
+            "id": sid, "name": "S",
+            "columns": [{"id": 1, "title": "Issue"}],
+            "rows": [{"id": 10, "rowNumber": 1, "cells": [{"columnId": 1, "displayValue": "login fails"}]}],
+        }
+
+    monkeypatch.setattr(ingest_smartsheet, "_get", _fake_get)
+    stats = ingest_smartsheet.ingest_smartsheet()
+    assert stats["support_rows"] == 1
+    assert stats["onboarding_rows"] == 1
+    assert stats["skipped_sheet_ids"] == ["333"]
+    assert any(k.startswith("support/raw/smartsheet/sheet-1146352141553540-") for k in fake.objs)
+    assert any(k.startswith("customers/onboarding/raw/smartsheet/sheet-222-") for k in fake.objs)
 
 
 # ---- compile ----------------------------------------------------------------
