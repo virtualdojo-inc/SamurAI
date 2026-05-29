@@ -1,0 +1,113 @@
+name: Nightly Self-Improvement
+
+# Once a night, Claude reads SamurAI's production signals (GCP logs) and the
+# current skills, proposes improvements to skills/ (and their tests), runs the
+# test suite, and opens a PR labeled `self-improve`. The claude-pr-review
+# workflow then reviews + (on approval and green CI) auto-merges, which triggers
+# the deploy workflow.
+#
+# SAFETY RAILS:
+#   - Gated by the SELF_IMPROVE_ENABLED repo variable (kill switch).
+#   - Requires the ANTHROPIC_API_KEY secret.
+#   - The agent is instructed to touch ONLY skills/ and tests/; the review
+#     workflow enforces that with a hard path-allowlist gate before any merge.
+
+on:
+  schedule:
+    - cron: "0 8 * * *" # 08:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: self-improve
+  cancel-in-progress: true
+
+jobs:
+  improve:
+    if: vars.SELF_IMPROVE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    env:
+      PROJECT: ${{ vars.GCP_PROJECT }}
+      SERVICE: ${{ vars.GCP_SERVICE }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Gather production signals (last 24h)
+        run: |
+          mkdir -p signals
+          BASE='resource.type="cloud_run_revision" AND resource.labels.service_name="'"$SERVICE"'"'
+          gcloud logging read "$BASE AND severity>=ERROR AND NOT textPayload:\"OutOfOrderError\"" \
+            --project "$PROJECT" --freshness=1d --limit=200 \
+            --format='value(timestamp,resource.labels.revision_name,textPayload)' > signals/errors.txt || true
+          gcloud logging read "$BASE AND (textPayload:\"on_turn_error\" OR textPayload:\"recursion_limit_hit\" OR textPayload:\"[judge.stage2]\" OR textPayload:\"verification.shadow\")" \
+            --project "$PROJECT" --freshness=1d --limit=200 \
+            --format='value(timestamp,textPayload)' > signals/notable.txt || true
+          echo "Errors: $(wc -l < signals/errors.txt) lines; Notable: $(wc -l < signals/notable.txt) lines"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Claude — analyze signals and improve skills
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are SamurAI's nightly self-improvement agent. Your job is to make
+            ONE focused, well-justified improvement to SamurAI's agent skills,
+            grounded in last night's production signals.
+
+            STRICT SCOPE — you may ONLY create or edit files under:
+              - skills/**     (skill directories with SKILL.md, per skills.py)
+              - tests/**      (tests for skills)
+            Do NOT touch agent.py, app.py, tools/, or any other file. A CI gate
+            will reject the PR if you do.
+
+            Inputs to read:
+              - signals/errors.txt and signals/notable.txt (last 24h of prod logs)
+              - skills/*/SKILL.md (current skills) and skills.py (the loader +
+                frontmatter rules: name <=64 chars [a-z0-9-], non-empty
+                description <=1024 chars, no reserved words 'anthropic'/'claude')
+              - CLAUDE.md for project conventions and the facts-only rule.
+
+            Pick the single highest-value change, e.g.:
+              - Add a new skill capturing a recurring troubleshooting recipe seen
+                in the signals.
+              - Sharpen an existing skill's description (it drives selection) or
+                fix outdated/incorrect guidance.
+              - Add a missing best-practice step a recurring error suggests.
+            Keep skills concise (SKILL.md body < 500 lines), third-person
+            descriptions, grounded in the signals or the codebase — no
+            speculation. Do online research with WebSearch if it improves a skill.
+
+            Then:
+              1. Add/adjust tests in tests/test_skills.py for any new/changed skill.
+              2. Run: python -m pytest tests/test_skills.py -q  (must pass).
+              3. Create a branch self-improve/<short-slug>, commit, push.
+              4. Open a PR with `gh pr create`, label it `self-improve`, and write
+                 a body explaining the signal you observed, the change, and why.
+            If the signals show nothing worth changing, do NOT open a PR — say so.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 40
+            --allowedTools "Read,Edit,Write,Glob,Grep,WebSearch,WebFetch,Bash(git:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(python:*),Bash(python -m pytest:*),Bash(ls:*),Bash(cat:*),Bash(wc:*)"

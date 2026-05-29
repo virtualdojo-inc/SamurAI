@@ -78,6 +78,17 @@ SamurAI acts independently on read-only operations, communications, and scheduli
 - Publishing social media posts
 - Deleting persistent data
 
+**Exception — autonomous self-improvement pipeline (CI, not the runtime bot):**
+The nightly self-improvement GitHub Actions pipeline is authorized to open,
+review, auto-merge, and deploy changes **without human approval**, but ONLY
+within a tightly bounded scope: changes limited to `skills/**` and `tests/**`,
+enforced by a hard path-allowlist CI gate, with the full test suite as a
+non-negotiable gate and a Claude reviewer approval required before merge. Merges
+deploy via the blue/green, health-gated, auto-rollback deploy workflow. Core code
+(`agent.py`, `app.py`, `tools/`, infra) is out of scope and still requires a
+human. The pipeline is gated by the `SELF_IMPROVE_ENABLED` repo variable (kill
+switch) and the `ANTHROPIC_API_KEY` secret. See "Skills and self-improvement".
+
 ## Tech stack
 
 - **Runtime**: Python 3.12, aiohttp, Microsoft Bot Framework SDK
@@ -188,6 +199,47 @@ The bot uses a **SingleTenant** Azure Bot Service registration. All three of the
 1. `MICROSOFT_APP_TENANT_ID` is set on the Cloud Run service (this was missing once and caused a full outage)
 2. The client secret in GCP Secret Manager matches a valid credential on the Azure app registration (`az ad app credential list --id 35e1851a-0377-47f3-8b47-09110fec743c`)
 3. The Azure Bot Service app type (`az bot show --name samurai-dojo-bot --resource-group samurai-rg --query 'properties.msaAppType'`) is `SingleTenant`
+
+## Skills and self-improvement
+
+### Skills (`skills/` + `skills.py`)
+SamurAI has an Agent-Skills capability modeled on Anthropic's Agent Skills.
+A skill is a directory `skills/<name>/SKILL.md` with YAML frontmatter
+(`name` + `description`) and a markdown body of procedural knowledge.
+Progressive disclosure:
+- **Level 1 (always in prompt):** every skill's `name` + `description`, injected
+  via `skills.skills_catalog_text()` into the system prompt in
+  `agent._select_prompt_sections`.
+- **Level 2 (on demand):** the full `SKILL.md` body, fetched by the `get_skill`
+  tool (a core, always-available tool) when the agent judges a skill relevant.
+
+`skills.py` validates frontmatter (name `[a-z0-9-]` ≤64 chars, no reserved words
+`anthropic`/`claude`; non-empty description ≤1024 chars) and skips malformed
+skills with a warning rather than crashing. Skills are plain files so they can be
+tuned via ordinary PRs — this is the surface the nightly self-improvement loop
+edits.
+
+### CI/CD (`.github/workflows/`)
+- `deploy.yml` — on push to `main`: full test suite gates a **blue/green** deploy
+  (deploy candidate with `--no-traffic --tag`, health-check `/health` on the
+  candidate's tagged URL, promote to 100% only if healthy, re-verify prod, and
+  **auto-rollback** to the previous revision if the post-promote check fails).
+  Auth is keyless via Workload Identity Federation. A bad build cannot take the
+  bot down. (Infra details in the memory note `project_samurai_cicd`.)
+- `nightly-self-improve.yml` — cron nightly: reads last-24h GCP logs + current
+  skills, makes ONE scoped improvement to `skills/**` (+ tests), runs tests, and
+  opens a PR labeled `self-improve`.
+- `claude-pr-review.yml` — on `self-improve` PRs: hard path-allowlist gate
+  (`skills/**`, `tests/**` only) → full tests → Claude review → auto-merge
+  (squash) on approval marker. Human PRs are never auto-merged here.
+- `deploy-troubleshoot.yml` — on a failed deploy: Claude reads the failed run
+  logs, and either opens a scoped fix PR (`self-improve`) or files an issue if
+  the fix is risky.
+
+**Enabling the loop:** set repo variable `SELF_IMPROVE_ENABLED=true` (kill
+switch) and add the `ANTHROPIC_API_KEY` repo secret. Scope is enforced in CI,
+not just by prompt. The Claude-in-CI agents use `anthropics/claude-code-action@v1`
+pinned to `claude-sonnet-4-6`.
 
 ## Running tests
 

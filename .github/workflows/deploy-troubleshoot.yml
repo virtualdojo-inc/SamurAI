@@ -1,0 +1,81 @@
+name: Deploy Troubleshoot
+
+# When a deploy to main fails, Claude pulls the failed run's logs, diagnoses the
+# cause, and opens a scoped fix PR (labeled `self-improve` so the review +
+# auto-merge pipeline picks it up). Production safety is already handled by the
+# deploy workflow itself: a failed candidate never receives traffic, and a bad
+# promote auto-rolls-back to the previous revision — so the bot stays up while
+# this runs.
+#
+# Gated by SELF_IMPROVE_ENABLED + ANTHROPIC_API_KEY.
+
+on:
+  workflow_run:
+    workflows: ["Deploy to Cloud Run"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  troubleshoot:
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      vars.SELF_IMPROVE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch failed run logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          mkdir -p signals
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed > signals/deploy-failure.txt 2>&1 || \
+            gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log > signals/deploy-failure.txt 2>&1 || true
+          echo "Captured $(wc -l < signals/deploy-failure.txt) log lines from run $RUN_ID"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Claude — diagnose the deploy failure
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            The "Deploy to Cloud Run" workflow on main just FAILED. Production is
+            safe (the failed revision never received traffic; a bad promote auto-
+            rolled-back), so your job is to find the cause and propose a fix.
+
+            Read signals/deploy-failure.txt (the failed run's logs). Diagnose the
+            root cause: a failing test, a build/Dockerfile error, a missing
+            dependency in requirements*.txt, an unavailable model/resource, etc.
+
+            Apply the facts-only rule from CLAUDE.md — ground the diagnosis in the
+            actual log lines, not assumptions.
+
+            If there is a clear, low-risk fix (e.g. a missing test dependency, an
+            obviously broken test, a small build fix):
+              1. Make the minimal change.
+              2. Run python -m pytest tests/ -q to confirm green.
+              3. Create branch deploy-fix/<slug>, commit, push, and open a PR with
+                 `gh pr create`. Label it `self-improve` and explain the failure +
+                 fix in the body.
+            If the cause is ambiguous or the fix is risky (touches app.py, infra,
+            secrets, or migrations), do NOT open a code PR — instead open a GitHub
+            issue summarizing the diagnosis and recommended next steps for a human.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 30
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh issue create:*),Bash(python:*),Bash(python -m pytest:*),Bash(ls:*),Bash(cat:*),Bash(wc:*)"

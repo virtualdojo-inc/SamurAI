@@ -65,6 +65,7 @@ from verification import (
     should_verify,
     should_route_from_verification,
 )
+from skills import SKILL_TOOLS, skills_catalog_text
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,7 @@ TOOL_GROUPS = {
             gcp_billing_summary,
             google_search,
             *PROGRESS_TOOLS,
+            *SKILL_TOOLS,
         ],
         "keywords": [],  # Always loaded
     },
@@ -748,6 +750,11 @@ def _select_prompt_sections(message: str) -> str:
             continue
         if any(kw in msg_lower for kw in section["keywords"]):
             parts.append(section["content"])
+    # Skills catalog (level-1 disclosure): always advertise available skills so
+    # the agent can pull a skill's full body via get_skill when relevant.
+    catalog = skills_catalog_text()
+    if catalog:
+        parts.append(catalog)
     return "\n\n".join(parts)
 
 

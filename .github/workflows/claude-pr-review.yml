@@ -1,0 +1,109 @@
+name: Self-Improve PR Review
+
+# Reviews autonomous self-improvement PRs (label `self-improve`) and, on Claude
+# approval + green CI + in-scope changes, auto-merges them. Merge to main then
+# triggers the deploy workflow (blue/green, health-gated, auto-rollback).
+#
+# Order of gates (all must pass before merge):
+#   1. scope-guard — PR diff must be limited to skills/** and tests/**
+#   2. test        — full pytest suite
+#   3. review      — Claude reviews; only an explicit approval marker auto-merges
+# Human-authored PRs (no `self-improve` label) are NOT auto-merged by this
+# workflow; they merge normally with human review.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  scope-guard:
+    if: contains(github.event.pull_request.labels.*.name, 'self-improve')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Enforce change scope (skills/ and tests/ only)
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          FILES=$(git diff --name-only "$BASE"...HEAD)
+          echo "Changed files:"; echo "$FILES"
+          BAD=$(echo "$FILES" | grep -vE '^(skills/|tests/)' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::Self-improve PR touches files outside the allowlist (skills/, tests/):"
+            echo "$BAD"
+            exit 1
+          fi
+          echo "Scope OK."
+
+  test:
+    needs: scope-guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  review:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude — review the self-improvement PR
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review this self-improvement PR for SamurAI. It should make ONE
+            focused, well-justified improvement to skills/ (and tests/), grounded
+            in production signals.
+
+            Check:
+              - Change is limited to skills/** and tests/** (scope-guard already
+                enforced this, but confirm the intent).
+              - Skill frontmatter is valid (name [a-z0-9-] <=64 chars; non-empty
+                third-person description <=1024 chars; no 'anthropic'/'claude').
+              - Guidance is accurate and grounded (facts-only) — no speculative or
+                fabricated steps; consistent with CLAUDE.md conventions.
+              - Tests cover the change and are meaningful.
+
+            If it is correct, safe, and a genuine improvement, post a PR comment
+            containing exactly the marker `SELF_IMPROVE_APPROVED` plus a short
+            rationale. Otherwise, request changes with specific, actionable
+            inline/PR comments and do NOT include that marker.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 15
+            --allowedTools "Read,Glob,Grep,Bash(git:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr review:*)"
+
+      - name: Auto-merge on approval
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if gh pr view "$PR" --json comments -q '.comments[].body' | grep -q "SELF_IMPROVE_APPROVED"; then
+            echo "Claude approved. Enabling auto-merge (merges once all checks are green)."
+            gh pr review "$PR" --approve
+            gh pr merge "$PR" --squash --auto --delete-branch
+          else
+            echo "No approval marker found — leaving PR open for revision."
+            exit 1
+          fi
