@@ -4,6 +4,7 @@ All tests use a fake in-memory storage and a fake LLM — no real GCS bucket and
 Vertex calls, so nothing touches protected data.
 """
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from kb import compile as kb_compile
 from kb import ingest_github
 from kb import ingest_smartsheet
+from kb import run as kb_run
 
 
 class FakeStorage:
@@ -197,6 +199,62 @@ def test_compile_engine_is_in_boundary_gemini(monkeypatch):
     assert eng["engine"] == "vertex-gemini"
     assert eng["external_llm"] is False
     assert eng["location"] != "global"  # regional, in-boundary
+
+
+def test_compile_bounded_and_resumes(monkeypatch):
+    """#1 + #2: bounded batch per call; a second call resumes the rest with no
+    re-extraction (manifest persisted per doc)."""
+    fake = FakeStorage()
+    for i in range(3):
+        fake.objs[f"support/raw/github-issues/issue-{i}.md"] = f"login issue number {i}"
+    monkeypatch.setattr(kb_compile, "storage", fake)
+
+    s1 = kb_compile.compile_support(llm=FakeLLM(), max_docs=2)
+    assert s1["raw_docs_processed"] == 2
+    assert s1["docs_remaining"] == 1
+    assert len(json.loads(fake.objs["support/wiki/.manifest.json"])) == 2
+
+    s2 = kb_compile.compile_support(llm=FakeLLM(), max_docs=2)
+    assert s2["raw_docs_processed"] == 1  # only the leftover doc — no re-extract
+    assert s2["docs_remaining"] == 0
+    assert len(json.loads(fake.objs["support/wiki/.manifest.json"])) == 3
+
+    s3 = kb_compile.compile_support(llm=FakeLLM(), max_docs=2)
+    assert s3["raw_docs_processed"] == 0  # fully converged
+
+
+def test_compile_checkpoints_units_and_manifest(monkeypatch):
+    """#1: manifest + units are persisted (resumable state on disk)."""
+    fake = FakeStorage()
+    fake.objs["support/raw/github-issues/issue-1.md"] = "login sso expired"
+    monkeypatch.setattr(kb_compile, "storage", fake)
+    kb_compile.compile_support(llm=FakeLLM())
+    assert "support/wiki/.manifest.json" in fake.objs
+    assert "support/wiki/.units.json" in fake.objs
+    units = json.loads(fake.objs["support/wiki/.units.json"])
+    assert "login-issues" in units["units"]
+    assert units["dirty"] == []  # cleared after articles written
+
+
+# ---- single-flight lock (#3) ------------------------------------------------
+
+def test_run_skips_when_locked(monkeypatch):
+    from kb import storage as kb_storage
+    monkeypatch.setattr(kb_storage, "acquire_lock", lambda *a, **k: False)
+    assert kb_run.run_support_pipeline(force=True) == {"skipped": "locked"}
+
+
+def test_run_acquires_and_releases_lock(monkeypatch):
+    from kb import storage as kb_storage
+    calls = {"acq": 0, "rel": 0}
+    monkeypatch.setattr(kb_storage, "acquire_lock", lambda *a, **k: (calls.__setitem__("acq", calls["acq"] + 1), True)[1])
+    monkeypatch.setattr(kb_storage, "release_lock", lambda *a, **k: calls.__setitem__("rel", calls["rel"] + 1))
+    monkeypatch.setattr(kb_run.ingest_github, "refresh_github_issues", lambda: {"issues_written": 0})
+    monkeypatch.setattr(kb_run.ingest_smartsheet, "ingest_smartsheet", lambda: {"support_rows": 0})
+    monkeypatch.setattr(kb_run.kb_compile, "compile_support", lambda **k: {"articles_written": 0})
+    out = kb_run.run_support_pipeline(force=True)
+    assert calls["acq"] == 1 and calls["rel"] == 1
+    assert "compile" in out
 
 
 # ---- support chat capture ---------------------------------------------------
