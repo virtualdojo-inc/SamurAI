@@ -130,7 +130,7 @@ def test_list_commits_format(mock_gh):
         _make_commit("abc1234567890", "Fix typo in readme", "alice"),
         _make_commit("def4567890123", "Add CI pipeline\n\ndetails here", "bob"),
     ]
-    mock_gh.return_value.get_repo.return_value.get_commits.return_value.__getitem__ = lambda s, k: commits
+    mock_gh.return_value.get_repo.return_value.get_commits.return_value.__iter__ = lambda s: iter(commits)
 
     result = github_list_recent_commits.invoke({"repo": "org/repo"})
 
@@ -276,13 +276,13 @@ def test_search_issues_scopes_query_to_repo(mock_gh):
 
     mock_gh.return_value.search_issues.return_value = []
     github_search_issues.invoke(
-        {"query": "api key activities", "repo": "Quote-ly/quotely-data-service"}
+        {"query": "api key activities", "repo": "virtualdojo-inc/virtualdojo"}
     )
 
     query_arg = mock_gh.return_value.search_issues.call_args.kwargs.get(
         "query"
     ) or mock_gh.return_value.search_issues.call_args.args[0]
-    assert "repo:Quote-ly/quotely-data-service" in query_arg
+    assert "repo:virtualdojo-inc/virtualdojo" in query_arg
     assert "api key activities" in query_arg
 
 
@@ -294,7 +294,7 @@ def test_search_issues_strips_repo_qualifier_if_model_adds_it(mock_gh):
 
     mock_gh.return_value.search_issues.return_value = []
     github_search_issues.invoke(
-        {"query": "repo:foo/bar some symptom", "repo": "Quote-ly/quotely-data-service"}
+        {"query": "repo:foo/bar some symptom", "repo": "virtualdojo-inc/virtualdojo"}
     )
 
     query_arg = mock_gh.return_value.search_issues.call_args.kwargs.get(
@@ -302,7 +302,7 @@ def test_search_issues_strips_repo_qualifier_if_model_adds_it(mock_gh):
     ) or mock_gh.return_value.search_issues.call_args.args[0]
     # Exactly one repo: qualifier, and it's the tool's, not the model's
     assert query_arg.count("repo:") == 1
-    assert "repo:Quote-ly/quotely-data-service" in query_arg
+    assert "repo:virtualdojo-inc/virtualdojo" in query_arg
     assert "some symptom" in query_arg
 
 
@@ -321,7 +321,7 @@ def test_search_issues_formats_results(mock_gh):
     mock_gh.return_value.search_issues.return_value = paginated
 
     out = github_search_issues.invoke(
-        {"query": "api key", "repo": "Quote-ly/quotely-data-service"}
+        {"query": "api key", "repo": "virtualdojo-inc/virtualdojo"}
     )
 
     assert "#522" in out
@@ -370,10 +370,383 @@ def test_search_issues_state_filter(mock_gh):
     assert "state:closed" in query_arg
 
 
+# --- Issue Types: _get_issue_type_id, _get_issue_node_id, github_set_issue_type ---
+
+
+import pytest
+
+
+@pytest.fixture(autouse=False)
+def clear_issue_type_cache():
+    """Reset the module-level issue type cache between tests."""
+    from tools import github as gh_mod
+
+    gh_mod._issue_type_cache.clear()
+    yield
+    gh_mod._issue_type_cache.clear()
+
+
+@patch("tools.github._graphql")
+def test_get_issue_type_id_resolves_and_caches(mock_graphql, clear_issue_type_cache):
+    from tools.github import _get_issue_type_id
+
+    mock_graphql.return_value = {
+        "organization": {
+            "issueTypes": {
+                "nodes": [
+                    {"id": "IT_BUG", "name": "Bug", "isEnabled": True},
+                    {"id": "IT_FEAT", "name": "Feature", "isEnabled": True},
+                    {"id": "IT_TASK", "name": "Task", "isEnabled": True},
+                    {"id": "IT_OFF", "name": "Disabled", "isEnabled": False},
+                ]
+            }
+        }
+    }
+
+    assert _get_issue_type_id("Bug") == "IT_BUG"
+    assert _get_issue_type_id("Feature") == "IT_FEAT"
+    # Second + third lookups must not refetch.
+    assert mock_graphql.call_count == 1
+    # Disabled types must not be exposed.
+    with pytest.raises(ValueError, match="Disabled"):
+        _get_issue_type_id("Disabled")
+
+
+@patch("tools.github._graphql")
+def test_get_issue_type_id_raises_for_unknown(mock_graphql, clear_issue_type_cache):
+    from tools.github import _get_issue_type_id
+
+    mock_graphql.return_value = {
+        "organization": {
+            "issueTypes": {
+                "nodes": [{"id": "IT_BUG", "name": "Bug", "isEnabled": True}]
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="Nonsense"):
+        _get_issue_type_id("Nonsense")
+
+
+@patch("tools.github._graphql")
+def test_get_issue_node_id_returns_id(mock_graphql):
+    from tools.github import _get_issue_node_id
+
+    mock_graphql.return_value = {"repository": {"issue": {"id": "I_NODE"}}}
+    assert _get_issue_node_id("virtualdojo-inc/virtualdojo", 423) == "I_NODE"
+
+    sent_vars = mock_graphql.call_args.args[1]
+    assert sent_vars == {"owner": "virtualdojo-inc", "name": "virtualdojo", "num": 423}
+
+
+@patch("tools.github._graphql")
+def test_get_issue_node_id_raises_when_missing(mock_graphql):
+    from tools.github import _get_issue_node_id
+
+    mock_graphql.return_value = {"repository": {"issue": None}}
+    with pytest.raises(ValueError, match="not found"):
+        _get_issue_node_id("virtualdojo-inc/virtualdojo", 9999)
+
+
+@patch("tools.github._graphql")
+def test_get_issue_type_returns_name_when_set(mock_graphql):
+    from tools.github import github_get_issue_type
+
+    mock_graphql.return_value = {
+        "repository": {"issue": {"issueType": {"name": "Bug"}}}
+    }
+    result = github_get_issue_type.invoke(
+        {"repo": "virtualdojo-inc/virtualdojo", "issue_number": 423}
+    )
+    assert result == "Bug"
+
+
+@patch("tools.github._graphql")
+def test_get_issue_type_returns_none_when_unset(mock_graphql):
+    from tools.github import github_get_issue_type
+
+    mock_graphql.return_value = {"repository": {"issue": {"issueType": None}}}
+    result = github_get_issue_type.invoke(
+        {"repo": "virtualdojo-inc/virtualdojo", "issue_number": 999}
+    )
+    assert result == "none"
+
+
+@patch("tools.github._graphql")
+def test_get_issue_type_raises_when_issue_missing(mock_graphql):
+    from tools.github import github_get_issue_type
+
+    mock_graphql.return_value = {"repository": {"issue": None}}
+    with pytest.raises(ValueError, match="not found"):
+        github_get_issue_type.invoke(
+            {"repo": "virtualdojo-inc/virtualdojo", "issue_number": 99999}
+        )
+
+
+@patch("tools.github._graphql")
+def test_set_issue_type_happy_path(mock_graphql, clear_issue_type_cache):
+    from tools.github import github_set_issue_type
+
+    # Three calls: node id lookup, type id lookup, the mutation.
+    mock_graphql.side_effect = [
+        {"repository": {"issue": {"id": "I_NODE"}}},
+        {
+            "organization": {
+                "issueTypes": {
+                    "nodes": [{"id": "IT_BUG", "name": "Bug", "isEnabled": True}]
+                }
+            }
+        },
+        {"updateIssueIssueType": {"issue": {"number": 423}}},
+    ]
+
+    result = github_set_issue_type.invoke(
+        {"repo": "virtualdojo-inc/virtualdojo", "issue_number": 423, "issue_type": "Bug"}
+    )
+
+    assert "Bug" in result
+    assert "#423" in result
+    # Mutation should receive the resolved IDs.
+    mutation_call = mock_graphql.call_args_list[2]
+    assert mutation_call.args[1] == {"issueId": "I_NODE", "typeId": "IT_BUG"}
+
+
+# --- github_create_issue with issue_type ---
+
+
+def _project_lookup_response():
+    """GraphQL stub for the Project #2 + Priority field lookup."""
+    return {
+        "organization": {
+            "projectV2": {
+                "id": "PRJ_2",
+                "fields": {
+                    "nodes": [
+                        {
+                            "id": "FIELD_PRIORITY",
+                            "name": "Priority",
+                            "options": [
+                                {"id": "OPT_P0", "name": "P0 - Critical"},
+                                {"id": "OPT_P1", "name": "P1 - High"},
+                                {"id": "OPT_P2", "name": "P2 - Medium"},
+                                {"id": "OPT_P3", "name": "P3 - Low"},
+                            ],
+                        }
+                    ]
+                },
+            }
+        }
+    }
+
+
+def test_create_issue_rejects_missing_type_at_schema_level():
+    """The tool's schema makes issue_type required — calls without it must fail."""
+    import pytest
+    from pydantic_core import ValidationError
+    from tools.github import github_create_issue
+
+    with pytest.raises(ValidationError) as exc:
+        github_create_issue.invoke(
+            {"repo": "foo/bar", "title": "X", "body": "...", "priority": "P2"}
+        )
+    assert "issue_type" in str(exc.value)
+
+
+def test_create_issue_rejects_missing_priority_at_schema_level():
+    """The tool's schema makes priority required — calls without it must fail."""
+    import pytest
+    from pydantic_core import ValidationError
+    from tools.github import github_create_issue
+
+    with pytest.raises(ValidationError) as exc:
+        github_create_issue.invoke(
+            {"repo": "foo/bar", "title": "X", "body": "...", "issue_type": "Bug"}
+        )
+    assert "priority" in str(exc.value)
+
+
+@patch("tools.github._graphql")
+@patch("tools.github._github")
+def test_create_issue_rejects_invalid_type_value(
+    mock_gh, mock_graphql, clear_issue_type_cache
+):
+    import pytest
+    from tools.github import github_create_issue
+
+    with pytest.raises(ValueError, match="issue_type must be one of"):
+        github_create_issue.invoke(
+            {
+                "repo": "foo/bar",
+                "title": "X",
+                "body": "...",
+                "issue_type": "Story",
+                "priority": "P2",
+            }
+        )
+
+
+@patch("tools.github._graphql")
+@patch("tools.github._github")
+def test_create_issue_rejects_invalid_priority_value(
+    mock_gh, mock_graphql, clear_issue_type_cache
+):
+    import pytest
+    from tools.github import github_create_issue
+
+    with pytest.raises(ValueError, match="priority must be one of"):
+        github_create_issue.invoke(
+            {
+                "repo": "foo/bar",
+                "title": "X",
+                "body": "...",
+                "issue_type": "Bug",
+                "priority": "URGENT",
+            }
+        )
+
+
+@patch("tools.github._graphql")
+@patch("tools.github._github")
+def test_create_issue_sets_type_and_adds_to_project(
+    mock_gh, mock_graphql, clear_issue_type_cache
+):
+    from tools.github import github_create_issue
+
+    issue = MagicMock()
+    issue.number = 8
+    issue.title = "Crash on load"
+    issue.html_url = "https://github.com/foo/bar/issues/8"
+    issue.raw_data = {"node_id": "I_NEW"}
+    mock_gh.return_value.get_repo.return_value.create_issue.return_value = issue
+
+    # Sequence: issue type lookup, set type, project lookup, add to project, set priority.
+    mock_graphql.side_effect = [
+        {
+            "organization": {
+                "issueTypes": {
+                    "nodes": [{"id": "IT_BUG", "name": "Bug", "isEnabled": True}]
+                }
+            }
+        },
+        {"updateIssueIssueType": {"issue": {"number": 8}}},
+        _project_lookup_response(),
+        {"addProjectV2ItemById": {"item": {"id": "ITEM_8"}}},
+        {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "ITEM_8"}}},
+    ]
+
+    result = github_create_issue.invoke(
+        {
+            "repo": "foo/bar",
+            "title": "Crash on load",
+            "body": "stack trace",
+            "issue_type": "Bug",
+            "priority": "P1",
+        }
+    )
+
+    assert "#8" in result
+    assert "type: Bug" in result
+    assert "priority: P1" in result
+    assert "project: #2" in result
+    assert "WARNING" not in result
+
+    # Project add mutation got the issue node id and project id.
+    add_call_vars = mock_graphql.call_args_list[3].args[1]
+    assert add_call_vars == {"projectId": "PRJ_2", "contentId": "I_NEW"}
+    # Priority update got the right field + option ids.
+    set_priority_vars = mock_graphql.call_args_list[4].args[1]
+    assert set_priority_vars["fieldId"] == "FIELD_PRIORITY"
+    assert set_priority_vars["optionId"] == "OPT_P1"
+
+
+@patch("tools.github._graphql")
+@patch("tools.github._github")
+def test_create_issue_warns_when_type_set_fails(
+    mock_gh, mock_graphql, clear_issue_type_cache
+):
+    """If issue creation succeeds but type-setting fails, the issue must not be lost
+    and the project tagging should still be attempted."""
+    from tools.github import github_create_issue
+
+    issue = MagicMock()
+    issue.number = 9
+    issue.title = "Crash"
+    issue.html_url = "https://github.com/foo/bar/issues/9"
+    issue.raw_data = {"node_id": "I_NEW"}
+    mock_gh.return_value.get_repo.return_value.create_issue.return_value = issue
+
+    # Type lookup fails, but project tagging should still run and succeed.
+    mock_graphql.side_effect = [
+        RuntimeError("GraphQL boom"),
+        _project_lookup_response(),
+        {"addProjectV2ItemById": {"item": {"id": "ITEM_9"}}},
+        {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "ITEM_9"}}},
+    ]
+
+    result = github_create_issue.invoke(
+        {
+            "repo": "foo/bar",
+            "title": "Crash",
+            "body": "...",
+            "issue_type": "Bug",
+            "priority": "P2",
+        }
+    )
+
+    assert "#9" in result
+    assert "WARNING" in result
+    assert "GraphQL boom" in result
+    # Project tagging still succeeded — no warning about that.
+    assert "failed to add to Project" not in result
+
+
+@patch("tools.github._graphql")
+@patch("tools.github._github")
+def test_create_issue_warns_when_project_add_fails(
+    mock_gh, mock_graphql, clear_issue_type_cache
+):
+    """If project tagging fails, the issue is still created and typed — warn only."""
+    from tools.github import github_create_issue
+
+    issue = MagicMock()
+    issue.number = 10
+    issue.title = "X"
+    issue.html_url = "https://github.com/foo/bar/issues/10"
+    issue.raw_data = {"node_id": "I_NEW"}
+    mock_gh.return_value.get_repo.return_value.create_issue.return_value = issue
+
+    mock_graphql.side_effect = [
+        {
+            "organization": {
+                "issueTypes": {
+                    "nodes": [{"id": "IT_BUG", "name": "Bug", "isEnabled": True}]
+                }
+            }
+        },
+        {"updateIssueIssueType": {"issue": {"number": 10}}},
+        RuntimeError("project lookup failed"),
+    ]
+
+    result = github_create_issue.invoke(
+        {
+            "repo": "foo/bar",
+            "title": "X",
+            "body": "...",
+            "issue_type": "Bug",
+            "priority": "P2",
+        }
+    )
+
+    assert "#10" in result
+    assert "type: Bug" in result
+    assert "WARNING" in result
+    assert "failed to add to Project #2" in result
+    assert "project lookup failed" in result
+
+
 @patch("tools.github._github")
 def test_search_issues_handles_paginated_list_index_error(mock_gh):
     """PyGitHub's PaginatedList raises IndexError on the empty case when sliced
-    (not []) — caught Devin's Monday session where 10 parallel searches all
+    (not [])  — caught Devin's Monday session where 10 parallel searches all
     crashed with 'list index out of range' for queries returning zero results."""
     from tools.github import github_search_issues
 
@@ -382,7 +755,7 @@ def test_search_issues_handles_paginated_list_index_error(mock_gh):
     mock_gh.return_value.search_issues.return_value = paginated
 
     out = github_search_issues.invoke(
-        {"query": "nothing matches this", "repo": "Quote-ly/quotely-data-service"}
+        {"query": "nothing matches this", "repo": "virtualdojo-inc/virtualdojo"}
     )
     assert "No issues" in out
     assert "IndexError" not in out

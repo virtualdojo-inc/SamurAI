@@ -179,7 +179,7 @@ def _get_verifier_llm():
         # Use Flash — this is a discriminative task, not a reasoning one.
         # A cheaper model is fine and keeps the overhead low.
         _verifier_llm = ChatGoogleGenerativeAI(
-            model="gemini-3-flash-preview",
+            model="gemini-3.5-flash",
             project=os.environ.get("GCP_PROJECT_ID"),
             location="global",
             vertexai=True,
@@ -293,25 +293,26 @@ async def verification_node(state):
 
     if mode == VERIFY_MODE_SHADOW:
         if ungrounded:
-            logger.info(
-                "[verification.shadow] would have flagged %d claim(s): %s",
-                len(ungrounded),
-                json.dumps(ungrounded)[:2000],
+            print(
+                f"[verification.shadow] would have flagged {len(ungrounded)} "
+                f"claim(s): {json.dumps(ungrounded)[:2000]}",
+                flush=True,
             )
         else:
-            logger.info(
-                "[verification.shadow] draft verified clean (%d claims checked via raw=%s)",
-                len(ungrounded),
-                "yes" if result.get("raw") else "no",
+            print(
+                f"[verification.shadow] draft verified clean "
+                f"(raw={'yes' if result.get('raw') else 'no'})",
+                flush=True,
             )
         # Shadow mode never alters state.
         return {}
 
     if mode == VERIFY_MODE_ENFORCE:
         if ungrounded:
-            logger.info(
-                "[verification.enforce] routing back with %d ungrounded claim(s)",
-                len(ungrounded),
+            print(
+                f"[verification.enforce] routing back with {len(ungrounded)} "
+                f"ungrounded claim(s)",
+                flush=True,
             )
             return {"messages": [HumanMessage(content=_format_nudge(ungrounded))]}
         # All claims grounded — nothing to do.

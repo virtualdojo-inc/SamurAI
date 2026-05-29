@@ -2,11 +2,53 @@
 
 import os
 import time
+from itertools import islice
 
 import httpx
 from langchain_core.tools import tool
 
-GITHUB_ORG = "Quote-ly"
+GITHUB_ORG = "virtualdojo-inc"
+
+_issue_type_cache: dict[str, str] = {}
+
+
+def _get_issue_type_id(name: str) -> str:
+    """Resolve an org-level Issue Type name to its GraphQL ID. Cached per process."""
+    if name in _issue_type_cache:
+        return _issue_type_cache[name]
+    data = _graphql(
+        """query($org: String!) {
+          organization(login: $org) {
+            issueTypes(first: 20) { nodes { id name isEnabled } }
+          }
+        }""",
+        {"org": GITHUB_ORG},
+    )
+    nodes = (data.get("organization") or {}).get("issueTypes", {}).get("nodes", [])
+    for it in nodes:
+        if it.get("isEnabled"):
+            _issue_type_cache[it["name"]] = it["id"]
+    if name not in _issue_type_cache:
+        raise ValueError(
+            f"Issue Type '{name}' is not enabled on org '{GITHUB_ORG}'. "
+            f"Available: {sorted(_issue_type_cache)}"
+        )
+    return _issue_type_cache[name]
+
+
+def _get_issue_node_id(repo: str, issue_number: int) -> str:
+    """Resolve a repo+number to the issue's GraphQL node ID."""
+    owner, name = repo.split("/", 1)
+    data = _graphql(
+        """query($owner: String!, $name: String!, $num: Int!) {
+          repository(owner: $owner, name: $name) { issue(number: $num) { id } }
+        }""",
+        {"owner": owner, "name": name, "num": issue_number},
+    )
+    issue = (data.get("repository") or {}).get("issue")
+    if not issue:
+        raise ValueError(f"Issue #{issue_number} not found in {repo}")
+    return issue["id"]
 
 # Cache the token to avoid re-generating on every tool call within a request
 _token_cache: dict = {"token": None, "expires_at": 0}
@@ -65,7 +107,9 @@ def github_list_prs(repo: str, state: str = "open") -> str:
         repo: Repository in 'owner/repo' format.
         state: PR state — 'open', 'closed', or 'all'.
     """
-    pulls = _github().get_repo(repo).get_pulls(state=state, sort="updated")[:10]
+    pulls = list(
+        islice(_github().get_repo(repo).get_pulls(state=state, sort="updated"), 10)
+    )
 
     if not pulls:
         return f"No {state} PRs found in {repo}."
@@ -106,7 +150,7 @@ def github_list_recent_commits(
         branch: Branch name (default 'main').
         count: Number of commits to return (default 10).
     """
-    commits = _github().get_repo(repo).get_commits(sha=branch)[:count]
+    commits = list(islice(_github().get_repo(repo).get_commits(sha=branch), count))
 
     lines = []
     for c in commits:
@@ -179,7 +223,7 @@ def github_list_issues(repo: str, state: str = "open", count: int = 10) -> str:
 @tool
 def github_search_issues(
     query: str,
-    repo: str = "Quote-ly/quotely-data-service",
+    repo: str = "virtualdojo-inc/virtualdojo",
     state: str = "all",
     count: int = 10,
 ) -> str:
@@ -213,10 +257,9 @@ def github_search_issues(
     except Exception as e:
         return f"Search failed: {type(e).__name__}: {e}"
 
-    # PyGitHub's PaginatedList raises IndexError on the empty case when
-    # sliced (rather than returning []). Catch it and treat as "no
-    # matches" — otherwise every zero-result search crashes with
-    # "list index out of range".
+    # PyGitHub's PaginatedList raises IndexError on the empty case instead
+    # of returning []. Catch it and treat as "no matches" — otherwise every
+    # zero-result search crashes with "list index out of range".
     try:
         issues = list(results[:count])
     except IndexError:
@@ -258,7 +301,7 @@ def github_get_issue_details(repo: str, issue_number: int) -> str:
         f"Body:\n{issue.body or '(empty)'}"
     )
 
-    comments = list(issue.get_comments()[:5])
+    comments = list(islice(issue.get_comments(), 5))
     if comments:
         result += "\n\nRecent comments:"
         for c in comments:
@@ -267,22 +310,222 @@ def github_get_issue_details(repo: str, issue_number: int) -> str:
     return result
 
 
+VALID_ISSUE_TYPES = ("Bug", "Feature", "Task")
+
+# Project #2 "VirtualDojo Development" is the org-wide backlog. Every new
+# issue gets added here so triage queries (github_get_project_items) see
+# them. Priority short codes map to the project's full option labels.
+DEFAULT_PROJECT_NUMBER = 2
+PRIORITY_LABELS = {
+    "P0": "P0 - Critical",
+    "P1": "P1 - High",
+    "P2": "P2 - Medium",
+    "P3": "P3 - Low",
+}
+
+
+def _add_issue_to_dev_project(issue_node_id: str, priority: str) -> str:
+    """Add an issue to Project #2 and set its Priority field. Returns the
+    project item id. Raises on any GraphQL failure so the caller can
+    surface a warning."""
+    proj = _graphql(
+        """query($org: String!, $num: Int!) {
+          organization(login: $org) {
+            projectV2(number: $num) {
+              id
+              fields(first: 30) {
+                nodes {
+                  ... on ProjectV2SingleSelectField {
+                    id name options { id name }
+                  }
+                }
+              }
+            }
+          }
+        }""",
+        {"org": GITHUB_ORG, "num": DEFAULT_PROJECT_NUMBER},
+    )
+    project = proj["organization"]["projectV2"]
+    project_id = project["id"]
+    priority_field = next(
+        (f for f in project["fields"]["nodes"] if f.get("name") == "Priority"),
+        None,
+    )
+    if not priority_field:
+        raise RuntimeError("Priority field not found on Project #2")
+    target_label = PRIORITY_LABELS[priority]
+    option = next(
+        (o for o in priority_field["options"] if o["name"] == target_label),
+        None,
+    )
+    if not option:
+        available = [o["name"] for o in priority_field["options"]]
+        raise RuntimeError(
+            f"Priority option {target_label!r} not found. Available: {available}"
+        )
+
+    add_result = _graphql(
+        """mutation($projectId: ID!, $contentId: ID!) {
+          addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+            item { id }
+          }
+        }""",
+        {"projectId": project_id, "contentId": issue_node_id},
+    )
+    item_id = add_result["addProjectV2ItemById"]["item"]["id"]
+
+    _graphql(
+        """mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+          updateProjectV2ItemFieldValue(input: {
+            projectId: $projectId
+            itemId: $itemId
+            fieldId: $fieldId
+            value: { singleSelectOptionId: $optionId }
+          }) { projectV2Item { id } }
+        }""",
+        {
+            "projectId": project_id,
+            "itemId": item_id,
+            "fieldId": priority_field["id"],
+            "optionId": option["id"],
+        },
+    )
+    return item_id
+
+
 @tool
 def github_create_issue(
-    repo: str, title: str, body: str, labels: str = ""
+    repo: str,
+    title: str,
+    body: str,
+    issue_type: str,
+    priority: str,
+    labels: str = "",
 ) -> str:
-    """Create a new GitHub issue.
+    """Create a new GitHub issue, classify it, and add it to the org backlog.
+
+    Every new issue is auto-added to Project #2 ('VirtualDojo Development')
+    and assigned a Priority. This is the org standard — there is no path
+    to create an untyped or un-prioritized issue.
 
     Args:
         repo: Repository in 'owner/repo' format.
         title: The issue title.
         body: The issue body/description (supports markdown).
+        issue_type: REQUIRED. One of 'Bug', 'Feature', or 'Task'. Pick
+            'Bug' for unexpected behavior or regressions, 'Feature' for
+            new functionality requests, 'Task' for specific pieces of
+            work that aren't bugs or features.
+        priority: REQUIRED. One of 'P0', 'P1', 'P2', 'P3' — maps to
+            P0-Critical / P1-High / P2-Medium / P3-Low on Project #2.
+            Use P0 for incidents and outages, P1 for clear regressions
+            blocking a workflow, P2 for the default backlog priority,
+            P3 for nice-to-haves.
         labels: Comma-separated label names to apply (optional).
     """
+    if issue_type not in VALID_ISSUE_TYPES:
+        raise ValueError(
+            f"issue_type must be one of {VALID_ISSUE_TYPES}, got {issue_type!r}"
+        )
+    if priority not in PRIORITY_LABELS:
+        raise ValueError(
+            f"priority must be one of {tuple(PRIORITY_LABELS)}, got {priority!r}"
+        )
+
     repo_obj = _github().get_repo(repo)
     label_list = [l.strip() for l in labels.split(",") if l.strip()] if labels else []
     issue = repo_obj.create_issue(title=title, body=body, labels=label_list)
-    return f"Created issue #{issue.number}: {issue.title}\nURL: {issue.html_url}"
+    issue_node_id = issue.raw_data["node_id"]
+
+    warnings: list[str] = []
+
+    try:
+        type_id = _get_issue_type_id(issue_type)
+        _graphql(
+            """mutation($issueId: ID!, $typeId: ID!) {
+              updateIssueIssueType(input: {issueId: $issueId, issueTypeId: $typeId}) {
+                issue { number }
+              }
+            }""",
+            {"issueId": issue_node_id, "typeId": type_id},
+        )
+    except Exception as e:
+        warnings.append(
+            f"failed to set Issue Type '{issue_type}': {e} "
+            "(call github_set_issue_type to fix)"
+        )
+
+    try:
+        _add_issue_to_dev_project(issue_node_id, priority)
+    except Exception as e:
+        warnings.append(
+            f"failed to add to Project #{DEFAULT_PROJECT_NUMBER} with "
+            f"priority {priority}: {e} "
+            "(call github_add_item_to_project + github_update_item_field to fix)"
+        )
+
+    warning_block = ""
+    if warnings:
+        warning_block = "\nWARNINGS:\n" + "\n".join(f"  - {w}" for w in warnings)
+
+    return (
+        f"Created issue #{issue.number} (type: {issue_type}, "
+        f"priority: {priority}, project: #{DEFAULT_PROJECT_NUMBER}): "
+        f"{issue.title}\nURL: {issue.html_url}{warning_block}"
+    )
+
+
+@tool
+def github_get_issue_type(repo: str, issue_number: int) -> str:
+    """Get the current Issue Type set on a GitHub issue.
+
+    Returns 'Bug', 'Feature', 'Task', or 'none' (when no type is set). Use this during
+    triage to check whether an issue already has a type before deciding to set one.
+
+    Args:
+        repo: Repository in 'owner/repo' format.
+        issue_number: The issue number.
+    """
+    owner, name = repo.split("/", 1)
+    data = _graphql(
+        """query($owner: String!, $name: String!, $num: Int!) {
+          repository(owner: $owner, name: $name) {
+            issue(number: $num) { issueType { name } }
+          }
+        }""",
+        {"owner": owner, "name": name, "num": issue_number},
+    )
+    issue = (data.get("repository") or {}).get("issue")
+    if issue is None:
+        raise ValueError(f"Issue #{issue_number} not found in {repo}")
+    issue_type = issue.get("issueType")
+    return issue_type["name"] if issue_type else "none"
+
+
+@tool
+def github_set_issue_type(repo: str, issue_number: int, issue_type: str) -> str:
+    """Set the Issue Type on an existing GitHub issue.
+
+    Issue Type is an org-level classification (Bug / Feature / Task) that travels with
+    the issue across all projects, search results, and views. Use this for triage —
+    it's the canonical signal for whether something is a bug, not the project Status field.
+
+    Args:
+        repo: Repository in 'owner/repo' format.
+        issue_number: The issue number.
+        issue_type: One of 'Bug', 'Feature', or 'Task'.
+    """
+    issue_id = _get_issue_node_id(repo, issue_number)
+    type_id = _get_issue_type_id(issue_type)
+    _graphql(
+        """mutation($issueId: ID!, $typeId: ID!) {
+          updateIssueIssueType(input: {issueId: $issueId, issueTypeId: $typeId}) {
+            issue { number }
+          }
+        }""",
+        {"issueId": issue_id, "typeId": type_id},
+    )
+    return f"Set Issue Type to '{issue_type}' on {repo}#{issue_number}"
 
 
 @tool
@@ -300,7 +543,7 @@ def github_list_workflow_runs(
     kwargs = {}
     if status:
         kwargs["status"] = status
-    runs = repo_obj.get_workflow_runs(**kwargs)[:count]
+    runs = list(islice(repo_obj.get_workflow_runs(**kwargs), count))
 
     if not runs:
         return f"No workflow runs found in {repo}."
@@ -359,7 +602,7 @@ def github_get_workflow_run_details(repo: str, run_id: int) -> str:
 
 @tool
 def github_list_projects() -> str:
-    """List all GitHub Projects in the Quote-ly organization."""
+    """List all GitHub Projects in the virtualdojo-inc organization."""
     data = _graphql(
         """
         query($org: String!) {
@@ -638,6 +881,7 @@ def github_update_item_field(
         return f"Field '{field_name}' not found. Available fields: {', '.join(available)}"
 
     field_id = target_field["id"]
+    data_type = target_field.get("dataType")
 
     # For single-select fields, find the option ID
     if "options" in target_field:
@@ -668,6 +912,58 @@ def github_update_item_field(
             },
         )
         return f"Updated '{field_name}' to '{option['name']}'"
+
+    if data_type == "DATE":
+        import re
+
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return (
+                f"Date '{value}' for field '{field_name}' must be in YYYY-MM-DD format"
+            )
+        _graphql(
+            """
+            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $date: Date!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $projectId
+                itemId: $itemId
+                fieldId: $fieldId
+                value: { date: $date }
+              }) { projectV2Item { id } }
+            }
+            """,
+            {
+                "projectId": project_id,
+                "itemId": item_id,
+                "fieldId": field_id,
+                "date": value,
+            },
+        )
+        return f"Updated '{field_name}' to '{value}'"
+
+    if data_type == "NUMBER":
+        try:
+            number = float(value)
+        except ValueError:
+            return f"Value '{value}' for field '{field_name}' is not a number"
+        _graphql(
+            """
+            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $number: Float!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $projectId
+                itemId: $itemId
+                fieldId: $fieldId
+                value: { number: $number }
+              }) { projectV2Item { id } }
+            }
+            """,
+            {
+                "projectId": project_id,
+                "itemId": item_id,
+                "fieldId": field_id,
+                "number": number,
+            },
+        )
+        return f"Updated '{field_name}' to '{value}'"
 
     # For text fields
     _graphql(
@@ -715,4 +1011,6 @@ PROJECT_TOOLS = [
     github_create_draft_issue,
     github_add_item_to_project,
     github_update_item_field,
+    github_get_issue_type,
+    github_set_issue_type,
 ]

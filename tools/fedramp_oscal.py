@@ -21,7 +21,7 @@ from tools.github import _github_token
 # Constants
 # ---------------------------------------------------------------------------
 
-FEDRAMP_REPO = "Quote-ly/Fedramp"
+FEDRAMP_REPO = "virtualdojo-inc/Fedramp"
 OSCAL_VERSION = "1.0.4"
 FEDRAMP_SYSTEM_ID = "FR2615441197"
 FEDRAMP_SYSTEM_NAME = "VirtualDojo AI CRM"

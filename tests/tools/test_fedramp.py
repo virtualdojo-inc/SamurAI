@@ -377,7 +377,7 @@ class TestCheckDependabotAlerts:
         mock_get.return_value.raise_for_status = MagicMock()
 
         result = fedramp_check_dependabot_alerts.invoke(
-            {"repo": "Quote-ly/quotely-data-service"}
+            {"repo": "virtualdojo-inc/virtualdojo"}
         )
         assert "No open Dependabot alerts" in result
 
@@ -410,7 +410,7 @@ class TestCheckDependabotAlerts:
         mock_get.return_value.raise_for_status = MagicMock()
 
         result = fedramp_check_dependabot_alerts.invoke(
-            {"repo": "Quote-ly/quotely-data-service"}
+            {"repo": "virtualdojo-inc/virtualdojo"}
         )
         assert "2 open" in result
         assert "HIGH" in result
@@ -426,7 +426,7 @@ class TestCheckDependabotAlerts:
         mock_get.side_effect = RuntimeError("network timeout")
 
         result = fedramp_check_dependabot_alerts.invoke(
-            {"repo": "Quote-ly/quotely-data-service"}
+            {"repo": "virtualdojo-inc/virtualdojo"}
         )
         assert "Error fetching Dependabot alerts" in result
 

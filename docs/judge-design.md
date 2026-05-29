@@ -46,7 +46,7 @@ measured that excluding it produces a lower false-negative rate.
 | Stage | Model | Output | When it runs |
 |---|---|---|---|
 | 1 | `gemini-2.5-flash-lite` | Single token (`safe` or `review`) | Every write tool call |
-| 2 | `gemini-3-flash-preview` | JSON `{verdict, reason}` | Only when Stage 1 returns `review` |
+| 2 | `gemini-3.5-flash` | JSON `{verdict, reason}` | Only when Stage 1 returns `review` |
 
 Anthropic uses Sonnet 4.6 for both stages. We start with Flash-Lite + Flash
 (~100x cheaper at our volume). If FPR is too high in production we'll

@@ -413,7 +413,7 @@ class TestReviewCode:
         mock_get.return_value = self._make_file_response(code)
 
         result = fedramp_review_code.invoke({
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "file_path": "app.py",
         })
         assert "SC-7" in result
@@ -430,7 +430,7 @@ class TestReviewCode:
         mock_get.return_value = self._make_file_response(code)
 
         result = fedramp_review_code.invoke({
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "file_path": "config.py",
         })
         assert "SC-12" in result
@@ -446,7 +446,7 @@ class TestReviewCode:
         mock_get.return_value = self._make_file_response(code)
 
         result = fedramp_review_code.invoke({
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "file_path": "handler.py",
         })
         assert "CM-6" in result
@@ -465,7 +465,7 @@ class TestReviewCode:
         mock_get.return_value = self._make_file_response(code)
 
         result = fedramp_review_code.invoke({
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "file_path": "config.py",
         })
         assert "No FedRAMP security issues found" in result
@@ -479,7 +479,7 @@ class TestReviewCode:
         mock_get.return_value = MagicMock(status_code=404)
 
         result = fedramp_review_code.invoke({
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "file_path": "nonexistent.py",
         })
         assert "File not found" in result
@@ -494,7 +494,7 @@ class TestReviewCode:
         mock_get.return_value = self._make_file_response(code)
 
         result = fedramp_review_code.invoke({
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "file_path": "template.vue",
         })
         assert "SC-18" in result
@@ -510,7 +510,7 @@ class TestReviewCode:
         mock_get.return_value = self._make_file_response(code)
 
         result = fedramp_review_code.invoke({
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "file_path": "middleware.py",
         })
         assert "SC-7" in result
@@ -526,7 +526,7 @@ class TestReviewCode:
         mock_get.return_value = self._make_file_response(code)
 
         result = fedramp_review_code.invoke({
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "file_path": "handler.py",
         })
         assert "CM-6" in result
@@ -547,7 +547,7 @@ class TestReviewCode:
         mock_get.return_value = self._make_file_response(code)
 
         result = fedramp_review_code.invoke({
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "file_path": "bad.py",
         })
         assert "SC-12" in result

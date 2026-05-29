@@ -1,4 +1,4 @@
-"""FedRAMP documentation and code review tools for the Quote-ly/Fedramp repo."""
+"""FedRAMP documentation and code review tools for the virtualdojo-inc/Fedramp repo."""
 
 import base64
 import re
@@ -8,7 +8,7 @@ from langchain_core.tools import tool
 
 from tools.github import _github_token
 
-FEDRAMP_REPO = "Quote-ly/Fedramp"
+FEDRAMP_REPO = "virtualdojo-inc/Fedramp"
 AUTHORIZED_EDITORS = {"devin@virtualdojo.com"}
 
 # Stores pending file uploads for the FileConsentCard flow
@@ -40,7 +40,7 @@ def _check_editor(user_email: str) -> str | None:
 
 @tool
 def fedramp_read_document(file_path: str) -> str:
-    """Read a file from the Quote-ly/Fedramp repository.
+    """Read a file from the virtualdojo-inc/Fedramp repository.
 
     Args:
         file_path: Path to the file within the repo (e.g. "policies/AC-Policy.md").
@@ -63,7 +63,7 @@ def fedramp_read_document(file_path: str) -> str:
 
 @tool
 def fedramp_list_documents(path: str = "") -> str:
-    """List files and folders in the Quote-ly/Fedramp repository.
+    """List files and folders in the virtualdojo-inc/Fedramp repository.
 
     Args:
         path: Directory path within the repo (empty string for root).
@@ -258,12 +258,12 @@ def fedramp_commit_document(
 
 @tool
 def fedramp_review_code(repo: str, file_path: str) -> str:
-    """Review a source file from a Quote-ly repo for FedRAMP security issues.
+    """Review a source file from a virtualdojo-inc repo for FedRAMP security issues.
 
     Checks against NIST 800-53 controls: SC-7, SC-12, CM-6, SC-18, AC-8.
 
     Args:
-        repo: Repository in 'owner/repo' format (must be a Quote-ly repo).
+        repo: Repository in 'owner/repo' format (must be a virtualdojo-inc repo).
         file_path: Path to the source file to review.
     """
     resp = httpx.get(

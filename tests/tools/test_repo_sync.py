@@ -41,7 +41,7 @@ def test_sync_repo_handles_unreachable_branch(mock_sha, mock_token):
     from tools.repo_sync import sync_repo
 
     result = sync_repo.invoke(
-        {"repo": "Quote-ly/quotely-data-service", "branch": "nonexistent"}
+        {"repo": "virtualdojo-inc/virtualdojo", "branch": "nonexistent"}
     )
     assert "Could not reach" in result
 
@@ -53,7 +53,7 @@ def test_sync_repo_skips_when_up_to_date(mock_remote, mock_local, mock_token):
     from tools.repo_sync import sync_repo
 
     result = sync_repo.invoke(
-        {"repo": "Quote-ly/quotely-data-service", "branch": "main"}
+        {"repo": "virtualdojo-inc/virtualdojo", "branch": "main"}
     )
     assert "Already up to date" in result
     assert "abc12345" in result
@@ -69,7 +69,7 @@ def test_sync_repo_clones_when_missing(mock_remote, mock_local, mock_run):
 
     with patch("tools.github._github_token", return_value="fake-token"):
         result = sync_repo.invoke(
-            {"repo": "Quote-ly/quotely-data-service", "branch": "main"}
+            {"repo": "virtualdojo-inc/virtualdojo", "branch": "main"}
         )
 
     assert "Synced successfully" in result
@@ -89,7 +89,7 @@ def test_sync_repo_reclones_when_stale(mock_remote, mock_local, mock_run):
 
     with patch("tools.github._github_token", return_value="fake-token"):
         result = sync_repo.invoke(
-            {"repo": "Quote-ly/quotely-data-service", "branch": "development"}
+            {"repo": "virtualdojo-inc/virtualdojo", "branch": "development"}
         )
 
     assert "Synced successfully" in result
@@ -107,7 +107,7 @@ def test_sync_repo_handles_clone_failure(mock_remote, mock_local, mock_run):
 
     with patch("tools.github._github_token", return_value="fake-token"):
         result = sync_repo.invoke(
-            {"repo": "Quote-ly/quotely-data-service", "branch": "main"}
+            {"repo": "virtualdojo-inc/virtualdojo", "branch": "main"}
         )
 
     assert "Error cloning" in result
@@ -129,7 +129,7 @@ def test_read_repo_file_not_synced():
     from tools.repo_sync import read_repo_file
 
     result = read_repo_file.invoke(
-        {"file_path": "main.py", "repo": "Quote-ly/quotely-data-service", "branch": "nonexistent-branch-xyz"}
+        {"file_path": "main.py", "repo": "virtualdojo-inc/virtualdojo", "branch": "nonexistent-branch-xyz"}
     )
     assert "not synced yet" in result.lower() or "Call sync_repo" in result
 
@@ -137,7 +137,7 @@ def test_read_repo_file_not_synced():
 def test_read_repo_file_reads_content(tmp_path):
     from tools.repo_sync import read_repo_file, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
 
@@ -160,7 +160,7 @@ def test_read_repo_file_reads_content(tmp_path):
 def test_read_repo_file_not_found(tmp_path):
     from tools.repo_sync import read_repo_file, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -177,7 +177,7 @@ def test_read_repo_file_not_found(tmp_path):
 def test_read_repo_file_truncates_large_files(tmp_path):
     from tools.repo_sync import read_repo_file, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -224,7 +224,7 @@ def test_read_repo_file_range_rejects_invalid_range():
             "file_path": "x.py",
             "start_line": 0,
             "end_line": 5,
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "branch": "main",
         }
     )
@@ -236,7 +236,7 @@ def test_read_repo_file_range_rejects_invalid_range():
             "file_path": "x.py",
             "start_line": 10,
             "end_line": 5,
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "branch": "main",
         }
     )
@@ -251,7 +251,7 @@ def test_read_repo_file_range_not_synced():
             "file_path": "x.py",
             "start_line": 1,
             "end_line": 5,
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "branch": "nonexistent-branch-xyz",
         }
     )
@@ -261,7 +261,7 @@ def test_read_repo_file_range_not_synced():
 def test_read_repo_file_range_file_not_found(tmp_path):
     from tools.repo_sync import read_repo_file_range, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -284,7 +284,7 @@ def test_read_repo_file_range_file_not_found(tmp_path):
 def test_read_repo_file_range_rejects_directory(tmp_path):
     from tools.repo_sync import read_repo_file_range, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(os.path.join(local_dir, "subdir"), exist_ok=True)
@@ -308,7 +308,7 @@ def test_read_repo_file_range_rejects_directory(tmp_path):
 def test_read_repo_file_range_reads_requested_lines(tmp_path):
     from tools.repo_sync import read_repo_file_range, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -352,7 +352,7 @@ def test_read_repo_file_range_clamps_end_to_eof(tmp_path):
     """end_line beyond EOF should clamp, not error."""
     from tools.repo_sync import read_repo_file_range, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -384,7 +384,7 @@ def test_read_repo_file_range_handles_open_exception(tmp_path):
     """Unexpected IO errors (e.g. permissions) should return an error string, not raise."""
     from tools.repo_sync import read_repo_file_range, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -415,7 +415,7 @@ def test_read_repo_file_range_start_past_eof(tmp_path):
     """start_line past EOF should report that, not crash."""
     from tools.repo_sync import read_repo_file_range, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -457,7 +457,7 @@ def test_search_repo_code_not_synced():
     from tools.repo_sync import search_repo_code
 
     result = search_repo_code.invoke(
-        {"query": "test", "repo": "Quote-ly/quotely-data-service", "branch": "nonexistent-xyz"}
+        {"query": "test", "repo": "virtualdojo-inc/virtualdojo", "branch": "nonexistent-xyz"}
     )
     assert "not synced yet" in result.lower() or "Call sync_repo" in result
 
@@ -465,7 +465,7 @@ def test_search_repo_code_not_synced():
 def test_search_repo_code_finds_matches(tmp_path):
     from tools.repo_sync import search_repo_code, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -489,7 +489,7 @@ def test_search_repo_code_includes_context_lines_by_default(tmp_path):
     """Default context_lines=2 should include 2 lines before/after each match (grep -C 2)."""
     from tools.repo_sync import search_repo_code, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -526,7 +526,7 @@ def test_search_repo_code_context_lines_zero_disables_context(tmp_path):
     """context_lines=0 reproduces the old match-only output."""
     from tools.repo_sync import search_repo_code, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -560,7 +560,7 @@ def test_search_repo_code_file_pattern_with_context(tmp_path):
     """file_pattern still works when context_lines is set."""
     from tools.repo_sync import search_repo_code, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -589,10 +589,216 @@ def test_search_repo_code_file_pattern_with_context(tmp_path):
         os.rmdir(local_dir)
 
 
+def test_search_repo_code_truncates_long_lines(tmp_path):
+    """A single matched line >500 chars must be truncated, not returned whole.
+
+    Reproduces the OOM root cause: a giant generated .md file blew memory
+    because grep returned a multi-hundred-KB line in one shot.
+    """
+    from tools.repo_sync import (
+        search_repo_code,
+        _repo_dir,
+        SEARCH_MAX_LINE_BYTES,
+    )
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    os.makedirs(local_dir, exist_ok=True)
+
+    test_file = os.path.join(local_dir, "huge.md")
+    huge_line = "TARGET_X" + ("y" * 100_000)
+    with open(test_file, "w") as f:
+        f.write(huge_line + "\n")
+
+    try:
+        result = search_repo_code.invoke(
+            {"query": "TARGET_X", "repo": repo, "branch": branch, "context_lines": 0}
+        )
+        assert "TARGET_X" in result
+        assert "line truncated" in result
+        # Result must be far smaller than the source line
+        assert len(result) < SEARCH_MAX_LINE_BYTES + 5_000
+    finally:
+        os.remove(test_file)
+        os.rmdir(local_dir)
+
+
+def test_search_repo_code_byte_cap(tmp_path):
+    """Total result is capped at ~50 KB even when many lines match."""
+    from tools.repo_sync import (
+        search_repo_code,
+        _repo_dir,
+        SEARCH_MAX_RESULT_BYTES,
+    )
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    os.makedirs(local_dir, exist_ok=True)
+
+    # 2000 matching lines, each ~250 chars after path prefix → comfortably > 50 KB
+    test_file = os.path.join(local_dir, "many.txt")
+    with open(test_file, "w") as f:
+        for i in range(2000):
+            f.write(f"NEEDLE_{i} " + ("z" * 240) + "\n")
+
+    try:
+        result = search_repo_code.invoke(
+            {
+                "query": "NEEDLE_",
+                "repo": repo,
+                "branch": branch,
+                "context_lines": 0,
+                "head_limit": 2000,
+            }
+        )
+        assert len(result) <= SEARCH_MAX_RESULT_BYTES + 1_000  # plus the trailing note
+        assert "Output truncated" in result
+        assert "files_with_matches" in result
+    finally:
+        os.remove(test_file)
+        os.rmdir(local_dir)
+
+
+def test_search_repo_code_head_limit_and_offset(tmp_path):
+    """head_limit + offset together provide pagination."""
+    from tools.repo_sync import search_repo_code, _repo_dir
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    os.makedirs(local_dir, exist_ok=True)
+
+    test_file = os.path.join(local_dir, "page.txt")
+    with open(test_file, "w") as f:
+        for i in range(10):
+            f.write(f"HIT_{i:02d}\n")
+
+    try:
+        page1 = search_repo_code.invoke(
+            {
+                "query": "HIT_",
+                "repo": repo,
+                "branch": branch,
+                "context_lines": 0,
+                "head_limit": 4,
+                "offset": 0,
+            }
+        )
+        assert "HIT_00" in page1
+        assert "HIT_03" in page1
+        assert "HIT_04" not in page1
+        assert "offset=4" in page1  # pagination hint
+
+        page2 = search_repo_code.invoke(
+            {
+                "query": "HIT_",
+                "repo": repo,
+                "branch": branch,
+                "context_lines": 0,
+                "head_limit": 4,
+                "offset": 4,
+            }
+        )
+        assert "HIT_00" not in page2
+        assert "HIT_04" in page2
+        assert "HIT_07" in page2
+        assert "HIT_08" not in page2
+        assert "offset=8" in page2
+    finally:
+        os.remove(test_file)
+        os.rmdir(local_dir)
+
+
+def test_search_repo_code_files_with_matches_mode(tmp_path):
+    """output_mode='files_with_matches' returns paths only, no content."""
+    from tools.repo_sync import search_repo_code, _repo_dir
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    os.makedirs(local_dir, exist_ok=True)
+
+    a = os.path.join(local_dir, "a.py")
+    b = os.path.join(local_dir, "b.py")
+    with open(a, "w") as f:
+        f.write("WANTED secret content here\n")
+    with open(b, "w") as f:
+        f.write("WANTED other content\n")
+
+    try:
+        result = search_repo_code.invoke(
+            {
+                "query": "WANTED",
+                "repo": repo,
+                "branch": branch,
+                "output_mode": "files_with_matches",
+            }
+        )
+        assert "a.py" in result
+        assert "b.py" in result
+        # Content lines must NOT appear in paths-only mode
+        assert "secret content" not in result
+        assert "other content" not in result
+    finally:
+        os.remove(a)
+        os.remove(b)
+        os.rmdir(local_dir)
+
+
+def test_search_repo_code_count_mode(tmp_path):
+    """output_mode='count' returns per-file match counts; zero-match files filtered."""
+    from tools.repo_sync import search_repo_code, _repo_dir
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    os.makedirs(local_dir, exist_ok=True)
+
+    hot = os.path.join(local_dir, "hot.py")
+    cold = os.path.join(local_dir, "cold.py")
+    with open(hot, "w") as f:
+        f.write("FOO\nFOO\nFOO\n")
+    with open(cold, "w") as f:
+        f.write("nothing relevant\n")
+
+    try:
+        result = search_repo_code.invoke(
+            {
+                "query": "FOO",
+                "repo": repo,
+                "branch": branch,
+                "output_mode": "count",
+            }
+        )
+        assert "hot.py:3" in result
+        # Files with 0 matches must be filtered out
+        assert "cold.py" not in result
+    finally:
+        os.remove(hot)
+        os.remove(cold)
+        os.rmdir(local_dir)
+
+
+def test_search_repo_code_rejects_invalid_output_mode():
+    from tools.repo_sync import search_repo_code
+
+    result = search_repo_code.invoke(
+        {
+            "query": "x",
+            "repo": "virtualdojo-inc/virtualdojo",
+            "branch": "main",
+            "output_mode": "bogus",
+        }
+    )
+    assert "invalid output_mode" in result
+
+
 def test_search_repo_code_no_matches(tmp_path):
     from tools.repo_sync import search_repo_code, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -627,7 +833,7 @@ def test_list_repo_files_not_synced():
     from tools.repo_sync import list_repo_files
 
     result = list_repo_files.invoke(
-        {"path": "", "repo": "Quote-ly/quotely-data-service", "branch": "nonexistent-xyz"}
+        {"path": "", "repo": "virtualdojo-inc/virtualdojo", "branch": "nonexistent-xyz"}
     )
     assert "not synced yet" in result.lower() or "Call sync_repo" in result
 
@@ -635,7 +841,7 @@ def test_list_repo_files_not_synced():
 def test_list_repo_files_shows_contents(tmp_path):
     from tools.repo_sync import list_repo_files, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(os.path.join(local_dir, "app"), exist_ok=True)
@@ -660,7 +866,7 @@ def test_list_repo_files_shows_contents(tmp_path):
 def test_list_repo_files_hides_dotfiles(tmp_path):
     from tools.repo_sync import list_repo_files, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "main"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -719,7 +925,7 @@ def test_sync_repo_serializes_concurrent_calls_to_same_branch(tmp_path, monkeypa
         threads = [
             threading.Thread(
                 target=lambda: rs.sync_repo.invoke(
-                    {"repo": "Quote-ly/quotely-data-service", "branch": "development"}
+                    {"repo": "virtualdojo-inc/virtualdojo", "branch": "development"}
                 )
             )
             for _ in range(3)
@@ -771,12 +977,12 @@ def test_sync_repo_allows_concurrent_calls_on_different_branches(tmp_path, monke
     ):
         t_main = threading.Thread(
             target=lambda: rs.sync_repo.invoke(
-                {"repo": "Quote-ly/quotely-data-service", "branch": "main"}
+                {"repo": "virtualdojo-inc/virtualdojo", "branch": "main"}
             )
         )
         t_dev = threading.Thread(
             target=lambda: rs.sync_repo.invoke(
-                {"repo": "Quote-ly/quotely-data-service", "branch": "development"}
+                {"repo": "virtualdojo-inc/virtualdojo", "branch": "development"}
             )
         )
         t_main.start()
@@ -801,10 +1007,10 @@ def test_sync_repo_records_last_synced_branch_on_clone(tmp_path, monkeypatch):
         patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")),
     ):
         rs.sync_repo.invoke(
-            {"repo": "Quote-ly/quotely-data-service", "branch": "development"}
+            {"repo": "virtualdojo-inc/virtualdojo", "branch": "development"}
         )
 
-    assert rs._last_synced_branch.get("Quote-ly/quotely-data-service") == "development"
+    assert rs._last_synced_branch.get("virtualdojo-inc/virtualdojo") == "development"
 
 
 def test_sync_repo_records_last_synced_branch_when_up_to_date():
@@ -816,25 +1022,25 @@ def test_sync_repo_records_last_synced_branch_when_up_to_date():
         patch("tools.repo_sync._get_local_sha", return_value="same"),
     ):
         result = rs.sync_repo.invoke(
-            {"repo": "Quote-ly/quotely-data-service", "branch": "development"}
+            {"repo": "virtualdojo-inc/virtualdojo", "branch": "development"}
         )
 
     assert "Already up to date" in result
-    assert rs._last_synced_branch.get("Quote-ly/quotely-data-service") == "development"
+    assert rs._last_synced_branch.get("virtualdojo-inc/virtualdojo") == "development"
 
 
 def test_search_repo_code_falls_back_to_last_synced_branch():
     """When branch is omitted, readers must default to the most-recently-synced branch.
 
-    This was the proximate cause of the May 2026 'no access to development'
-    incident: sync_repo(branch='development') and search_repo_code (no
-    branch kwarg) fired in the same parallel batch, and search defaulted
-    to 'main' which wasn't synced.
+    This was the proximate cause of Jason's 'no access to development' report:
+    sync_repo(branch='development') and search_repo_code (no branch kwarg)
+    fired in the same parallel batch, and search defaulted to 'main' which
+    wasn't synced.
     """
     from tools.repo_sync import search_repo_code, _repo_dir
     import tools.repo_sync as rs
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "development"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -857,7 +1063,7 @@ def test_read_repo_file_falls_back_to_last_synced_branch():
     from tools.repo_sync import read_repo_file, _repo_dir
     import tools.repo_sync as rs
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     branch = "development"
     local_dir = _repo_dir(repo, branch)
     os.makedirs(local_dir, exist_ok=True)
@@ -877,14 +1083,15 @@ def test_read_repo_file_falls_back_to_last_synced_branch():
 def test_not_synced_message_lists_actually_synced_branches():
     """The error must reflect filesystem state, not parrot the caller's branch.
 
-    Previously it said "Call sync_repo(... branch='main') first" even when
-    the caller had just synced 'development', which led the model to chase
-    the wrong branch.
+    Previously it said "Call sync_repo(... branch='main') first" even when the
+    caller had just synced 'development', which led the model to chase the
+    wrong branch.
     """
     from tools.repo_sync import search_repo_code, _repo_dir
 
-    repo = "Quote-ly/quotely-data-service"
+    repo = "virtualdojo-inc/virtualdojo"
     dev_dir = _repo_dir(repo, "development")
+    # Make sure 'main' is NOT present for this repo, then create 'development'.
     main_dir = _repo_dir(repo, "main")
     if os.path.isdir(main_dir):
         shutil.rmtree(main_dir)
@@ -905,7 +1112,7 @@ def test_not_synced_message_lists_actually_synced_branches():
 def test_not_synced_message_handles_repo_with_no_local_branches():
     from tools.repo_sync import read_repo_file, _repo_dir
 
-    repo = "Quote-ly/Fedramp"
+    repo = "virtualdojo-inc/Fedramp"
     local_dir = _repo_dir(repo, "main")
     repo_root = os.path.dirname(local_dir)
     if os.path.isdir(repo_root):

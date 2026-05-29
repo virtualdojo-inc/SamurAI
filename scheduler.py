@@ -139,6 +139,70 @@ async def _resolve_conversation_ref(store, task: dict) -> str | None:
     return None
 
 
+_BG_RECURSION_LIMIT = 75
+_BG_RECURSION_LIMIT_RETRY = 150
+
+
+def _is_recursion_error(exc: BaseException) -> bool:
+    return (
+        type(exc).__name__ == "GraphRecursionError"
+        or "recursion limit" in str(exc).lower()
+    )
+
+
+async def _run_agent_with_recursion_recovery(
+    *,
+    run_agent,
+    task: dict,
+    bg_conversation_id: str,
+) -> str:
+    """Run the agent for a background task, retrying once with a higher
+    recursion limit if the first attempt hits GraphRecursionError.
+
+    If the retry also fails, return a graceful user-facing message instead
+    of re-raising — so the user gets a coherent reply rather than a silent
+    auto-pause.
+    """
+    kwargs = dict(
+        user_message=task["prompt"],
+        conversation_id=bg_conversation_id,
+        user_id=task["user_id"],
+        user_name=task["user_name"],
+        user_timezone=task["user_timezone"],
+        user_email=task["user_email"],
+        is_background_task=True,
+    )
+    try:
+        return await run_agent(recursion_limit=_BG_RECURSION_LIMIT, **kwargs)
+    except Exception as e:
+        if not _is_recursion_error(e):
+            raise
+        logger.warning(
+            "[scheduler] recursion retry kicked in for task %s (limit %d -> %d): %s",
+            task["id"],
+            _BG_RECURSION_LIMIT,
+            _BG_RECURSION_LIMIT_RETRY,
+            e,
+        )
+
+    try:
+        return await run_agent(recursion_limit=_BG_RECURSION_LIMIT_RETRY, **kwargs)
+    except Exception as e:
+        if not _is_recursion_error(e):
+            raise
+        logger.error(
+            "[scheduler] recursion retry exhausted for task %s at limit %d: %s",
+            task["id"],
+            _BG_RECURSION_LIMIT_RETRY,
+            e,
+        )
+        return (
+            f"I worked on **{task['prompt'][:120]}** but it turned out more "
+            "involved than I expected and I couldn't finish in the steps I had. "
+            "Want me to narrow the scope, or break it into a few smaller tasks?"
+        )
+
+
 async def _execute_task(task_id: str) -> None:
     """Execute a background task: run the agent, send results to Teams."""
     from task_store import get_task_store
@@ -170,15 +234,10 @@ async def _execute_task(task_id: str) -> None:
                 ref_json=ref_json,
             )
 
-        response = await run_agent(
-            user_message=task["prompt"],
-            conversation_id=bg_conversation_id,
-            user_id=task["user_id"],
-            user_name=task["user_name"],
-            user_timezone=task["user_timezone"],
-            user_email=task["user_email"],
-            recursion_limit=50,
-            is_background_task=True,
+        response = await _run_agent_with_recursion_recovery(
+            run_agent=run_agent,
+            task=task,
+            bg_conversation_id=bg_conversation_id,
         )
 
         await _send_task_result(task, response)

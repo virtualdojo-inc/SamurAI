@@ -178,7 +178,7 @@ class TestExecuteTask:
             user_name="Test User",
             user_timezone="America/Chicago",
             user_email="test@example.com",
-            recursion_limit=50,
+            recursion_limit=75,
             is_background_task=True,
         )
         mock_store.record_run.assert_called_once_with("abc123", success=True)
@@ -337,7 +337,7 @@ class TestOneShotRetry:
             patch(
                 "agent.run_agent",
                 new_callable=AsyncMock,
-                side_effect=RuntimeError("Recursion limit"),
+                side_effect=RuntimeError("Database unavailable"),
             ),
         ):
             await scheduler_module._execute_task("abc123")
@@ -383,7 +383,7 @@ class TestOneShotRetry:
             patch(
                 "agent.run_agent",
                 new_callable=AsyncMock,
-                side_effect=RuntimeError("Recursion limit again"),
+                side_effect=RuntimeError("Database still unavailable"),
             ),
         ):
             await scheduler_module._execute_task("abc123")

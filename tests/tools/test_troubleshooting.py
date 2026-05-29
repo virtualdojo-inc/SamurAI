@@ -73,7 +73,7 @@ def test_save_round_trips_all_fields(_mem_store):
             "fix_location": "app/api/v1/endpoints/activities.py:12",
             "fix_description": "change import to from app.api.deps",
             "hypotheses_ruled_out": ["token expired", "tenant mismatch"],
-            "repo": "Quote-ly/quotely-data-service",
+            "repo": "virtualdojo-inc/virtualdojo",
             "github_issue": 522,
         }
     )
@@ -85,7 +85,7 @@ def test_save_round_trips_all_fields(_mem_store):
     assert v["symptom"] == "API key rejected on POST /activities"
     assert v["fix_location"] == "app/api/v1/endpoints/activities.py:12"
     assert v["hypotheses_ruled_out"] == ["token expired", "tenant mismatch"]
-    assert v["repo"] == "Quote-ly/quotely-data-service"
+    assert v["repo"] == "virtualdojo-inc/virtualdojo"
     assert v["github_issue"] == 522
     assert v["source"] == "manual"
     assert v["retrieval_count"] == 0

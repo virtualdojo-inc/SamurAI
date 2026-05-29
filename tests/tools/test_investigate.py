@@ -223,7 +223,7 @@ async def test_investigate_routes_through_tool_node_when_tool_calls_present(mock
             {
                 "name": "sync_repo",
                 "args": {
-                    "repo": "Quote-ly/quotely-data-service",
+                    "repo": "virtualdojo-inc/virtualdojo",
                     "branch": "main",
                 },
                 "id": "call-1",
@@ -259,7 +259,7 @@ async def test_investigate_logs_sub_tool_activity(mock_llm, capsys):
             {
                 "name": "sync_repo",
                 "args": {
-                    "repo": "Quote-ly/quotely-data-service",
+                    "repo": "virtualdojo-inc/virtualdojo",
                     "branch": "main",
                 },
                 "id": "call-log-1",

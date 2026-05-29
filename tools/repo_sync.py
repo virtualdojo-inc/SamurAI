@@ -12,16 +12,16 @@ logger = logging.getLogger(__name__)
 REPO_BASE_DIR = "/tmp/repos"
 
 ALLOWED_REPOS = {
-    "Quote-ly/quotely-data-service",
-    "Quote-ly/virtualdojo_cli",
-    "Quote-ly/SamurAI",
-    "Quote-ly/Fedramp",
+    "virtualdojo-inc/virtualdojo",
+    "virtualdojo-inc/virtualdojo_cli",
+    "virtualdojo-inc/SamurAI",
+    "virtualdojo-inc/Fedramp",
 }
 
 # Per-(repo, branch) lock. LangGraph's ToolNode runs sync tools in worker
 # threads, so concurrent sync_repo calls to the same path race on rm -rf +
 # git clone — the loser sees "could not open .git/objects/pack/tmp_pack_..."
-# or "could not lock config file".
+# or "could not lock config file". threading.Lock serializes them.
 _sync_locks: dict[tuple[str, str], threading.Lock] = {}
 _sync_locks_guard = threading.Lock()
 
@@ -50,7 +50,7 @@ def _resolve_branch(repo: str, branch: str | None) -> str:
 def _not_synced_message(repo: str, branch: str) -> str:
     """Tell the model what's actually synced, not a hardcoded 'main' suggestion."""
     repo_root = os.path.join(REPO_BASE_DIR, repo.split("/")[-1])
-    have: list[str] = []
+    have = []
     if os.path.isdir(repo_root):
         try:
             have = sorted(
@@ -115,7 +115,7 @@ def _get_local_sha(repo_dir: str) -> str | None:
 
 @tool
 def sync_repo(
-    repo: str = "Quote-ly/quotely-data-service",
+    repo: str = "virtualdojo-inc/virtualdojo",
     branch: str = "main",
 ) -> str:
     """Sync a GitHub repo branch to a local copy for code reading and search.
@@ -200,7 +200,7 @@ def sync_repo(
 @tool
 def read_repo_file(
     file_path: str,
-    repo: str = "Quote-ly/quotely-data-service",
+    repo: str = "virtualdojo-inc/virtualdojo",
     branch: str | None = None,
 ) -> str:
     """Read a file from a locally synced repo.
@@ -246,7 +246,7 @@ def read_repo_file_range(
     file_path: str,
     start_line: int,
     end_line: int,
-    repo: str = "Quote-ly/quotely-data-service",
+    repo: str = "virtualdojo-inc/virtualdojo",
     branch: str | None = None,
 ) -> str:
     """Read a specific line range from a file in a locally synced repo.
@@ -309,17 +309,32 @@ def read_repo_file_range(
         return f"Error reading {file_path} lines {start_line}-{end_line}: {e}"
 
 
+# Caps on search_repo_code output. A single tool result that exceeds the byte
+# cap once OOM-killed the bot when grep returned a huge generated .md file.
+SEARCH_MAX_RESULT_BYTES = 50_000
+SEARCH_MAX_LINE_BYTES = 500
+SEARCH_DEFAULT_HEAD_LIMIT = 50
+SEARCH_VALID_OUTPUT_MODES = ("content", "files_with_matches", "count")
+
+
 @tool
 def search_repo_code(
     query: str,
-    repo: str = "Quote-ly/quotely-data-service",
+    repo: str = "virtualdojo-inc/virtualdojo",
     branch: str | None = None,
     file_pattern: str = "",
     context_lines: int = 2,
+    output_mode: str = "content",
+    head_limit: int = SEARCH_DEFAULT_HEAD_LIMIT,
+    offset: int = 0,
 ) -> str:
     """Search for a pattern in a locally synced repo using grep.
 
     Call sync_repo first if you haven't already synced this repo+branch.
+
+    Output is hard-capped at ~50 KB. If you hit the cap, narrow the query,
+    set a tighter file_pattern, or start with output_mode='files_with_matches'
+    to scan paths first and then drill in with read_repo_file_range.
 
     Args:
         query: Search pattern (regex supported).
@@ -327,11 +342,28 @@ def search_repo_code(
         branch: Branch name. Defaults to the most-recently-synced branch for
             this repo, or 'main' if none has been synced this session.
         file_pattern: Optional glob to filter files (e.g. '*.py', '*.vue').
-        context_lines: Lines of surrounding context to include per match (grep -C).
-            Default 2. Set to 0 for match-only output.
+        context_lines: Lines of surrounding context per match (grep -C).
+            Only applies when output_mode='content'. Default 2.
+        output_mode: 'content' (default — matched lines + context),
+            'files_with_matches' (paths only, cheapest), or
+            'count' (match count per file).
+        head_limit: Max output lines to return after offset. Default 50.
+        offset: Skip this many output lines before head_limit. Use to
+            paginate through large result sets.
     """
     if repo not in ALLOWED_REPOS:
         return f"Error: '{repo}' is not a whitelisted repo."
+
+    if output_mode not in SEARCH_VALID_OUTPUT_MODES:
+        return (
+            f"Error: invalid output_mode '{output_mode}'. "
+            f"Must be one of: {', '.join(SEARCH_VALID_OUTPUT_MODES)}."
+        )
+
+    if head_limit < 1:
+        return "Error: head_limit must be >= 1."
+    if offset < 0:
+        return "Error: offset must be >= 0."
 
     branch = _resolve_branch(repo, branch)
     local_dir = _repo_dir(repo, branch)
@@ -339,9 +371,15 @@ def search_repo_code(
     if not os.path.exists(local_dir):
         return _not_synced_message(repo, branch)
 
-    cmd = ["grep", "-rn"]
-    if context_lines and context_lines > 0:
-        cmd += ["-C", str(context_lines)]
+    if output_mode == "files_with_matches":
+        cmd = ["grep", "-rl"]
+    elif output_mode == "count":
+        cmd = ["grep", "-rc"]
+    else:
+        cmd = ["grep", "-rn"]
+        if context_lines and context_lines > 0:
+            cmd += ["-C", str(context_lines)]
+
     if file_pattern:
         cmd += ["--include", file_pattern]
     cmd += [query, local_dir]
@@ -360,16 +398,55 @@ def search_repo_code(
         if result.returncode != 0:
             return f"Search error: {result.stderr[:200]}"
 
-        # Format results: strip the local dir prefix for readability
-        lines = result.stdout.strip().split("\n")
-        formatted = []
-        for line in lines[:50]:
+        raw_lines = result.stdout.strip().split("\n")
+
+        # grep -rc returns "<path>:0" for files with no matches; filter those.
+        if output_mode == "count":
+            raw_lines = [ln for ln in raw_lines if not ln.endswith(":0")]
+            if not raw_lines:
+                return f"No matches found for '{query}' in {repo} ({branch})."
+
+        total = len(raw_lines)
+        windowed = raw_lines[offset : offset + head_limit]
+
+        formatted: list[str] = []
+        running_bytes = 0
+        byte_capped = False
+        for line in windowed:
             cleaned = line.replace(local_dir + "/", "")
+            if len(cleaned) > SEARCH_MAX_LINE_BYTES:
+                cleaned = (
+                    cleaned[:SEARCH_MAX_LINE_BYTES]
+                    + f" ... [line truncated, was {len(line)} chars]"
+                )
+            # +1 for the join newline
+            if running_bytes + len(cleaned) + 1 > SEARCH_MAX_RESULT_BYTES:
+                byte_capped = True
+                break
             formatted.append(cleaned)
+            running_bytes += len(cleaned) + 1
 
         output = "\n".join(formatted)
-        if len(lines) > 50:
-            output += f"\n\n... [{len(lines)} total lines, showing first 50]"
+        shown = len(formatted)
+        next_offset = offset + shown
+
+        notes: list[str] = []
+        if byte_capped:
+            notes.append(
+                f"Output truncated at {SEARCH_MAX_RESULT_BYTES // 1000} KB after "
+                f"{shown} of {total} lines. Narrow the query, set file_pattern, "
+                f"or call again with output_mode='files_with_matches'."
+            )
+        elif total > offset + shown:
+            notes.append(
+                f"{total} total lines, showing {offset + 1}-{next_offset}. "
+                f"Call again with offset={next_offset} to continue."
+            )
+        elif offset > 0:
+            notes.append(f"{total} total lines, showing {offset + 1}-{next_offset}.")
+
+        if notes:
+            output = output + "\n\n... [" + " ".join(notes) + "]"
 
         return output
 
@@ -382,7 +459,7 @@ def search_repo_code(
 @tool
 def list_repo_files(
     path: str = "",
-    repo: str = "Quote-ly/quotely-data-service",
+    repo: str = "virtualdojo-inc/virtualdojo",
     branch: str | None = None,
 ) -> str:
     """List files and directories in a locally synced repo.

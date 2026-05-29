@@ -58,14 +58,18 @@ INVESTIGATOR_SYSTEM_PROMPT = (
     "- Keep your final answer to 200 words or less.\n"
     "- If you can't reach a conclusion after 6 tool calls, report what you ruled "
     "out and stop. Don't speculate past the evidence.\n"
-    "- For code questions: call sync_repo first, then search_repo_code (returns "
-    "matches with 2 lines of surrounding context by default) to locate the symbol, "
-    "then read_repo_file_range(file, start_line, end_line) for just the lines that "
-    "matter. Only fall back to read_repo_file when you need the whole file.\n"
-    "- Default to branch='main' on Quote-ly/quotely-data-service unless the question "
+    "- For code questions: call sync_repo first, then search_repo_code to locate "
+    "the symbol, then read_repo_file_range(file, start_line, end_line) for just "
+    "the lines that matter. Only fall back to read_repo_file when you need the "
+    "whole file.\n"
+    "- search_repo_code is hard-capped at ~50 KB per call. For broad scans, start "
+    "with output_mode='files_with_matches' to get paths only, then re-run "
+    "search_repo_code on a tighter file_pattern, or jump straight to "
+    "read_repo_file_range. Use offset to paginate when a result note tells you to.\n"
+    "- Default to branch='main' on virtualdojo-inc/virtualdojo unless the question "
     "mentions dev/development.\n"
-    "- Repos you can access: Quote-ly/quotely-data-service, Quote-ly/virtualdojo_cli, "
-    "Quote-ly/SamurAI, Quote-ly/Fedramp.\n"
+    "- Repos you can access: virtualdojo-inc/virtualdojo, virtualdojo-inc/virtualdojo_cli, "
+    "virtualdojo-inc/SamurAI, virtualdojo-inc/Fedramp.\n"
     "- If the answer is 'I don't know from this data', say that plainly."
 )
 
@@ -80,7 +84,7 @@ _investigator_graph = None
 def _build_investigator_graph():
     """Build a mini LangGraph with Flash and the investigator tool set."""
     llm = ChatGoogleGenerativeAI(
-        model="gemini-3-flash-preview",
+        model="gemini-3.5-flash",
         project=os.environ.get("GCP_PROJECT_ID"),
         location="global",
         vertexai=True,

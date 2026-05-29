@@ -8,7 +8,7 @@ Run once locally after the embeddings path is verified:
 
     GCP_PROJECT_ID=virtualdojo-samurai \\
     SAMURAI_DATA_DIR=/path/to/local/data \\
-    python scripts/backfill_troubleshooting.py --repo Quote-ly/quotely-data-service --limit 30
+    python scripts/backfill_troubleshooting.py --repo virtualdojo-inc/virtualdojo --limit 30
 
 Idempotent: skips issues that already have a saved step (matched by
 github_issue number in the stored value).
@@ -197,7 +197,7 @@ def backfill(
     # on this project's Vertex config. Flash-lite is not reliably available at
     # location=global across all Vertex projects.
     llm = ChatGoogleGenerativeAI(
-        model=os.environ.get("BACKFILL_MODEL", "gemini-3-flash-preview"),
+        model=os.environ.get("BACKFILL_MODEL", "gemini-3.5-flash"),
         vertexai=True,
         project=os.environ.get("GCP_PROJECT_ID"),
         location=os.environ.get("GCP_LOCATION", "global"),
@@ -269,7 +269,7 @@ def backfill(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", default="Quote-ly/quotely-data-service")
+    parser.add_argument("--repo", default="virtualdojo-inc/virtualdojo")
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument("--state", default="closed", choices=["closed", "open", "all"])
     parser.add_argument("--labels", default="bug")

@@ -603,12 +603,12 @@ def fedramp_scan_container_vulnerabilities(
 
 @tool
 def fedramp_check_dependabot_alerts(
-    repo: str = "Quote-ly/quotely-data-service",
+    repo: str = "virtualdojo-inc/virtualdojo",
 ) -> str:
     """Check GitHub Dependabot alerts for open dependency vulnerabilities.
 
     Args:
-        repo: Repository in 'owner/repo' format (default: Quote-ly/quotely-data-service).
+        repo: Repository in 'owner/repo' format (default: virtualdojo-inc/virtualdojo).
     """
     import httpx
     from tools.github import _github_token
@@ -657,7 +657,7 @@ def fedramp_check_dependabot_alerts(
 def fedramp_poam_status() -> str:
     """Read POA&M (Plan of Action and Milestones) status from the FedRAMP OSCAL repo.
 
-    Fetches oscal/poam.json from Quote-ly/Fedramp and formats as a status report.
+    Fetches oscal/poam.json from virtualdojo-inc/Fedramp and formats as a status report.
     """
     import httpx
     from tools.github import _github_token
@@ -665,7 +665,7 @@ def fedramp_poam_status() -> str:
     try:
         token = _github_token()
         resp = httpx.get(
-            "https://api.github.com/repos/Quote-ly/Fedramp/contents/oscal/poam.json",
+            "https://api.github.com/repos/virtualdojo-inc/Fedramp/contents/oscal/poam.json",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github.raw+json",
@@ -674,7 +674,7 @@ def fedramp_poam_status() -> str:
         )
         if resp.status_code == 404:
             return (
-                "POA&M file not found at Quote-ly/Fedramp/oscal/poam.json. "
+                "POA&M file not found at virtualdojo-inc/Fedramp/oscal/poam.json. "
                 "The POA&M has not been initialized yet. Use oscal_generate_poam to create one."
             )
         resp.raise_for_status()

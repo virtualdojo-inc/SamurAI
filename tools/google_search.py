@@ -25,7 +25,7 @@ def google_search(query: str) -> str:
     )
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash",
         contents=query,
         config=GenerateContentConfig(
             tools=[GenaiTool(google_search=GoogleSearch())],
