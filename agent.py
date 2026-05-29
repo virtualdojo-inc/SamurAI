@@ -86,15 +86,14 @@ TOOL_GROUPS = {
             *PROGRESS_TOOLS,
             *SKILL_TOOLS,
             *WIKI_TOOLS,
+            # Background-task/scheduling tools are ALWAYS available: they're few,
+            # high-value, and creating a task already requires approval. Keyword-
+            # gating them previously hid them when users asked for recurring work
+            # in phrasings that missed the trigger words (e.g. "every morning"),
+            # so the agent did one-off work instead of scheduling a job.
+            *BACKGROUND_TASK_TOOLS,
         ],
         "keywords": [],  # Always loaded
-    },
-    "background_tasks": {
-        "tools": BACKGROUND_TASK_TOOLS,
-        "keywords": [
-            "background task", "schedule", "recurring", "cron", "remind",
-            "follow up", "check back", "one shot", "task", "autonomous",
-        ],
     },
     "files": {
         "tools": FILE_HANDLER_TOOLS,
@@ -227,11 +226,13 @@ def _select_tool_groups(message: str, memory_tools: list | None = None) -> list:
     """
     msg_lower = message.lower()
     selected = list(TOOL_GROUPS["core"]["tools"])  # Always include core
+    matched = ["core"]
 
     for name, group in TOOL_GROUPS.items():
         if name == "core":
             continue
         if any(kw in msg_lower for kw in group["keywords"]):
+            matched.append(name)
             if name == "memory" and memory_tools:
                 selected.extend(memory_tools)
             else:
@@ -243,6 +244,14 @@ def _select_tool_groups(message: str, memory_tools: list | None = None) -> list:
         if id(t) not in seen:
             seen.add(id(t))
             deduped.append(t)
+    # Per-turn observability: which tool groups + exact tools were bound for
+    # this message. Makes "the agent didn't have tool X" diagnosable from logs,
+    # and supports tuning which tools get selected for which phrasings.
+    tool_names = sorted(t.name for t in deduped)
+    print(
+        f"[agent] tool_groups={matched} tools={tool_names}",
+        flush=True,
+    )
     return deduped
 
 # ── System prompt sections ─────────────────────────────────────────────

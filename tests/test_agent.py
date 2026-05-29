@@ -171,8 +171,10 @@ def test_select_tool_groups_core_only(mock_llm):
     assert "list_cloud_run_services" in names
     # No fallback — GitHub should NOT be loaded for simple log queries
     assert "github_list_issues" not in names
-    # Background tasks and file tools should NOT be loaded
-    assert "create_background_task" not in names
+    # Background-task/scheduling tools are now ALWAYS available (moved to core)
+    # so the agent can schedule recurring jobs regardless of phrasing.
+    assert "create_background_task" in names
+    # File tools should NOT be loaded for a simple log query
     assert "get_spreadsheet_info" not in names
     # FedRAMP/OSCAL should NOT be loaded
     assert "fedramp_collect_evidence" not in names
