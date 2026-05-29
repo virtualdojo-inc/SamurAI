@@ -182,6 +182,8 @@ TOOL_GROUPS = {
             "improve yourself", "self improve", "self-improve",
             "learn from today", "update your knowledge", "update your skills",
             "compile your wiki", "learn from our chats", "learn from the chats",
+            "learn the codebase", "learn the system", "update the system map",
+            "engineering knowledge", "sync the system map", "study the repo",
         ],
     },
     "repo": {
@@ -326,6 +328,20 @@ _CORE_SECTION = (
     "what they're asking about.\n"
     "Use github_search_issues for full-text search of historical issues "
     "(includes closed); the project view only shows current work.\n\n"
+    "VIRTUALDOJO SYSTEM KNOWLEDGE:\n"
+    "How the VirtualDojo SaaS is built — frontend + backend architecture, the "
+    "subsystems (agents, flows, quoting, compliance, tenancy, auth/permissions, "
+    "email, packages, RFx, dynamic schema...), the data model, and the non-obvious "
+    "invariants/gotchas — is documented in your engineering knowledge wiki "
+    "(the 'engineering' articles under 'Knowledge base': system-map, "
+    "backend-request-flow, frontend-map, data-model-overview, "
+    "dev-gotchas-and-invariants, and the symptom-to-subsystem troubleshooting "
+    "index). CONSULT IT FIRST via search_wiki / read_knowledge when troubleshooting, "
+    "doing root-cause analysis, or writing up a GitHub issue — use it to locate the "
+    "owning subsystem and the code paths to read, and to name that subsystem/path "
+    "in the issue. It is an ORIENTATION MAP, not the source of truth: once it points "
+    "you at a subsystem, read the LIVE code with the repo tools (sync_repo etc.) "
+    "before asserting specifics.\n\n"
     "IMPORTANT: Before creating a GitHub issue, ALWAYS search existing issues first "
     "(via github_search_issues for full-text search, or github_get_project_items for "
     "the active backlog) to check for duplicates. Do NOT create redundant issues.\n"
@@ -624,6 +640,13 @@ _TROUBLESHOOTING_SECTION = (
     "or code reads. If a closed bug issue already matches, prior investigation likely "
     "solved it — cite the issue and synthesize from there instead of re-investigating. "
     "Include this call in your first parallel batch.\n"
+    "2a. ARCHITECTURE CONTEXT: in the same first batch, call search_wiki / "
+    "read_knowledge on the engineering wiki (system-map, symptom-to-subsystem, "
+    "frontend-map, backend-request-flow) to identify the OWNING subsystem and the "
+    "service/model/view/endpoint that likely holds the bug BEFORE sync_repo / "
+    "investigate — so code reads and investigate() calls target the right files "
+    "instead of searching blind. (It's an orientation map; confirm against live "
+    "code.) When you later write up the issue, name that subsystem + code path.\n"
     "3. Determine which environment has the issue: production (main branch) or dev "
     "(development branch). Call sync_repo to ensure the latest code is available.\n"
     "3a. CRITICAL: sync_repo must complete BEFORE search_repo_code / read_repo_file / "

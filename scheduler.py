@@ -55,7 +55,7 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
     # Daily in-boundary knowledge-base compile (support pilot). Runs in-process
     # on samurai-bot (inside the Assured Workloads boundary) via regional Vertex
     # Gemini. Gated by KB_PIPELINE_ENABLED so it stays dormant until enabled.
-    from kb.run import pipeline_enabled
+    from kb.run import engineering_pipeline_enabled, pipeline_enabled
 
     if pipeline_enabled():
         _scheduler.add_job(
@@ -65,6 +65,18 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
             replace_existing=True,
         )
         logger.info("KB support pipeline scheduled (daily, in-boundary Gemini).")
+
+    # Daily engineering-knowledge sync: refresh the virtualdojo system map from
+    # the repo (only when something merged to main). Defaults to 9am. Gated by
+    # KB_ENG_PIPELINE_ENABLED so it stays dormant until enabled.
+    if engineering_pipeline_enabled():
+        _scheduler.add_job(
+            _run_kb_engineering_pipeline,
+            CronTrigger.from_crontab(os.environ.get("KB_ENG_PIPELINE_CRON", "0 9 * * *")),
+            id="kb_engineering_pipeline",
+            replace_existing=True,
+        )
+        logger.info("KB engineering pipeline scheduled (daily 9am, in-boundary Gemini).")
 
     _scheduler.start()
     logger.info("Scheduler started with %d active tasks", len(tasks))
@@ -79,6 +91,16 @@ async def _run_kb_pipeline() -> None:
         await asyncio.to_thread(run_support_pipeline)
     except Exception as e:  # never let a pipeline run crash the scheduler
         logger.error("[kb.run] support pipeline failed: %s: %s", type(e).__name__, e)
+
+
+async def _run_kb_engineering_pipeline() -> None:
+    """Run the in-boundary engineering-knowledge sync off the event loop."""
+    from kb.run import run_engineering_pipeline
+
+    try:
+        await asyncio.to_thread(run_engineering_pipeline)
+    except Exception as e:  # never let a pipeline run crash the scheduler
+        logger.error("[kb.run] engineering pipeline failed: %s: %s", type(e).__name__, e)
 
 
 def _register_job(task: dict) -> None:

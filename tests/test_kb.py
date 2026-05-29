@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 import pytest
 
 from kb import compile as kb_compile
+from kb import compile_engineering as kb_compile_eng
 from kb import ingest_github
+from kb import ingest_repo
 from kb import ingest_smartsheet
 from kb import run as kb_run
 
@@ -260,6 +262,202 @@ def test_run_acquires_and_releases_lock(monkeypatch):
     out = kb_run.run_support_pipeline(force=True)
     assert calls["acq"] == 1 and calls["rel"] == 1
     assert "compile" in out
+
+
+# ---- engineering ingest (repo → stubs) --------------------------------------
+
+_API_PY = (
+    'api_router.include_router(auth.router, prefix="/auth", tags=["authentication"])\n'
+    'api_router.include_router(quotes.router, prefix="/quotes", tags=["formula"])\n'
+)
+_LEAK = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+class _FakeContent:
+    def __init__(self, path, body=None, is_dir=False):
+        self.path = path
+        self.name = path.rsplit("/", 1)[-1]
+        self.type = "dir" if is_dir else "file"
+        self._body = body or ""
+
+    @property
+    def decoded_content(self):
+        return self._body.encode("utf-8")
+
+
+class _FakeRepoTree:
+    def __init__(self, sha="HEADSHA"):
+        self._sha = sha
+        self.fetched = []  # individual file fetches (not dir listings)
+        self.files = {
+            "README.md": "# VirtualDojo\nA multi-tenant CRM.",
+            "CLAUDE.md": f"# Dev Guide\nleaked {_LEAK}\n## Common Mistakes to Avoid\nUse flush().",
+            "LOGIN_TROUBLESHOOTING_GUIDE.md": "# Login\nCheck SSO and MFA.",
+            "PRODUCTION_DEPLOYMENT_TROUBLESHOOTING.md": "# Deploy\nRollback steps.",
+            "WORKFLOW_GUIDE.md": "# Workflow\nGit flow.",
+            "TENANT_PROVISIONING_ANALYSIS.md": "# Tenant\nProvisioning notes.",
+            "docs/project/architecture.md": "# Arch\nLayers.",
+            "app/api/v1/api.py": _API_PY,
+        }
+        self.dirs = {
+            "docs/project": ["docs/project/architecture.md"],
+            "app/services": [
+                "app/services/quote_generation_service.py",
+                "app/services/sso_auth_service.py",
+                "app/services/mcp_client_service.py",
+                "app/services/weird_service.py",
+            ],
+            "app/models": ["app/models/quote.py", "app/models/permission.py", "app/models/unknownthing.py"],
+            "app/api/v1/endpoints": ["app/api/v1/endpoints/agent_execution.py"],
+            "app/middleware": ["app/middleware/tenant.py"],
+            "frontend/src/views": ["frontend/src/views/Login.vue", "frontend/src/views/Quote.vue"],
+            "frontend/src/stores": ["frontend/src/stores/auth.js"],
+            "frontend/src/services": ["frontend/src/services/api.js"],
+        }
+
+    def get_branch(self, ref):
+        return type("B", (), {"commit": type("C", (), {"sha": self._sha})()})()
+
+    def get_contents(self, path, ref=None):
+        if path in self.dirs:
+            return [_FakeContent(c, is_dir=c in self.dirs) for c in self.dirs[path]]
+        if path in self.files:
+            self.fetched.append(path)
+            return _FakeContent(path, body=self.files[path])
+        raise Exception(f"404 {path}")
+
+
+def _patch_repo(monkeypatch, sha="HEADSHA"):
+    fake = FakeStorage()
+    repo = _FakeRepoTree(sha=sha)
+    monkeypatch.setattr(ingest_repo, "storage", fake)
+    monkeypatch.setattr(ingest_repo, "_github", lambda: type("G", (), {"get_repo": lambda self, r: repo})())
+    return fake, repo
+
+
+def test_repo_ingest_skips_when_no_merges(monkeypatch):
+    fake, repo = _patch_repo(monkeypatch, sha="SAME")
+    fake.objs[ingest_repo.STATE_PATH] = "SAME"
+    stats = ingest_repo.refresh_repo_knowledge(force=False)
+    assert stats["skipped"] == "no-merges"
+    # nothing written when the HEAD sha is unchanged
+    assert not any(k.startswith(ingest_repo.DOCS_PREFIX) for k in fake.objs)
+
+
+def test_repo_ingest_writes_docs_structure_and_stubs(monkeypatch):
+    fake, repo = _patch_repo(monkeypatch, sha="NEWSHA")
+    stats = ingest_repo.refresh_repo_knowledge(force=True)
+    assert stats["docs_written"] == 7  # 6 top-level present + docs/project/architecture
+    assert stats["structure_written"] == 8  # 7 dirs + router map
+    assert stats["stubs_written"] == 9
+    assert stats["secrets_redacted"] == 1
+    # secret scrubbed in the stored doc AND in the stub that embeds CLAUDE.md
+    assert "[REDACTED-SECRET]" in fake.objs[ingest_repo.DOCS_PREFIX + "claude.md"]
+    assert _LEAK not in fake.objs[ingest_repo.STUBS_PREFIX + "dev-gotchas-and-invariants.md"]
+    # the system-map stub clustered a real service path under a domain heading
+    sysmap = fake.objs[ingest_repo.STUBS_PREFIX + "system-map.md"]
+    assert "quote_generation_service.py" in sysmap and "kind: wiki" in sysmap
+    # watermark advanced
+    assert fake.objs[ingest_repo.STATE_PATH] == "NEWSHA"
+
+
+def test_repo_ingest_allowlist_excludes_code(monkeypatch):
+    fake, repo = _patch_repo(monkeypatch, sha="NEWSHA")
+    ingest_repo.refresh_repo_knowledge(force=True)
+    # a non-allowlisted service file is never fetched as a doc — only its NAME
+    # appears in the structure inventory.
+    assert "app/services/weird_service.py" not in repo.fetched
+    assert "app/api/v1/api.py" in repo.fetched  # router map IS parsed
+    assert not any("weird-service" in k for k in fake.objs if k.startswith(ingest_repo.DOCS_PREFIX))
+    assert "weird_service.py" in fake.objs[ingest_repo.STRUCT_PREFIX + "services.md"]
+
+
+# ---- engineering compile (fill the stub) ------------------------------------
+
+def _seed_stub(fake, slug, kind):
+    fake.objs[f"{kb_compile_eng.STUBS_PREFIX}{slug}.md"] = (
+        f"---\ntitle: T {slug}\nsummary: S {slug}\nkind: {kind}\n---\n\n# {slug}\n<!-- WRITE: x -->\n"
+    )
+
+
+def test_compile_engineering_writes_articles_and_index(monkeypatch):
+    fake = FakeStorage()
+    _seed_stub(fake, "system-map", "wiki")
+    _seed_stub(fake, "symptom-to-subsystem", "troubleshooting")
+    monkeypatch.setattr(kb_compile_eng, "storage", fake)
+
+    stats = kb_compile_eng.compile_engineering(llm=FakeLLM())
+    assert stats["articles_written"] == 2
+    wiki = fake.objs[kb_compile_eng.WIKI_PREFIX + "system-map.md"]
+    assert wiki.startswith("---\n") and "title:" in wiki and "category: wiki" in wiki
+    assert kb_compile_eng.TROUBLE_PREFIX + "symptom-to-subsystem.md" in fake.objs
+    # index regenerated with wikilinks to both
+    idx = fake.objs[kb_compile_eng.INDEX_PATH]
+    assert "[[system-map]]" in idx and "[[symptom-to-subsystem]]" in idx
+
+
+def test_compile_engineering_is_idempotent(monkeypatch):
+    fake = FakeStorage()
+    _seed_stub(fake, "system-map", "wiki")
+    monkeypatch.setattr(kb_compile_eng, "storage", fake)
+    kb_compile_eng.compile_engineering(llm=FakeLLM())
+    stats2 = kb_compile_eng.compile_engineering(llm=FakeLLM())  # unchanged stubs
+    assert stats2["articles_written"] == 0
+
+
+def test_compile_engineering_bounded_and_resumes(monkeypatch):
+    fake = FakeStorage()
+    for s in ("a", "b", "c"):
+        _seed_stub(fake, s, "wiki")
+    monkeypatch.setattr(kb_compile_eng, "storage", fake)
+    s1 = kb_compile_eng.compile_engineering(llm=FakeLLM(), max_docs=2)
+    assert s1["articles_written"] == 2 and s1["stubs_remaining"] == 1
+    s2 = kb_compile_eng.compile_engineering(llm=FakeLLM(), max_docs=2)
+    assert s2["articles_written"] == 1 and s2["stubs_remaining"] == 0
+
+
+def test_compile_engineering_engine_is_in_boundary(monkeypatch):
+    fake = FakeStorage()
+    _seed_stub(fake, "system-map", "wiki")
+    monkeypatch.setattr(kb_compile_eng, "storage", fake)
+    eng = kb_compile_eng.compile_engineering(llm=FakeLLM())["engine"]
+    assert eng["engine"] == "vertex-gemini" and eng["external_llm"] is False
+    assert eng["location"] != "global"
+
+
+# ---- engineering pipeline runner --------------------------------------------
+
+def test_engineering_run_skips_when_locked(monkeypatch):
+    from kb import storage as kb_storage
+    monkeypatch.setattr(kb_storage, "acquire_lock", lambda *a, **k: False)
+    assert kb_run.run_engineering_pipeline(force=True) == {"skipped": "locked"}
+
+
+def test_engineering_run_skips_compile_on_no_merges(monkeypatch):
+    from kb import storage as kb_storage
+    monkeypatch.setenv("KB_ENG_PIPELINE_ENABLED", "true")
+    monkeypatch.setattr(kb_storage, "acquire_lock", lambda *a, **k: True)
+    monkeypatch.setattr(kb_storage, "release_lock", lambda *a, **k: None)
+    monkeypatch.setattr(kb_run.ingest_repo, "refresh_repo_knowledge",
+                        lambda force=False: {"skipped": "no-merges", "head": "x"})
+    called = {"compile": 0}
+    monkeypatch.setattr(kb_run.kb_compile_eng, "compile_engineering",
+                        lambda **k: called.__setitem__("compile", called["compile"] + 1))
+    out = kb_run.run_engineering_pipeline(force=False)
+    assert out["compile"] == {"skipped": "no-merges"}
+    assert called["compile"] == 0  # Gemini compile NOT invoked on a no-op tick
+
+
+def test_engineering_run_acquires_and_releases_lock(monkeypatch):
+    from kb import storage as kb_storage
+    calls = {"acq": 0, "rel": 0}
+    monkeypatch.setattr(kb_storage, "acquire_lock", lambda *a, **k: (calls.__setitem__("acq", calls["acq"] + 1), True)[1])
+    monkeypatch.setattr(kb_storage, "release_lock", lambda *a, **k: calls.__setitem__("rel", calls["rel"] + 1))
+    monkeypatch.setattr(kb_run.ingest_repo, "refresh_repo_knowledge", lambda force=False: {"head": "x", "stubs_written": 9})
+    monkeypatch.setattr(kb_run.kb_compile_eng, "compile_engineering", lambda **k: {"articles_written": 9})
+    out = kb_run.run_engineering_pipeline(force=True)
+    assert calls["acq"] == 1 and calls["rel"] == 1
+    assert "compile" in out and out["compile"]["articles_written"] == 9
 
 
 # ---- support chat capture ---------------------------------------------------
