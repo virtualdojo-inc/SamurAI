@@ -28,9 +28,12 @@ from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
-# Scopes the bot is granted (conditioned objectViewer). Each contributes
-# its <scope>/wiki/*.md articles.
+# Scopes the bot is granted (conditioned objectViewer). For each scope we serve
+# curated knowledge from these subdirs: wiki/ (reference articles), playbooks/
+# (synthesized troubleshooting playbooks), troubleshooting/. Raw tickets are NOT
+# served — they're a searchable log, not knowledge.
 SERVE_SCOPES = ["engineering", "support", "customers/onboarding"]
+SERVE_SUBDIRS = ["wiki", "playbooks", "troubleshooting"]
 # Repo skills stay repo-local; only knowledge moved to the bucket.
 SKILLS_DIR = Path(__file__).parent / "skills"
 # Transition fallback to repo knowledge/ until it is retired.
@@ -71,25 +74,26 @@ def _parse(path_name: str, text: str) -> dict | None:
 
 
 def _load_from_bucket() -> list[dict]:
-    """Read <scope>/wiki/*.md via the in-boundary storage client (conditioned IAM)."""
+    """Read curated knowledge (<scope>/<subdir>/*.md) via the in-boundary client."""
     from kb import storage  # lazy: avoids hard dep at import / in tests
 
     articles: list[dict] = []
     seen: set[str] = set()
     for scope in SERVE_SCOPES:
-        try:
-            items = storage.list_text(f"{scope}/wiki/")
-        except Exception as e:
-            logger.warning("[wiki] scope %s read failed: %s", scope, e)
-            continue
-        for path_name, text in items:
-            base = path_name.rsplit("/", 1)[-1].lower()
-            if base in ("index.md", ".keep") or not base.endswith(".md"):
+        for sub in SERVE_SUBDIRS:
+            try:
+                items = storage.list_text(f"{scope}/{sub}/")
+            except Exception as e:
+                logger.warning("[wiki] %s/%s read failed: %s", scope, sub, e)
                 continue
-            parsed = _parse(path_name, text)
-            if parsed and parsed["name"] not in seen:
-                seen.add(parsed["name"])
-                articles.append(parsed)
+            for path_name, text in items:
+                base = path_name.rsplit("/", 1)[-1].lower()
+                if base in ("index.md", ".keep") or not base.endswith(".md"):
+                    continue
+                parsed = _parse(path_name, text)
+                if parsed and parsed["name"] not in seen:
+                    seen.add(parsed["name"])
+                    articles.append(parsed)
     return articles
 
 

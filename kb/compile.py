@@ -1,18 +1,20 @@
-"""Compile ``support/raw/`` → ``support/wiki/`` with in-boundary Gemini.
+"""Compile resolved support tickets → troubleshooting PLAYBOOKS (in-boundary Gemini).
 
-Designed to run as a small, resumable, bounded in-process job on the serving
-instance, tolerant of Cloud Run interruptions (deploys/drains/SIGKILL):
+Option C semantics: a resolved GitHub issue / Smartsheet ticket is a *historical
+work-log record*, NOT a fact about the product. So we do NOT transcribe one
+article per issue. Instead:
 
-- **Checkpoint as you go (#1):** the manifest (processed doc → hash) and the
-  accumulated knowledge units are persisted after EVERY doc, and articles are
-  regenerated per "dirty" topic and cleared as they're written. So an interrupted
-  run resumes exactly where it stopped — no re-extraction, no doom loop.
-- **Bounded batches (#2):** each call processes at most ``max_docs`` unprocessed
-  docs, so an interruption costs ≤ one small batch and the compile never hogs the
-  instance. Repeated ticks converge to a fully compiled wiki.
-- Single-flight locking (#3) is handled by the caller (``kb.run``).
+  (A) DISTILL: per-doc we extract a troubleshooting SIGNAL (area, symptom,
+      root_cause, resolution, status); per *area* we SYNTHESIZE a durable
+      troubleshooting playbook (common symptoms → likely causes → resolution
+      steps) plus a dated, source-cited "past resolved issues" list. Resolutions
+      are framed as HISTORICAL, never as current product facts.
+  (B) The raw tickets stay in ``support/raw/`` as the searchable log; agents drill
+      into specifics via the playbook's issue refs + the existing GitHub tools.
 
-Compliance: the only LLM is ``kb.gemini.get_kb_llm`` (regional Vertex, in-boundary).
+Bounded + resumable + single-flight (same machinery as before): per-doc manifest
++ signals are checkpointed after every doc; playbooks regenerate per "dirty" area
+and clear as written, so interruptions resume with no re-extraction.
 """
 
 from __future__ import annotations
@@ -26,28 +28,34 @@ from kb import storage
 from kb.gemini import get_kb_llm, kb_engine_info
 
 RAW_PREFIX = "support/raw/"
-WIKI_PREFIX = "support/wiki/"
-INDEX_PATH = "support/index.md"
-MANIFEST_PATH = "support/wiki/.manifest.json"
-UNITS_PATH = "support/wiki/.units.json"
-_INTERNAL = (MANIFEST_PATH, UNITS_PATH)
+PLAYBOOK_PREFIX = "support/playbooks/"
+INDEX_PATH = "support/playbooks/index.md"
+MANIFEST_PATH = "support/playbooks/.manifest.json"
+SIGNALS_PATH = "support/playbooks/.signals.json"
+_INTERNAL = (MANIFEST_PATH, SIGNALS_PATH)
 
 _EXTRACT_SYS = (
-    "You extract knowledge from a single VirtualDojo support source document. "
-    "Return ONLY a JSON object with keys: topic_slug (lowercase-hyphen, <=48 chars), "
-    "title (short), one_line (third person), key_facts (array of short factual "
-    "strings grounded ONLY in the document), sensitive (true if the doc contains "
-    "financials, legal, PII, or secrets), sensitive_kinds (array). OMIT any "
-    "sensitive values from key_facts — never echo them. Facts only; no speculation."
+    "You read ONE resolved VirtualDojo support ticket / GitHub issue — a HISTORICAL "
+    "record of a past problem and its fix, NOT a statement of current product "
+    "behavior. Return ONLY a JSON object: area (lowercase-hyphen product-area slug "
+    "<=48 chars, e.g. 'quote-importer', 'ui-readability', 'rfx-filtering'), symptom "
+    "(what was reported/observed), root_cause (why, if stated, else ''), resolution "
+    "(what fixed it, if stated, else ''), status (resolved|in-progress|wont-fix|"
+    "unknown), sensitive (true if it contains financials/legal/PII/secrets). OMIT "
+    "any sensitive values. Facts only; empty string for anything not in the ticket."
 )
 
-_ARTICLE_SYS = (
-    "You write ONE concise, third-person VirtualDojo support knowledge article in "
-    "markdown, grounded ONLY in the provided facts (facts-only rule — no "
-    "speculation, no invented specifics). Do NOT include any financials, legal, "
-    "PII, or secrets. Start with a short H1, then tight prose/bullets, and end with "
-    "a '## Related' section linking sibling topics as [[slug]]. Output ONLY the "
-    "article body (no frontmatter — it is added programmatically)."
+_PLAYBOOK_SYS = (
+    "You write ONE troubleshooting PLAYBOOK for a VirtualDojo support area, in "
+    "markdown, SYNTHESIZED across MULTIPLE resolved tickets — durable guidance for a "
+    "support agent, NOT a restatement of individual tickets. Structure: a short H1; "
+    "'## Common symptoms'; '## Likely causes'; '## Resolution steps' (generalized "
+    "from how these were resolved). Then '## Past resolved issues (historical)' — a "
+    "brief, dated, source-cited bullet list. CRITICAL: frame everything as "
+    "troubleshooting patterns and HISTORICAL resolutions — NEVER assert a past fix "
+    "as current product behavior (it may have changed since). Ground ONLY in the "
+    "provided signals; no speculation; no financials/PII/secrets. Output ONLY the "
+    "markdown body (frontmatter is added programmatically)."
 )
 
 
@@ -69,9 +77,10 @@ def _llm_text(llm, system: str, user: str) -> str:
 
 
 def _frontmatter(title: str, sources: list[str], confidence: str) -> str:
-    src = "[" + ", ".join(sorted(set(sources))) + "]"
+    src = "[" + ", ".join(sorted(set(sources))[:40]) + "]"
     return (
         "---\n"
+        "kind: troubleshooting-playbook\n"
         f"title: {title}\n"
         f"sources: {src}\n"
         f"last_verified: {date.today().isoformat()}\n"
@@ -94,53 +103,60 @@ def _slugify(s: str) -> str:
     return re.sub(r"[^a-z0-9-]", "", str(s or "").lower())[:48]
 
 
-def _write_article(llm, slug: str, unit: dict, siblings: list[str]) -> None:
-    related = [s for s in siblings if s != slug][:8]
-    prompt = (
-        f"Topic slug: {slug}\nTitle: {unit.get('title') or slug}\n"
-        f"Sibling topics (for [[backlinks]]): {related}\n\n"
-        "Facts (grounded sources):\n- " + "\n- ".join(unit.get("facts", [])[:60])
+def _write_playbook(llm, area: str, rec: dict) -> None:
+    items = rec.get("items", [])
+    lines = []
+    for it in items[:60]:
+        lines.append(
+            f"- source={it.get('source','?')} status={it.get('status','?')} "
+            f"symptom={it.get('symptom','')!r} cause={it.get('root_cause','')!r} "
+            f"resolution={it.get('resolution','')!r}"
+        )
+    prompt = f"Area: {area}\nTitle: {rec.get('title') or area}\n\nSignals:\n" + "\n".join(lines)
+    body = _llm_text(llm, _PLAYBOOK_SYS, prompt).strip()
+    confidence = "high" if len(items) >= 3 else "needs-review"
+    sources = [it.get("source", "") for it in items if it.get("source")]
+    storage.write_text(
+        f"{PLAYBOOK_PREFIX}{area}.md",
+        _frontmatter(rec.get("title") or area, sources, confidence) + body + "\n",
     )
-    body = _llm_text(llm, _ARTICLE_SYS, prompt).strip()
-    confidence = "high" if len(unit.get("facts", [])) >= 3 else "needs-review"
-    article = _frontmatter(unit.get("title") or slug, unit.get("sources", []), confidence) + body + "\n"
-    storage.write_text(f"{WIKI_PREFIX}{slug}.md", article)
 
 
 def _refresh_index() -> int:
-    articles = sorted(
-        p for p in storage.list_paths(WIKI_PREFIX)
+    playbooks = sorted(
+        p for p in storage.list_paths(PLAYBOOK_PREFIX)
         if p.endswith(".md") and not p.endswith("index.md")
     )
     lines = [
-        "# Support Knowledge Index",
+        "# Support Troubleshooting Playbooks",
         "",
-        "Auto-maintained by the in-boundary Gemini compile. Do not edit by hand.",
+        "Auto-synthesized from resolved tickets by in-boundary Gemini. These are "
+        "troubleshooting PATTERNS and HISTORICAL resolutions, not current product "
+        "facts. Do not edit by hand.",
         "",
     ]
-    for p in articles:
-        lines.append(f"- [[{p[len(WIKI_PREFIX):-3]}]]")
+    for p in playbooks:
+        lines.append(f"- [[{p[len(PLAYBOOK_PREFIX):-3]}]]")
     storage.write_text(INDEX_PATH, "\n".join(lines) + "\n")
-    return len(articles)
+    return len(playbooks)
 
 
 def compile_support(llm=None, max_docs: int | None = None) -> dict:
-    """Process up to ``max_docs`` new/changed raw docs into the wiki, resumably.
+    """Distill up to ``max_docs`` new/changed tickets into per-area playbooks.
 
-    Returns content-free stats. Safe to call repeatedly: each call advances the
-    manifest and converges the wiki; interruptions lose at most the in-flight doc.
+    Resumable + bounded. Returns content-free stats.
     """
     llm = llm or get_kb_llm()
     manifest: dict = _load_json(MANIFEST_PATH, {})
-    state: dict = _load_json(UNITS_PATH, {})
-    units: dict = state.get("units", {})
+    state: dict = _load_json(SIGNALS_PATH, {})
+    areas: dict = state.get("areas", {})
     dirty: set = set(state.get("dirty", []))
 
     def _save():
         storage.write_text(MANIFEST_PATH, json.dumps(manifest), content_type="application/json")
         storage.write_text(
-            UNITS_PATH,
-            json.dumps({"units": units, "dirty": sorted(dirty)}),
+            SIGNALS_PATH,
+            json.dumps({"areas": areas, "dirty": sorted(dirty)}),
             content_type="application/json",
         )
 
@@ -150,53 +166,53 @@ def compile_support(llm=None, max_docs: int | None = None) -> dict:
     ]
     pending = [(p, t, hashlib.sha256(t.encode("utf-8")).hexdigest()) for p, t in docs]
     pending = [(p, t, h) for p, t, h in pending if manifest.get(p) != h]
-    batch = pending[: max_docs] if max_docs else pending
+    batch = pending[:max_docs] if max_docs else pending
 
-    # --- Extract phase: per-doc, checkpoint after each (resumable) ---
+    # --- Extract phase: one troubleshooting signal per ticket (checkpointed) ---
     processed = flagged = 0
     for path, text, h in batch:
         data = _json_from(_llm_text(llm, _EXTRACT_SYS, text)) or {}
         if data.get("sensitive"):
             flagged += 1
-        slug = _slugify(data.get("topic_slug"))
-        if slug:
-            u = units.setdefault(slug, {"title": data.get("title") or slug, "facts": [], "sources": []})
-            for f in (data.get("key_facts") or []):
-                if f and f not in u["facts"]:
-                    u["facts"].append(f)
-            if path not in u["sources"]:
-                u["sources"].append(path)
-            dirty.add(slug)
+        area = _slugify(data.get("area"))
+        if area:
+            rec = areas.setdefault(area, {"title": area.replace("-", " ").title(), "items": []})
+            rec["items"].append({
+                "source": path.rsplit("/", 1)[-1],
+                "symptom": data.get("symptom", ""),
+                "root_cause": data.get("root_cause", ""),
+                "resolution": data.get("resolution", ""),
+                "status": data.get("status", "unknown"),
+            })
+            dirty.add(area)
         manifest[path] = h
         processed += 1
         _save()  # checkpoint every doc → interruption-safe
 
-    # --- Article phase: regenerate each dirty topic, clear as written ---
-    articles_written = 0
-    siblings = sorted(units.keys())
-    for slug in sorted(dirty):
-        if slug not in units:
-            dirty.discard(slug)
+    # --- Synthesis phase: regenerate each dirty area's playbook ---
+    playbooks_written = 0
+    for area in sorted(dirty):
+        if area not in areas:
+            dirty.discard(area)
             continue
-        _write_article(llm, slug, units[slug], siblings)
-        dirty.discard(slug)
-        articles_written += 1
-        _save()  # checkpoint after each article → resume skips done ones
+        _write_playbook(llm, area, areas[area])
+        dirty.discard(area)
+        playbooks_written += 1
+        _save()
 
-    total_articles = _refresh_index()
-
+    total = _refresh_index()
     stats = {
         "engine": kb_engine_info(),
         "raw_docs_seen": len(docs),
         "raw_docs_processed": processed,
         "sensitive_flagged_omitted": flagged,
-        "articles_written": articles_written,
-        "articles_total": total_articles,
+        "playbooks_written": playbooks_written,
+        "playbooks_total": total,
         "docs_remaining": max(0, len(pending) - processed),
     }
     print(
-        f"[kb.compile] batch: processed={processed} wrote={articles_written} "
-        f"remaining={stats['docs_remaining']} total_articles={total_articles}",
+        f"[kb.compile] batch: processed={processed} playbooks={playbooks_written} "
+        f"remaining={stats['docs_remaining']} total_playbooks={total}",
         flush=True,
     )
     return stats

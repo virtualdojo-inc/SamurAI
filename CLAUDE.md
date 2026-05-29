@@ -200,60 +200,99 @@ The bot uses a **SingleTenant** Azure Bot Service registration. All three of the
 2. The client secret in GCP Secret Manager matches a valid credential on the Azure app registration (`az ad app credential list --id 35e1851a-0377-47f3-8b47-09110fec743c`)
 3. The Azure Bot Service app type (`az bot show --name samurai-dojo-bot --resource-group samurai-rg --query 'properties.msaAppType'`) is `SingleTenant`
 
-## Skills, knowledge wiki, and self-improvement
+## Knowledge bucket + learning loop
 
-SamurAI maintains a committed, LLM-curated **knowledge wiki** (Andrej Karpathy's
-LLM-wiki pattern): raw conversations are the source, Claude "compiles" them into
-markdown skills + knowledge articles, and SamurAI reads/searches that wiki to
-answer questions. It complements (does not replace) the LangMem runtime memory.
+SamurAI maintains a self-improving knowledge base in **`gs://virtualdojo-knowledge`**
+(project `virtualdojo-samurai`, us-central1), inside the **SamurAI Assured Workloads
+boundary (FedRAMP Moderate)**. The bucket is the single KB store going forward
+(the repo's `skills/` + `knowledge/` are legacy; `knowledge/` survives only as a
+transition fallback in `wiki.py`).
 
-### The wiki (committed markdown, Obsidian-compatible)
-- **Skills** (`skills/<name>/SKILL.md`, loader `skills.py`): procedural know-how.
-  Frontmatter `name` (`[a-z0-9-]` ≤64, no `anthropic`/`claude`) + `description`
-  (≤1024). Tool: `get_skill`.
-- **Knowledge** (`knowledge/<name>.md`, loader `wiki.py`): conceptual/reference
-  articles. Frontmatter `title` + `summary`; bodies use Obsidian `[[wikilinks]]`.
-  `knowledge/INDEX.md` is an auto-maintained index. Tools: `read_knowledge`,
-  `search_wiki` (naive keyword search over skills/ + knowledge/).
-- **Progressive disclosure:** every skill's name/description and every article's
-  title/summary are injected into the system prompt (`skills.skills_catalog_text`
-  + `wiki.knowledge_index_text`, wired in `agent._select_prompt_sections`); full
-  bodies load on demand via the tools above. Loaders skip malformed files rather
-  than crash. `get_skill`, `read_knowledge`, `search_wiki` are core (always-on).
+### ⚠️ Compliance boundary — non-negotiable
+**All ingest / compile / lint of this bucket's data runs IN-BOUNDARY on Vertex AI
+Gemini.** Never send this bucket's data to an external LLM (Claude/Anthropic,
+OpenAI) or a developer laptop, and never process it on a GitHub-hosted runner
+(out-of-boundary). This is why the compile runs in-process on `samurai-bot`, not
+in GitHub Actions. (The bucket's own `README.md` carries the authoritative rules:
+`raw/` immutable, `wiki/` LLM-authored + grounded only in `raw/`,
+`conversation-history/` is a LOG never cited as a source, flag+omit PII/secrets.)
 
-### Raw conversation capture (the wiki's ingest)
-- `conversation_log.py:log_turn` is called from `agent.run_agent` (~line 1496)
-  after each turn; it writes ONE JSON file per turn to `DATA_DIR/raw/<date>/`
-  (one-file-per-turn avoids GCS-FUSE append races). Best-effort — never breaks a
-  turn. Raw transcripts contain PII and live ONLY on the `samurai-bot-data`
-  bucket; they are **gitignored** (`raw/`, `_raw_ingest/`) and never committed.
-  A GCS lifecycle rule expires them after 30 days.
+### Two learned-knowledge layers
+1. **LangMem** (runtime vector memory, `memory.py`) — auto-recall injected every
+   turn. Working today; complements the bucket.
+2. **The bucket KB** (curated markdown, in-boundary) — the learning loop below.
 
-### CI/CD (`.github/workflows/`)
-- `deploy.yml` — push to `main`: full test suite gates a **blue/green** deploy
-  (candidate with `--no-traffic --tag`, health-check `/health`, promote only if
-  healthy, **auto-rollback** to the prior revision on a bad promote). Keyless WIF.
-  (Infra in memory note `project_samurai_cicd`.)
-- `nightly-wiki-compile.yml` — cron + manual: `gcloud storage rsync` the last
-  ~24h of `gs://samurai-bot-data/raw/`, Claude distills it into `skills/` +
-  `knowledge/` updates (backlinks, refreshed INDEX), opens a `self-improve` PR.
-- `wiki-health-check.yml` — weekly + manual: Claude lints the wiki (broken
-  links, drift, duplicates, gaps), opens a `self-improve` PR.
-- `claude-pr-review.yml` — on `self-improve` PRs: scope-guard (`skills/**`,
-  `knowledge/**`, `tests/**` only) + **secret-scan** + full tests + Claude review
-  → squash auto-merge on the `SELF_IMPROVE_APPROVED` marker. Human PRs are never
-  auto-merged here.
-- `deploy-troubleshoot.yml` — on a failed deploy: Claude diagnoses from the run
-  logs and opens a normal PR for human review (deploy fixes touch code, outside
-  the wiki allowlist) or files an issue if risky.
-- **Manual trigger:** the `trigger_wiki_compile` tool (`tools/self_improve.py`)
-  dispatches `nightly-wiki-compile.yml` from Teams ("learn from today's chats");
-  it's an action requiring Devin/Cyrus approval.
+### The learning loop (`kb/` package)
+- **Ingest → `support/raw/`** (the immutable, searchable log):
+  - `kb/ingest_github.py` — incremental refresh of `virtualdojo-inc/virtualdojo`
+    issues (watermark in `support/raw/.state/`), secret-scrubbed.
+  - `kb/ingest_smartsheet.py` — auto-discovers Smartsheets in-boundary via
+    `tools/smartsheet.py` and routes by id/name: DH Tech Issue Tracker
+    (`1146352141553540`) + ticket/support sheets → `support/raw/smartsheet/`;
+    onboarding sheets → `customers/onboarding/raw/`.
+  - Support chats → `support/conversation-history/` via
+    `conversation_log.log_support_chat` (gated by `KB_SUPPORT_CHAT_CAPTURE`;
+    marked `authoritative: false` — a log, never a source).
+- **Compile → `support/playbooks/`** (`kb/compile.py`): distills resolved tickets
+  into per-**area** troubleshooting **playbooks** (common symptoms → likely causes
+  → resolution steps + a dated, source-cited "past resolved issues" list).
+  **Key principle:** a resolved ticket is a *historical work-log record, not a
+  fact* — playbooks are troubleshooting PATTERNS and are never asserted as current
+  product behavior. Raw tickets stay as the searchable log (drill into specifics
+  via the playbook's issue refs + the GitHub tools); facts about the product
+  should come from docs/code, not the issue log.
+- **In-boundary engine** (`kb/gemini.py`): regional **us-central1** Vertex Gemini
+  (`KB_COMPILE_MODEL`, default `gemini-2.5-flash-lite`); refuses the `global`
+  endpoint for KB data; there is deliberately no Anthropic client. (Vertex model
+  availability for this project: `gemini-3.5-flash` global-only, `gemini-2.5-flash`
+  + `-lite` at us-central1, `gemini-2.0-flash-lite` decommissioned.)
 
-**Enabling the loop:** set repo variable `SELF_IMPROVE_ENABLED=true` (kill
-switch) + add the `ANTHROPIC_API_KEY` secret. Scope + secret-scan are enforced in
-CI, not just by prompt. Claude-in-CI uses `anthropics/claude-code-action@v1`
-pinned to `claude-sonnet-4-6`.
+### Runs reliably in-process on the serving instance
+A Cloud Run deploy/drain will cancel in-flight background work, so the compile is
+**interruption-tolerant**, not interruption-proof (`kb/compile.py` + `kb/run.py`):
+- **Checkpoint-as-you-go:** the manifest (doc→hash) + accumulated signals persist
+  after EVERY doc; playbooks regenerate per "dirty" area and clear as written →
+  an interrupted run resumes with no re-extraction (no doom loop).
+- **Bounded batches:** `KB_COMPILE_MAX_DOCS` (default 50) per tick; converges over
+  ticks; a kill costs ≤ one small batch.
+- **Single-flight lock:** a GCS lease lock (`storage.acquire_lock`,
+  `support/playbooks/.compile.lock`, atomic `if_generation_match=0` + stale-TTL
+  takeover) stops overlapping compiles across instances during revision churn.
+- Orchestrated by `kb/run.py`; scheduled in `scheduler.py` (`KB_PIPELINE_CRON`,
+  in-process `asyncio.to_thread`); gated by **`KB_PIPELINE_ENABLED`** kill switch.
+  Manual trigger: `trigger_wiki_compile` tool (`tools/self_improve.py`, force run).
+  Progress is logged: `[kb.compile] processed=.. playbooks=.. remaining=..`.
+
+### Serving (runtime read — no redeploy needed)
+`wiki.py` reads `<scope>/{wiki,playbooks,troubleshooting}/*.md` via the
+google-cloud-storage **client** (NOT gcsfuse — gcsfuse needs blanket bucket list
+which violates scope isolation) for scopes `engineering`, `support`,
+`customers/onboarding`. TTL-cached (300s) so nightly updates appear without a
+redeploy. Title/summary injected into the prompt (`knowledge_index_text`); full
+bodies via the core tools `read_knowledge` / `search_wiki` (+ `get_skill`).
+
+### IAM (runtime SA `samurai-bot@…`)
+Conditioned `objectViewer` (read) on `engineering/`+`support/`+
+`customers/onboarding/`; conditioned `objectAdmin` (write) on `support/`+
+`customers/onboarding/`; **plus an unconditional list-only custom role
+`kbLister` (`storage.objects.list`)** — because GCS `objects.list` is bucket-level
+and cannot be prefix-conditioned, so a list-only blanket grant is required while
+content reads stay scope-conditioned.
+
+### Enabling / operating
+`KB_PIPELINE_ENABLED=on` + a `KB_PIPELINE_CRON` (use `*/5`–`*/15` for the first
+full build so it converges over ticks; relax to hourly/daily after). The first
+build processes the whole corpus a batch at a time. **Open caveat:** the chat
+model that *serves* KB answers still uses the Vertex `global` endpoint
+(`gemini-3.5-flash` is global-only for this project) — a data-residency item to
+resolve or get ATO sign-off on.
+
+### Retired
+The earlier Claude-on-GitHub-Actions self-improvement loop
+(`nightly-wiki-compile.yml`, `wiki-health-check.yml`, the `self-improve`
+auto-merge path) is **retired** — a GitHub runner is out-of-boundary. `deploy.yml`
+(blue/green deploy, keyless WIF, memory note `project_samurai_cicd`) and
+`deploy-troubleshoot.yml` remain.
 
 ## Running tests
 

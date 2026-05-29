@@ -41,7 +41,7 @@ class _Resp:
 
 
 class FakeLLM:
-    """Returns extraction JSON for extract prompts, an article body otherwise."""
+    """Returns a troubleshooting SIGNAL for extract prompts, a playbook body otherwise."""
 
     def __init__(self):
         self.calls = 0
@@ -49,13 +49,17 @@ class FakeLLM:
     def invoke(self, messages):
         self.calls += 1
         system = messages[0].content.lower()
-        if "extract knowledge" in system:
+        if "json object" in system:  # extract phase
             return _Resp(
-                '{"topic_slug":"login-issues","title":"Login Issues",'
-                '"one_line":"Users hit login errors","key_facts":["SSO token expiry",'
-                '"clock skew","retry guidance"],"sensitive":false,"sensitive_kinds":[]}'
+                '{"area":"login-issues","symptom":"SSO token expiry","root_cause":'
+                '"clock skew","resolution":"retry after clock fix","status":"resolved",'
+                '"sensitive":false}'
             )
-        return _Resp("# Login Issues\n\nGrounded summary.\n\n## Related\n- [[other-topic]]")
+        return _Resp(
+            "# Login Issues\n\n## Common symptoms\nSSO errors.\n\n## Likely causes\n"
+            "Clock skew.\n\n## Resolution steps\nFix clock, retry.\n\n"
+            "## Past resolved issues (historical)\n- issue-1 (resolved)\n"
+        )
 
 
 # ---- secret scrubbing -------------------------------------------------------
@@ -162,7 +166,7 @@ def test_smartsheet_ingest_routes_by_scope(monkeypatch):
 
 # ---- compile ----------------------------------------------------------------
 
-def test_compile_support_produces_wiki_and_index(monkeypatch):
+def test_compile_support_produces_playbooks_and_index(monkeypatch):
     fake = FakeStorage()
     fake.objs["support/raw/github-issues/issue-1.md"] = "user cannot log in, sso expired"
     fake.objs["support/raw/github-issues/issue-2.md"] = "login retry after clock fix"
@@ -170,15 +174,16 @@ def test_compile_support_produces_wiki_and_index(monkeypatch):
 
     stats = kb_compile.compile_support(llm=FakeLLM())
     assert stats["raw_docs_processed"] == 2
-    assert stats["articles_written"] >= 1
-    # article written with provenance frontmatter
-    art = fake.objs["support/wiki/login-issues.md"]
-    assert art.startswith("---\n")
-    assert "title:" in art and "sources:" in art and "last_verified:" in art and "confidence:" in art
-    assert "[[" in art  # backlinks present
-    # index regenerated
-    assert "support/index.md" in fake.objs
-    assert "[[login-issues]]" in fake.objs["support/index.md"]
+    assert stats["playbooks_written"] >= 1
+    # playbook written with provenance frontmatter + historical framing
+    pb = fake.objs["support/playbooks/login-issues.md"]
+    assert pb.startswith("---\n")
+    assert "kind: troubleshooting-playbook" in pb
+    assert "title:" in pb and "sources:" in pb and "last_verified:" in pb and "confidence:" in pb
+    assert "Past resolved issues (historical)" in pb
+    # index regenerated, in the playbooks scope
+    assert "support/playbooks/index.md" in fake.objs
+    assert "[[login-issues]]" in fake.objs["support/playbooks/index.md"]
 
 
 def test_compile_is_idempotent(monkeypatch):
@@ -212,28 +217,28 @@ def test_compile_bounded_and_resumes(monkeypatch):
     s1 = kb_compile.compile_support(llm=FakeLLM(), max_docs=2)
     assert s1["raw_docs_processed"] == 2
     assert s1["docs_remaining"] == 1
-    assert len(json.loads(fake.objs["support/wiki/.manifest.json"])) == 2
+    assert len(json.loads(fake.objs["support/playbooks/.manifest.json"])) == 2
 
     s2 = kb_compile.compile_support(llm=FakeLLM(), max_docs=2)
     assert s2["raw_docs_processed"] == 1  # only the leftover doc — no re-extract
     assert s2["docs_remaining"] == 0
-    assert len(json.loads(fake.objs["support/wiki/.manifest.json"])) == 3
+    assert len(json.loads(fake.objs["support/playbooks/.manifest.json"])) == 3
 
     s3 = kb_compile.compile_support(llm=FakeLLM(), max_docs=2)
     assert s3["raw_docs_processed"] == 0  # fully converged
 
 
-def test_compile_checkpoints_units_and_manifest(monkeypatch):
-    """#1: manifest + units are persisted (resumable state on disk)."""
+def test_compile_checkpoints_signals_and_manifest(monkeypatch):
+    """#1: manifest + signals are persisted (resumable state on disk)."""
     fake = FakeStorage()
     fake.objs["support/raw/github-issues/issue-1.md"] = "login sso expired"
     monkeypatch.setattr(kb_compile, "storage", fake)
     kb_compile.compile_support(llm=FakeLLM())
-    assert "support/wiki/.manifest.json" in fake.objs
-    assert "support/wiki/.units.json" in fake.objs
-    units = json.loads(fake.objs["support/wiki/.units.json"])
-    assert "login-issues" in units["units"]
-    assert units["dirty"] == []  # cleared after articles written
+    assert "support/playbooks/.manifest.json" in fake.objs
+    assert "support/playbooks/.signals.json" in fake.objs
+    state = json.loads(fake.objs["support/playbooks/.signals.json"])
+    assert "login-issues" in state["areas"]
+    assert state["dirty"] == []  # cleared after playbooks written
 
 
 # ---- single-flight lock (#3) ------------------------------------------------

@@ -19,7 +19,7 @@ from kb.gemini import kb_engine_info
 
 logger = logging.getLogger(__name__)
 
-LOCK_PATH = "support/wiki/.compile.lock"
+LOCK_PATH = "support/playbooks/.compile.lock"
 LOCK_TTL = int(os.environ.get("KB_LOCK_TTL", "1800"))  # stale-takeover after 30m
 DEFAULT_MAX_DOCS = int(os.environ.get("KB_COMPILE_MAX_DOCS", "50"))
 
