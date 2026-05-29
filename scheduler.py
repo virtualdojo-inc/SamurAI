@@ -1,7 +1,9 @@
 """Background task scheduler using APScheduler + in-process AsyncIOScheduler."""
 
+import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -50,9 +52,33 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
     for task in tasks:
         _register_job(task)
 
+    # Daily in-boundary knowledge-base compile (support pilot). Runs in-process
+    # on samurai-bot (inside the Assured Workloads boundary) via regional Vertex
+    # Gemini. Gated by KB_PIPELINE_ENABLED so it stays dormant until enabled.
+    from kb.run import pipeline_enabled
+
+    if pipeline_enabled():
+        _scheduler.add_job(
+            _run_kb_pipeline,
+            CronTrigger.from_crontab(os.environ.get("KB_PIPELINE_CRON", "0 8 * * *")),
+            id="kb_support_pipeline",
+            replace_existing=True,
+        )
+        logger.info("KB support pipeline scheduled (daily, in-boundary Gemini).")
+
     _scheduler.start()
     logger.info("Scheduler started with %d active tasks", len(tasks))
     return _scheduler
+
+
+async def _run_kb_pipeline() -> None:
+    """Run the in-boundary KB pipeline off the event loop (it does blocking I/O)."""
+    from kb.run import run_support_pipeline
+
+    try:
+        await asyncio.to_thread(run_support_pipeline)
+    except Exception as e:  # never let a pipeline run crash the scheduler
+        logger.error("[kb.run] support pipeline failed: %s: %s", type(e).__name__, e)
 
 
 def _register_job(task: dict) -> None:

@@ -200,45 +200,59 @@ The bot uses a **SingleTenant** Azure Bot Service registration. All three of the
 2. The client secret in GCP Secret Manager matches a valid credential on the Azure app registration (`az ad app credential list --id 35e1851a-0377-47f3-8b47-09110fec743c`)
 3. The Azure Bot Service app type (`az bot show --name samurai-dojo-bot --resource-group samurai-rg --query 'properties.msaAppType'`) is `SingleTenant`
 
-## Skills and self-improvement
+## Skills, knowledge wiki, and self-improvement
 
-### Skills (`skills/` + `skills.py`)
-SamurAI has an Agent-Skills capability modeled on Anthropic's Agent Skills.
-A skill is a directory `skills/<name>/SKILL.md` with YAML frontmatter
-(`name` + `description`) and a markdown body of procedural knowledge.
-Progressive disclosure:
-- **Level 1 (always in prompt):** every skill's `name` + `description`, injected
-  via `skills.skills_catalog_text()` into the system prompt in
-  `agent._select_prompt_sections`.
-- **Level 2 (on demand):** the full `SKILL.md` body, fetched by the `get_skill`
-  tool (a core, always-available tool) when the agent judges a skill relevant.
+SamurAI maintains a committed, LLM-curated **knowledge wiki** (Andrej Karpathy's
+LLM-wiki pattern): raw conversations are the source, Claude "compiles" them into
+markdown skills + knowledge articles, and SamurAI reads/searches that wiki to
+answer questions. It complements (does not replace) the LangMem runtime memory.
 
-`skills.py` validates frontmatter (name `[a-z0-9-]` ≤64 chars, no reserved words
-`anthropic`/`claude`; non-empty description ≤1024 chars) and skips malformed
-skills with a warning rather than crashing. Skills are plain files so they can be
-tuned via ordinary PRs — this is the surface the nightly self-improvement loop
-edits.
+### The wiki (committed markdown, Obsidian-compatible)
+- **Skills** (`skills/<name>/SKILL.md`, loader `skills.py`): procedural know-how.
+  Frontmatter `name` (`[a-z0-9-]` ≤64, no `anthropic`/`claude`) + `description`
+  (≤1024). Tool: `get_skill`.
+- **Knowledge** (`knowledge/<name>.md`, loader `wiki.py`): conceptual/reference
+  articles. Frontmatter `title` + `summary`; bodies use Obsidian `[[wikilinks]]`.
+  `knowledge/INDEX.md` is an auto-maintained index. Tools: `read_knowledge`,
+  `search_wiki` (naive keyword search over skills/ + knowledge/).
+- **Progressive disclosure:** every skill's name/description and every article's
+  title/summary are injected into the system prompt (`skills.skills_catalog_text`
+  + `wiki.knowledge_index_text`, wired in `agent._select_prompt_sections`); full
+  bodies load on demand via the tools above. Loaders skip malformed files rather
+  than crash. `get_skill`, `read_knowledge`, `search_wiki` are core (always-on).
+
+### Raw conversation capture (the wiki's ingest)
+- `conversation_log.py:log_turn` is called from `agent.run_agent` (~line 1496)
+  after each turn; it writes ONE JSON file per turn to `DATA_DIR/raw/<date>/`
+  (one-file-per-turn avoids GCS-FUSE append races). Best-effort — never breaks a
+  turn. Raw transcripts contain PII and live ONLY on the `samurai-bot-data`
+  bucket; they are **gitignored** (`raw/`, `_raw_ingest/`) and never committed.
+  A GCS lifecycle rule expires them after 30 days.
 
 ### CI/CD (`.github/workflows/`)
-- `deploy.yml` — on push to `main`: full test suite gates a **blue/green** deploy
-  (deploy candidate with `--no-traffic --tag`, health-check `/health` on the
-  candidate's tagged URL, promote to 100% only if healthy, re-verify prod, and
-  **auto-rollback** to the previous revision if the post-promote check fails).
-  Auth is keyless via Workload Identity Federation. A bad build cannot take the
-  bot down. (Infra details in the memory note `project_samurai_cicd`.)
-- `nightly-self-improve.yml` — cron nightly: reads last-24h GCP logs + current
-  skills, makes ONE scoped improvement to `skills/**` (+ tests), runs tests, and
-  opens a PR labeled `self-improve`.
-- `claude-pr-review.yml` — on `self-improve` PRs: hard path-allowlist gate
-  (`skills/**`, `tests/**` only) → full tests → Claude review → auto-merge
-  (squash) on approval marker. Human PRs are never auto-merged here.
-- `deploy-troubleshoot.yml` — on a failed deploy: Claude reads the failed run
-  logs, and either opens a scoped fix PR (`self-improve`) or files an issue if
-  the fix is risky.
+- `deploy.yml` — push to `main`: full test suite gates a **blue/green** deploy
+  (candidate with `--no-traffic --tag`, health-check `/health`, promote only if
+  healthy, **auto-rollback** to the prior revision on a bad promote). Keyless WIF.
+  (Infra in memory note `project_samurai_cicd`.)
+- `nightly-wiki-compile.yml` — cron + manual: `gcloud storage rsync` the last
+  ~24h of `gs://samurai-bot-data/raw/`, Claude distills it into `skills/` +
+  `knowledge/` updates (backlinks, refreshed INDEX), opens a `self-improve` PR.
+- `wiki-health-check.yml` — weekly + manual: Claude lints the wiki (broken
+  links, drift, duplicates, gaps), opens a `self-improve` PR.
+- `claude-pr-review.yml` — on `self-improve` PRs: scope-guard (`skills/**`,
+  `knowledge/**`, `tests/**` only) + **secret-scan** + full tests + Claude review
+  → squash auto-merge on the `SELF_IMPROVE_APPROVED` marker. Human PRs are never
+  auto-merged here.
+- `deploy-troubleshoot.yml` — on a failed deploy: Claude diagnoses from the run
+  logs and opens a normal PR for human review (deploy fixes touch code, outside
+  the wiki allowlist) or files an issue if risky.
+- **Manual trigger:** the `trigger_wiki_compile` tool (`tools/self_improve.py`)
+  dispatches `nightly-wiki-compile.yml` from Teams ("learn from today's chats");
+  it's an action requiring Devin/Cyrus approval.
 
 **Enabling the loop:** set repo variable `SELF_IMPROVE_ENABLED=true` (kill
-switch) and add the `ANTHROPIC_API_KEY` repo secret. Scope is enforced in CI,
-not just by prompt. The Claude-in-CI agents use `anthropics/claude-code-action@v1`
+switch) + add the `ANTHROPIC_API_KEY` secret. Scope + secret-scan are enforced in
+CI, not just by prompt. Claude-in-CI uses `anthropics/claude-code-action@v1`
 pinned to `claude-sonnet-4-6`.
 
 ## Running tests

@@ -67,3 +67,56 @@ def log_turn(
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("[conversation_log] failed to log turn: %s", e)
         return None
+
+
+# Support-scope chat capture into the in-boundary knowledge bucket. This is a
+# LOG, not a source of truth: the compile may read it for continuity but must
+# never cite it as authoritative (README echo-chamber guard). Env-gated so it
+# adds no latency/bucket dependency unless explicitly enabled.
+SUPPORT_CHAT_CAPTURE = os.environ.get("KB_SUPPORT_CHAT_CAPTURE", "off").lower() != "off"
+_SUPPORT_HISTORY_PREFIX = "support/conversation-history/"
+
+
+def log_support_chat(
+    *,
+    conversation_id: str,
+    user_id: str,
+    user_message: str,
+    assistant_response: str,
+    user_name: str = "",
+    tools: list[str] | None = None,
+    ts: datetime | None = None,
+) -> str | None:
+    """Append a support-chat turn to gs://virtualdojo-knowledge/support/conversation-history/.
+
+    Best-effort and env-gated (``KB_SUPPORT_CHAT_CAPTURE``). Runs in-boundary on
+    samurai-bot; writes via the in-boundary GCS client. Never raises.
+    """
+    if not SUPPORT_CHAT_CAPTURE:
+        return None
+    try:
+        from kb import storage  # lazy: avoids a hard dep at module import
+
+        ts = ts or datetime.now(timezone.utc)
+        body = (
+            "---\n"
+            "type: support-conversation-log\n"
+            "authoritative: false  # LOG ONLY — never cite as a source\n"
+            f"ts: {ts.isoformat()}\n"
+            f"conversation_id: {conversation_id}\n"
+            f"user_id: {user_id}\n"
+            f"user_name: {user_name}\n"
+            f"tools: {tools or []}\n"
+            "---\n\n"
+            f"**User:** {user_message}\n\n"
+            f"**SamurAI:** {assistant_response}\n"
+        )
+        path = (
+            f"{_SUPPORT_HISTORY_PREFIX}{ts.strftime('%Y-%m-%d')}/"
+            f"{ts.strftime('%H%M%S')}-{uuid.uuid4().hex[:8]}.md"
+        )
+        storage.write_text(path, body)
+        return path
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("[conversation_log] failed to log support chat: %s", e)
+        return None

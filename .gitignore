@@ -3,3 +3,8 @@ __pycache__/
 .env
 venv/
 .venv/
+
+# Raw conversation transcripts (PII) — captured to the /data GCS bucket and
+# pulled into _raw_ingest/ by the nightly wiki-compile job. Never commit these.
+raw/
+_raw_ingest/

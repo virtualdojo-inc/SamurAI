@@ -1,47 +1,53 @@
-"""Tool to manually trigger SamurAI's self-improvement (wiki-compile) pipeline.
+"""Tool to manually trigger SamurAI's in-boundary knowledge-base compile.
 
 Lets a user ask SamurAI in Teams to "learn from today's chats" / "update your
-knowledge", which dispatches the nightly wiki-compile GitHub Actions workflow on
-demand. It opens a PR with skill/knowledge updates; merge rides the blue/green
-deploy. This is an action that can ship changes — only trigger with explicit
-Devin/Cyrus approval (autonomy rules).
+knowledge". This runs the SAME in-boundary pipeline as the daily schedule
+(ingest GitHub + Smartsheet → compile with regional Vertex Gemini → wiki), in
+the background on samurai-bot — inside the Assured Workloads boundary. It does
+NOT dispatch any GitHub Actions workflow (a GitHub runner is out-of-boundary)
+and never calls an external LLM.
+
+It can ship knowledge updates — only trigger with explicit Devin/Cyrus approval.
 """
 
 from __future__ import annotations
 
+import threading
+
 from langchain_core.tools import tool
 
-from tools.github import _github
 
-_REPO = "virtualdojo-inc/SamurAI"
-_WORKFLOW_FILE = "nightly-wiki-compile.yml"
+def _run_pipeline_background() -> None:
+    from kb.run import run_support_pipeline
+
+    # force=True: a deliberate human trigger bypasses the daily kill switch.
+    run_support_pipeline(force=True)
 
 
 @tool
 def trigger_wiki_compile(reason: str = "") -> str:
-    """Manually trigger SamurAI's self-improvement run (the wiki-compile pipeline).
+    """Manually run SamurAI's in-boundary knowledge-base compile now.
 
-    Dispatches the wiki-compile GitHub Actions workflow now, so SamurAI reviews
-    recent conversations and proposes updates to its skills/knowledge wiki via a
-    PR. This can ship changes to production — only trigger with Devin or Cyrus's
+    Kicks off the in-boundary pipeline (ingest recent GitHub issues + Smartsheet,
+    then compile the support wiki via regional Vertex Gemini) in the background.
+    Runs entirely inside the FedRAMP boundary; no external LLM, no GitHub runner.
+    This can update the knowledge base — only trigger with Devin or Cyrus's
     explicit approval.
 
     Args:
-        reason: Optional note on why it's being triggered (shown to the team).
+        reason: Optional note on why it's being triggered (for the run log).
     """
     try:
-        repo = _github().get_repo(_REPO)
-        workflow = repo.get_workflow(_WORKFLOW_FILE)
-        ok = workflow.create_dispatch(ref="main")
-        if ok:
-            return (
-                f"Triggered the wiki-compile self-improvement workflow on "
-                f"{_REPO}@main. It will review recent conversations and open a PR "
-                f"with any skill/knowledge updates. Reason: {reason or '(none)'}"
-            )
-        return "GitHub did not confirm the dispatch — the workflow may not exist yet."
+        t = threading.Thread(target=_run_pipeline_background, daemon=True)
+        t.start()
+        return (
+            "Started the in-boundary knowledge-base compile (ingest + Gemini "
+            "compile of the support wiki) in the background. It runs inside the "
+            f"FedRAMP boundary on Vertex Gemini. Reason: {reason or '(none)'}. "
+            "Results land in gs://virtualdojo-knowledge/support/wiki/."
+        )
     except Exception as e:
-        return f"Could not trigger the self-improvement workflow: {type(e).__name__}: {e}"
+        return f"Could not start the knowledge-base compile: {type(e).__name__}: {e}"
 
 
 SELF_IMPROVE_TOOLS = [trigger_wiki_compile]

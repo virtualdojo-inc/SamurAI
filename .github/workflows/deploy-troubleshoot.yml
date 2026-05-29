@@ -70,8 +70,11 @@ jobs:
               1. Make the minimal change.
               2. Run python -m pytest tests/ -q to confirm green.
               3. Create branch deploy-fix/<slug>, commit, push, and open a PR with
-                 `gh pr create`. Label it `self-improve` and explain the failure +
-                 fix in the body.
+                 `gh pr create` explaining the failure + fix in the body.
+                 Do NOT add the `self-improve` label — deploy fixes touch real
+                 code (deps, tests, build), which is outside the wiki auto-merge
+                 allowlist, so this PR is for HUMAN review and merge, not
+                 auto-merge.
             If the cause is ambiguous or the fix is risky (touches app.py, infra,
             secrets, or migrations), do NOT open a code PR — instead open a GitHub
             issue summarizing the diagnosis and recommended next steps for a human.

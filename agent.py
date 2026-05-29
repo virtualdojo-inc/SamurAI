@@ -49,6 +49,7 @@ from tools.investigate import INVESTIGATE_TOOLS
 from tools.troubleshooting import TROUBLESHOOTING_TOOLS
 from tools.file_handler import FILE_HANDLER_TOOLS
 from tools.smartsheet import SMARTSHEET_TOOLS
+from tools.self_improve import SELF_IMPROVE_TOOLS
 from tools.progress import (
     PROGRESS_TOOLS,
     clear_progress,
@@ -66,6 +67,8 @@ from verification import (
     should_route_from_verification,
 )
 from skills import SKILL_TOOLS, skills_catalog_text
+from wiki import WIKI_TOOLS, knowledge_index_text
+from conversation_log import log_turn, log_support_chat
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,7 @@ TOOL_GROUPS = {
             google_search,
             *PROGRESS_TOOLS,
             *SKILL_TOOLS,
+            *WIKI_TOOLS,
         ],
         "keywords": [],  # Always loaded
     },
@@ -171,6 +175,14 @@ TOOL_GROUPS = {
         "keywords": [
             "smartsheet", "smart sheet", "sheet id", "issue tracker",
             "project tracker", "support tickets",
+        ],
+    },
+    "self_improve": {
+        "tools": SELF_IMPROVE_TOOLS,
+        "keywords": [
+            "improve yourself", "self improve", "self-improve",
+            "learn from today", "update your knowledge", "update your skills",
+            "compile your wiki", "learn from our chats", "learn from the chats",
         ],
     },
     "repo": {
@@ -750,11 +762,15 @@ def _select_prompt_sections(message: str) -> str:
             continue
         if any(kw in msg_lower for kw in section["keywords"]):
             parts.append(section["content"])
-    # Skills catalog (level-1 disclosure): always advertise available skills so
-    # the agent can pull a skill's full body via get_skill when relevant.
+    # Skills catalog + knowledge index (level-1 disclosure): always advertise
+    # available skills/articles so the agent can pull their full bodies via
+    # get_skill / read_knowledge / search_wiki when relevant.
     catalog = skills_catalog_text()
     if catalog:
         parts.append(catalog)
+    index = knowledge_index_text()
+    if index:
+        parts.append(index)
     return "\n\n".join(parts)
 
 
@@ -1492,6 +1508,39 @@ async def run_agent(
         {"role": "assistant", "content": extraction_content},
     ]}
     user_config = {"configurable": {"user_id": user_id}}
+
+    # Durable raw-conversation capture (the wiki's nightly ingest). Best-effort:
+    # log_turn swallows its own errors so it can never break the turn.
+    log_turn(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        user_name=user_name,
+        user_email=user_email,
+        user_message=user_message,
+        assistant_response=response_text,
+        tools=list(_tool_call_log[:25]),
+        is_background_task=is_background_task,
+    )
+
+    # Support-scope chat → in-boundary knowledge bucket (log only, env-gated).
+    # Heuristic: a turn counts as "support" if it used a support-related tool or
+    # the user message mentions support topics. Refine classification later.
+    _tools_blob = " ".join(_tool_call_log).lower()
+    _is_support = any(
+        k in _tools_blob for k in ("smartsheet", "github_", "troubleshoot", "investigate")
+    ) or any(
+        k in user_message.lower()
+        for k in ("support", "ticket", "troubleshoot", "bug", "not working", "error", "issue")
+    )
+    if _is_support:
+        log_support_chat(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            user_name=user_name,
+            user_message=user_message,
+            assistant_response=response_text,
+            tools=list(_tool_call_log[:25]),
+        )
 
     # 1. Always print this BEFORE any submit so we know the block was reached.
     print(

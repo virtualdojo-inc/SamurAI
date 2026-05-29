@@ -1,25 +1,30 @@
-"""Knowledge wiki for SamurAI (the committed, LLM-maintained knowledge base).
+"""Knowledge wiki loader for SamurAI.
 
-Companion to ``skills.py``. Where a *skill* is procedural know-how, a *knowledge
-article* is conceptual/reference knowledge — facts about VirtualDojo infra, the
-deploy pipeline, recurring decisions, etc. Articles are markdown under
-``knowledge/`` with YAML frontmatter (``title`` + ``summary``) and Obsidian-style
-``[[wikilinks]]`` backlinks. ``knowledge/INDEX.md`` is an auto-maintained index.
+Knowledge now lives in the in-boundary bucket ``gs://virtualdojo-knowledge``,
+mounted read-only on the bot via GCS FUSE at ``KB_KNOWLEDGE_ROOT`` (default
+``/knowledge``). The bot serves the scopes it has read access to:
+``engineering/``, ``support/``, ``customers/onboarding/`` — reading each scope's
+``wiki/*.md``. Because it reads the live mount, nightly compile updates are
+picked up WITHOUT a redeploy.
 
-Progressive disclosure (same as skills):
-  Level 1 — every article's title + summary, injected into the system prompt via
-            :func:`knowledge_index_text`. Cheap; enough to know what exists.
-  Level 2 — full article body via the ``read_knowledge`` tool; ``search_wiki``
-            does a naive keyword search across skills/ + knowledge/.
+A transition fallback to the repo's ``knowledge/`` directory remains until that
+directory is retired (so local/dev and the pre-mount window keep working).
 
-The nightly ``wiki-compile`` job (and the weekly health-check) curate this wiki
-from raw conversations. It is committed to git, so it is versioned and reviewable
-— unlike the runtime LangMem vector store, which it complements.
+Progressive disclosure (unchanged): every article's title + summary is injected
+into the system prompt via :func:`knowledge_index_text`; full bodies load on
+demand via ``read_knowledge``; ``search_wiki`` does a naive keyword search.
+
+Frontmatter is schema-tolerant: ``title`` is required (or derived from the first
+H1); ``summary`` is used if present, else derived from the body. This accepts
+both migrated articles (title+summary) and compile output (title + sources +
+last_verified + confidence).
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import re
 from pathlib import Path
 
 import yaml
@@ -27,83 +32,110 @@ from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
-KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
+# GCS FUSE mount of gs://virtualdojo-knowledge (read what we serve).
+KB_KNOWLEDGE_ROOT = os.environ.get("KB_KNOWLEDGE_ROOT", "/knowledge")
+SERVE_SCOPES = ["engineering", "support", "customers/onboarding"]
+
+# Repo skills are still served from the repo; only knowledge moved to the bucket.
 SKILLS_DIR = Path(__file__).parent / "skills"
-_INDEX_NAME = "INDEX.md"
+# Transition fallback only — removed when repo knowledge/ is retired.
+_REPO_KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
 _MAX_SUMMARY = 1024
 
 _catalog_cache: list[dict] | None = None
 
 
-def _parse_article(path: Path) -> dict | None:
-    """Parse a knowledge article into ``{name, title, summary, body}``.
+def _scope_wiki_dirs() -> list[Path]:
+    root = Path(KB_KNOWLEDGE_ROOT)
+    dirs = [root / scope / "wiki" for scope in SERVE_SCOPES]
+    return [d for d in dirs if d.is_dir()]
 
-    ``name`` is the filename stem (used by ``read_knowledge``). Returns ``None``
-    (logged) for malformed articles so one bad file can't crash startup.
-    """
+
+def _derive_summary(body: str, title: str) -> str:
+    for line in body.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and not s.startswith("---"):
+            return s[:200]
+    return title
+
+
+def _parse_article(path: Path) -> dict | None:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as e:
         logger.warning("[wiki] could not read %s (%s); skipping", path, e)
         return None
-    if not text.lstrip().startswith("---"):
-        logger.warning("[wiki] %s missing frontmatter; skipping", path)
-        return None
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        logger.warning("[wiki] %s malformed frontmatter; skipping", path)
-        return None
-    try:
-        meta = yaml.safe_load(parts[1]) or {}
-    except yaml.YAMLError as e:
-        logger.warning("[wiki] %s bad YAML frontmatter (%s); skipping", path, e)
-        return None
-    if not isinstance(meta, dict):
-        logger.warning("[wiki] %s frontmatter is not a mapping; skipping", path)
-        return None
+
+    meta: dict = {}
+    body = text
+    if text.lstrip().startswith("---"):
+        parts = text.split("---", 2)
+        if len(parts) >= 3:
+            try:
+                loaded = yaml.safe_load(parts[1])
+                meta = loaded if isinstance(loaded, dict) else {}
+            except yaml.YAMLError as e:
+                logger.warning("[wiki] %s bad frontmatter (%s); using body only", path, e)
+            body = parts[2].strip()
 
     title = str(meta.get("title") or "").strip()
-    summary = str(meta.get("summary") or "").strip()
-    body = parts[2].strip()
-    if not title or not summary or len(summary) > _MAX_SUMMARY:
-        logger.warning("[wiki] %s missing/invalid title or summary; skipping", path)
-        return None
+    if not title:
+        m = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+        title = m.group(1).strip() if m else path.stem
+    summary = str(meta.get("summary") or "").strip() or _derive_summary(body, title)
+    if len(summary) > _MAX_SUMMARY:
+        summary = summary[:_MAX_SUMMARY]
     return {"name": path.stem, "title": title, "summary": summary, "body": body}
 
 
+def _article_paths() -> list[Path]:
+    """Markdown article paths from the mounted scopes, or the repo fallback."""
+    paths: list[Path] = []
+    for d in _scope_wiki_dirs():
+        for md in sorted(d.glob("*.md")):
+            if md.name.lower() in ("index.md", ".keep"):
+                continue
+            paths.append(md)
+    if paths:
+        return paths
+    # Transition fallback: repo knowledge/ (removed at retirement).
+    if _REPO_KNOWLEDGE_DIR.is_dir():
+        return [
+            md for md in sorted(_REPO_KNOWLEDGE_DIR.glob("*.md"))
+            if md.name != "INDEX.md"
+        ]
+    return []
+
+
 def load_knowledge_catalog(force: bool = False) -> list[dict]:
-    """Load and cache all valid knowledge articles (excluding INDEX.md)."""
     global _catalog_cache
     if _catalog_cache is not None and not force:
         return _catalog_cache
+    seen: set[str] = set()
     articles: list[dict] = []
-    if KNOWLEDGE_DIR.is_dir():
-        for md in sorted(KNOWLEDGE_DIR.glob("*.md")):
-            if md.name == _INDEX_NAME:
-                continue
-            parsed = _parse_article(md)
-            if parsed is not None:
-                articles.append(parsed)
+    for md in _article_paths():
+        parsed = _parse_article(md)
+        if parsed and parsed["name"] not in seen:
+            seen.add(parsed["name"])
+            articles.append(parsed)
     _catalog_cache = articles
     logger.info(
-        "[wiki] loaded %d knowledge articles: %s",
-        len(articles),
-        [a["name"] for a in articles],
+        "[wiki] loaded %d knowledge articles from %s: %s",
+        len(articles), KB_KNOWLEDGE_ROOT, [a["name"] for a in articles],
     )
     return articles
 
 
 def knowledge_index_text() -> str:
-    """Compact title+summary index for the system prompt (level-1 disclosure)."""
     articles = load_knowledge_catalog()
     if not articles:
         return ""
     lines = [
         "## Knowledge base",
         (
-            "You maintain a knowledge wiki. When a question relates to an article "
-            "below, call `read_knowledge(name)` to load it; use `search_wiki(query)` "
-            "to search across skills and knowledge. Articles:"
+            "You maintain a knowledge wiki (in-boundary bucket). When a question "
+            "relates to an article below, call `read_knowledge(name)`; use "
+            "`search_wiki(query)` to search. Articles:"
         ),
     ]
     for a in articles:
@@ -115,15 +147,13 @@ def knowledge_index_text() -> str:
 def read_knowledge(name: str) -> str:
     """Read a knowledge-base article in full.
 
-    Call this when a question relates to one of the articles listed under
-    'Knowledge base' in your system prompt.
+    Call this when a question relates to an article listed under 'Knowledge base'.
 
     Args:
         name: The article name (filename stem), e.g. 'virtualdojo-infra'.
     """
     for a in load_knowledge_catalog():
         if a["name"] == name:
-            # Article bodies carry their own H1 heading by convention.
             return a["body"]
     available = ", ".join(a["name"] for a in load_knowledge_catalog()) or "(none)"
     return f"No knowledge article named '{name}'. Available: {available}"
@@ -131,11 +161,10 @@ def read_knowledge(name: str) -> str:
 
 @tool
 def search_wiki(query: str, limit: int = 8) -> str:
-    """Search the wiki (skills/ + knowledge/) for a keyword or phrase.
+    """Search the wiki (repo skills + bucket knowledge) for a keyword or phrase.
 
-    A naive case-insensitive substring search over all markdown files; returns
-    matching files with a short context snippet. Use it to find relevant
-    procedural skills or knowledge articles before answering a broad question.
+    Naive case-insensitive substring search; returns matching files with a short
+    snippet. Use it to find relevant skills or knowledge before answering.
 
     Args:
         query: Keyword or phrase to search for.
@@ -145,7 +174,10 @@ def search_wiki(query: str, limit: int = 8) -> str:
     if not q:
         return "Provide a non-empty query."
     hits: list[str] = []
-    for base in (SKILLS_DIR, KNOWLEDGE_DIR):
+    search_dirs = [SKILLS_DIR, *_scope_wiki_dirs()]
+    if len(search_dirs) == 1 and _REPO_KNOWLEDGE_DIR.is_dir():
+        search_dirs.append(_REPO_KNOWLEDGE_DIR)  # transition fallback
+    for base in search_dirs:
         if not base.is_dir():
             continue
         for md in sorted(base.rglob("*.md")):
@@ -156,18 +188,13 @@ def search_wiki(query: str, limit: int = 8) -> str:
             lower = text.lower()
             if q in lower:
                 idx = lower.index(q)
-                start = max(0, idx - 120)
-                end = min(len(text), idx + len(q) + 120)
-                snippet = text[start:end].replace("\n", " ").strip()
-                rel = md.relative_to(Path(__file__).parent)
-                hits.append(f"- {rel}: …{snippet}…")
+                snippet = text[max(0, idx - 120): idx + len(q) + 120].replace("\n", " ").strip()
+                hits.append(f"- {md.name}: …{snippet}…")
                 if len(hits) >= limit:
                     break
         if len(hits) >= limit:
             break
-    if not hits:
-        return f"No wiki matches for '{query}'."
-    return "Wiki matches:\n" + "\n".join(hits)
+    return "Wiki matches:\n" + "\n".join(hits) if hits else f"No wiki matches for '{query}'."
 
 
 WIKI_TOOLS = [read_knowledge, search_wiki]
