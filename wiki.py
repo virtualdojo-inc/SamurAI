@@ -1,30 +1,26 @@
-"""Knowledge wiki loader for SamurAI.
+"""Knowledge wiki loader for SamurAI — reads from the in-boundary bucket.
 
-Knowledge now lives in the in-boundary bucket ``gs://virtualdojo-knowledge``,
-mounted read-only on the bot via GCS FUSE at ``KB_KNOWLEDGE_ROOT`` (default
-``/knowledge``). The bot serves the scopes it has read access to:
-``engineering/``, ``support/``, ``customers/onboarding/`` — reading each scope's
-``wiki/*.md``. Because it reads the live mount, nightly compile updates are
-picked up WITHOUT a redeploy.
+Knowledge lives in ``gs://virtualdojo-knowledge``. The bot reads it at runtime via
+the google-cloud-storage client (``kb.storage``) using **prefix lists** over the
+scopes it is granted (``engineering/``, ``support/``, ``customers/onboarding/``).
 
-A transition fallback to the repo's ``knowledge/`` directory remains until that
-directory is retired (so local/dev and the pre-mount window keep working).
+Why the client and not a GCS FUSE mount: gcsfuse requires blanket bucket-level
+``storage.objects.list`` (a ``storageLayout`` probe), which conflicts with the
+"no blanket read of other scopes" rule. A prefix-scoped client list is gated
+correctly by the conditioned IAM, so the bot only ever reads the three granted
+scopes. Reads are live (TTL-cached), so nightly compile updates are picked up
+without a redeploy.
 
-Progressive disclosure (unchanged): every article's title + summary is injected
-into the system prompt via :func:`knowledge_index_text`; full bodies load on
-demand via ``read_knowledge``; ``search_wiki`` does a naive keyword search.
-
-Frontmatter is schema-tolerant: ``title`` is required (or derived from the first
-H1); ``summary`` is used if present, else derived from the body. This accepts
-both migrated articles (title+summary) and compile output (title + sources +
-last_verified + confidence).
+Progressive disclosure unchanged: title+summary injected into the prompt via
+:func:`knowledge_index_text`; full bodies via ``read_knowledge``; ``search_wiki``
+does a naive keyword search over repo skills + the cached knowledge bodies.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
+import time
 from pathlib import Path
 
 import yaml
@@ -32,23 +28,18 @@ from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
-# GCS FUSE mount of gs://virtualdojo-knowledge (read what we serve).
-KB_KNOWLEDGE_ROOT = os.environ.get("KB_KNOWLEDGE_ROOT", "/knowledge")
+# Scopes the bot is granted (conditioned objectViewer). Each contributes
+# its <scope>/wiki/*.md articles.
 SERVE_SCOPES = ["engineering", "support", "customers/onboarding"]
-
-# Repo skills are still served from the repo; only knowledge moved to the bucket.
+# Repo skills stay repo-local; only knowledge moved to the bucket.
 SKILLS_DIR = Path(__file__).parent / "skills"
-# Transition fallback only — removed when repo knowledge/ is retired.
+# Transition fallback to repo knowledge/ until it is retired.
 _REPO_KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
 _MAX_SUMMARY = 1024
+_CACHE_TTL = 300  # seconds — balance freshness (nightly updates) vs per-turn latency
 
 _catalog_cache: list[dict] | None = None
-
-
-def _scope_wiki_dirs() -> list[Path]:
-    root = Path(KB_KNOWLEDGE_ROOT)
-    dirs = [root / scope / "wiki" for scope in SERVE_SCOPES]
-    return [d for d in dirs if d.is_dir()]
+_cache_ts: float = 0.0
 
 
 def _derive_summary(body: str, title: str) -> str:
@@ -59,13 +50,7 @@ def _derive_summary(body: str, title: str) -> str:
     return title
 
 
-def _parse_article(path: Path) -> dict | None:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        logger.warning("[wiki] could not read %s (%s); skipping", path, e)
-        return None
-
+def _parse(path_name: str, text: str) -> dict | None:
     meta: dict = {}
     body = text
     if text.lstrip().startswith("---"):
@@ -74,54 +59,66 @@ def _parse_article(path: Path) -> dict | None:
             try:
                 loaded = yaml.safe_load(parts[1])
                 meta = loaded if isinstance(loaded, dict) else {}
-            except yaml.YAMLError as e:
-                logger.warning("[wiki] %s bad frontmatter (%s); using body only", path, e)
+            except yaml.YAMLError:
+                meta = {}
             body = parts[2].strip()
-
     title = str(meta.get("title") or "").strip()
     if not title:
         m = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
-        title = m.group(1).strip() if m else path.stem
+        title = m.group(1).strip() if m else Path(path_name).stem
     summary = str(meta.get("summary") or "").strip() or _derive_summary(body, title)
-    if len(summary) > _MAX_SUMMARY:
-        summary = summary[:_MAX_SUMMARY]
-    return {"name": path.stem, "title": title, "summary": summary, "body": body}
+    return {"name": Path(path_name).stem, "title": title, "summary": summary[:_MAX_SUMMARY], "body": body}
 
 
-def _article_paths() -> list[Path]:
-    """Markdown article paths from the mounted scopes, or the repo fallback."""
-    paths: list[Path] = []
-    for d in _scope_wiki_dirs():
-        for md in sorted(d.glob("*.md")):
-            if md.name.lower() in ("index.md", ".keep"):
+def _load_from_bucket() -> list[dict]:
+    """Read <scope>/wiki/*.md via the in-boundary storage client (conditioned IAM)."""
+    from kb import storage  # lazy: avoids hard dep at import / in tests
+
+    articles: list[dict] = []
+    seen: set[str] = set()
+    for scope in SERVE_SCOPES:
+        try:
+            items = storage.list_text(f"{scope}/wiki/")
+        except Exception as e:
+            logger.warning("[wiki] scope %s read failed: %s", scope, e)
+            continue
+        for path_name, text in items:
+            base = path_name.rsplit("/", 1)[-1].lower()
+            if base in ("index.md", ".keep") or not base.endswith(".md"):
                 continue
-            paths.append(md)
-    if paths:
-        return paths
-    # Transition fallback: repo knowledge/ (removed at retirement).
+            parsed = _parse(path_name, text)
+            if parsed and parsed["name"] not in seen:
+                seen.add(parsed["name"])
+                articles.append(parsed)
+    return articles
+
+
+def _load_from_repo_fallback() -> list[dict]:
+    out: list[dict] = []
     if _REPO_KNOWLEDGE_DIR.is_dir():
-        return [
-            md for md in sorted(_REPO_KNOWLEDGE_DIR.glob("*.md"))
-            if md.name != "INDEX.md"
-        ]
-    return []
+        for md in sorted(_REPO_KNOWLEDGE_DIR.glob("*.md")):
+            if md.name == "INDEX.md":
+                continue
+            try:
+                out.append(_parse(md.name, md.read_text(encoding="utf-8")))
+            except OSError:
+                continue
+    return out
 
 
 def load_knowledge_catalog(force: bool = False) -> list[dict]:
-    global _catalog_cache
-    if _catalog_cache is not None and not force:
+    global _catalog_cache, _cache_ts
+    fresh = _catalog_cache is not None and (time.time() - _cache_ts) < _CACHE_TTL
+    if fresh and not force:
         return _catalog_cache
-    seen: set[str] = set()
-    articles: list[dict] = []
-    for md in _article_paths():
-        parsed = _parse_article(md)
-        if parsed and parsed["name"] not in seen:
-            seen.add(parsed["name"])
-            articles.append(parsed)
+    articles = _load_from_bucket()
+    if not articles:
+        articles = _load_from_repo_fallback()  # transition safety
     _catalog_cache = articles
+    _cache_ts = time.time()
     logger.info(
-        "[wiki] loaded %d knowledge articles from %s: %s",
-        len(articles), KB_KNOWLEDGE_ROOT, [a["name"] for a in articles],
+        "[wiki] loaded %d knowledge articles from bucket: %s",
+        len(articles), [a["name"] for a in articles],
     )
     return articles
 
@@ -163,37 +160,37 @@ def read_knowledge(name: str) -> str:
 def search_wiki(query: str, limit: int = 8) -> str:
     """Search the wiki (repo skills + bucket knowledge) for a keyword or phrase.
 
-    Naive case-insensitive substring search; returns matching files with a short
+    Naive case-insensitive substring search; returns matching items with a short
     snippet. Use it to find relevant skills or knowledge before answering.
 
     Args:
         query: Keyword or phrase to search for.
-        limit: Max number of matching files to return (default 8).
+        limit: Max number of matches to return (default 8).
     """
     q = (query or "").strip().lower()
     if not q:
         return "Provide a non-empty query."
     hits: list[str] = []
-    search_dirs = [SKILLS_DIR, *_scope_wiki_dirs()]
-    if len(search_dirs) == 1 and _REPO_KNOWLEDGE_DIR.is_dir():
-        search_dirs.append(_REPO_KNOWLEDGE_DIR)  # transition fallback
-    for base in search_dirs:
-        if not base.is_dir():
-            continue
-        for md in sorted(base.rglob("*.md")):
+    # Repo skills (local files).
+    if SKILLS_DIR.is_dir():
+        for md in sorted(SKILLS_DIR.rglob("*.md")):
             try:
                 text = md.read_text(encoding="utf-8")
             except OSError:
                 continue
-            lower = text.lower()
-            if q in lower:
-                idx = lower.index(q)
-                snippet = text[max(0, idx - 120): idx + len(q) + 120].replace("\n", " ").strip()
-                hits.append(f"- {md.name}: …{snippet}…")
+            if q in text.lower():
+                i = text.lower().index(q)
+                hits.append(f"- {md.name}: …{text[max(0,i-120):i+len(q)+120].replace(chr(10),' ').strip()}…")
                 if len(hits) >= limit:
-                    break
-        if len(hits) >= limit:
-            break
+                    return "Wiki matches:\n" + "\n".join(hits)
+    # Bucket knowledge (already-downloaded bodies — no extra GCS calls).
+    for a in load_knowledge_catalog():
+        blob = f"{a['title']}\n{a['body']}"
+        if q in blob.lower():
+            i = blob.lower().index(q)
+            hits.append(f"- {a['name']}: …{blob[max(0,i-120):i+len(q)+120].replace(chr(10),' ').strip()}…")
+            if len(hits) >= limit:
+                break
     return "Wiki matches:\n" + "\n".join(hits) if hits else f"No wiki matches for '{query}'."
 
 
