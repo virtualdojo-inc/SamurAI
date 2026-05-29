@@ -1,0 +1,112 @@
+name: Nightly Wiki Compile
+
+# Karpathy-style knowledge compile: pull the last ~24h of raw conversations from
+# the private GCS bucket, and have Claude distill them into SamurAI's committed
+# markdown wiki (skills/ + knowledge/) — new/updated articles with [[backlinks]],
+# a refreshed INDEX, sharpened skills — then open a `self-improve` PR. The
+# claude-pr-review workflow reviews + (on approval, green CI, clean secret scan)
+# auto-merges, which triggers the blue/green deploy.
+#
+# SAFETY: gated by SELF_IMPROVE_ENABLED + ANTHROPIC_API_KEY. Raw transcripts are
+# pulled into _raw_ingest/ (gitignored) and never committed. The agent is scoped
+# to skills/ + knowledge/ + tests/; the review workflow enforces that plus a
+# hard secret scan before any merge.
+
+on:
+  schedule:
+    - cron: "0 8 * * *" # 08:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: wiki-compile
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    if: vars.SELF_IMPROVE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Ingest last 24h of raw conversations
+        run: |
+          set -euo pipefail
+          mkdir -p _raw_ingest
+          for d in "$(date -u +%F)" "$(date -u -d 'yesterday' +%F)"; do
+            gcloud storage rsync -r "gs://samurai-bot-data/raw/$d" "_raw_ingest/$d" 2>/dev/null || true
+          done
+          echo "Ingested $(find _raw_ingest -name '*.json' | wc -l) conversation turns."
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Claude — compile conversations into the wiki
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are SamurAI's nightly knowledge-compile agent, following Andrej
+            Karpathy's LLM-maintained-wiki pattern. Compile the last 24h of raw
+            conversations into SamurAI's committed markdown wiki.
+
+            INPUTS:
+              - _raw_ingest/**/*.json — raw conversation turns from the last ~24h
+                (each has user_message, assistant_response, tools, user, ts).
+              - skills/*/SKILL.md and skills.py (procedural skills + frontmatter
+                rules: name [a-z0-9-] <=64 chars, non-empty description <=1024).
+              - knowledge/*.md and knowledge/INDEX.md and wiki.py (knowledge
+                articles: frontmatter title + summary, Obsidian [[wikilinks]]).
+              - CLAUDE.md for conventions and the facts-only rule.
+
+            TASK — make focused, well-justified improvements:
+              - Distill recurring questions, decisions, facts, and resolutions from
+                the conversations into NEW or UPDATED knowledge/ articles (with
+                frontmatter title+summary+tags+updated and [[backlinks]] to related
+                articles). Refresh knowledge/INDEX.md to match.
+              - Capture recurring procedures as new/sharpened skills/ entries.
+              - Keep articles concise, third-person, grounded ONLY in the
+                conversations or the codebase — no speculation.
+
+            STRICT SCOPE — create/edit ONLY under skills/**, knowledge/**,
+            tests/**. Do NOT touch any other file. Do NOT commit _raw_ingest/.
+
+            REDACTION (critical): NEVER write secrets, tokens, API keys,
+            passwords, or verbatim customer PII into the wiki. Store lessons and
+            concepts, not raw sensitive content. A secret-scan CI gate will reject
+            the PR if anything leaks.
+
+            THEN:
+              1. Add/adjust tests in tests/test_wiki.py / tests/test_skills.py for
+                 new/changed articles or skills.
+              2. Run: python -m pytest tests/test_wiki.py tests/test_skills.py -q
+                 (must pass).
+              3. Create branch wiki/<short-slug>, commit, push, open a PR with
+                 `gh pr create`, label it `self-improve`, and in the body explain
+                 what was learned and from which kinds of conversations.
+            If the last 24h hold nothing worth adding, do NOT open a PR — say so.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 50
+            --allowedTools "Read,Edit,Write,Glob,Grep,WebSearch,WebFetch,Bash(git:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(python:*),Bash(python -m pytest:*),Bash(ls:*),Bash(cat:*),Bash(find:*),Bash(wc:*)"
