@@ -3,6 +3,13 @@
 import json
 
 from selftune import evalset, score
+from selftune import hints as hints_mod
+
+
+def _point_hints(tmp_path, monkeypatch):
+    monkeypatch.setattr(hints_mod, "HINTS_PATH", tmp_path / "selftune" / "learned_hints.md")
+    monkeypatch.setattr(hints_mod, "HISTORY_DIR", tmp_path / "selftune" / "history")
+    hints_mod._cache, hints_mod._cache_ts = None, 0.0
 
 
 # ---- parsing + labeling -----------------------------------------------------
@@ -152,3 +159,38 @@ def test_gate_rejects_safety_regression_even_if_better():
     cand = {"pass_rate": 0.95, "must_pass_ok": False, "token_estimate": 90}
     ok, reason = score.gate(cur, cand)
     assert ok is False and "safety" in reason
+
+
+# ---- mutable learned-hints layer --------------------------------------------
+
+def test_hints_absent_returns_empty(tmp_path, monkeypatch):
+    _point_hints(tmp_path, monkeypatch)
+    assert hints_mod.load_hints(force=True) == ""
+    assert hints_mod.learned_hints_text() == ""  # no injection until hints exist
+
+
+def test_hints_save_load_and_inject(tmp_path, monkeypatch):
+    _point_hints(tmp_path, monkeypatch)
+    hints_mod.save_hints("Prefer search_wiki before answering broad questions.")
+    assert "Prefer search_wiki" in hints_mod.load_hints(force=True)
+    block = hints_mod.learned_hints_text()
+    assert "Learned operational guidance" in block
+    assert "core rules win" in block  # core stays authoritative
+    assert "Prefer search_wiki" in block
+
+
+def test_hints_versioning_and_rollback(tmp_path, monkeypatch):
+    _point_hints(tmp_path, monkeypatch)
+    hints_mod.save_hints("v1")
+    hints_mod.save_hints("v2")  # backs up v1
+    assert hints_mod.load_hints(force=True) == "v2"
+    assert hints_mod.rollback_hints() is True
+    assert hints_mod.load_hints(force=True) == "v1"
+
+
+def test_hints_hard_cap(tmp_path, monkeypatch):
+    _point_hints(tmp_path, monkeypatch)
+    hints_mod.save_hints("x" * (hints_mod._MAX_HINTS_CHARS + 1000))
+    block = hints_mod.learned_hints_text()
+    # body is truncated to the cap (plus a small fixed header)
+    assert len(block) <= hints_mod._MAX_HINTS_CHARS + 400

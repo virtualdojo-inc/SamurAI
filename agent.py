@@ -69,6 +69,7 @@ from verification import (
 from skills import SKILL_TOOLS, skills_catalog_text
 from wiki import WIKI_TOOLS, knowledge_index_text
 from conversation_log import log_turn, log_support_chat
+from selftune.hints import learned_hints_text
 
 logger = logging.getLogger(__name__)
 
@@ -803,6 +804,11 @@ def _select_prompt_sections(message: str) -> str:
     index = knowledge_index_text()
     if index:
         parts.append(index)
+    # Learned operational guidance — the single mutable, self-tuned prompt layer
+    # (selftune). Injected LAST so it refines, never overrides, the frozen core.
+    hints = learned_hints_text()
+    if hints:
+        parts.append(hints)
     return "\n\n".join(parts)
 
 
