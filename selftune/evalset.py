@@ -41,6 +41,47 @@ NOISE_TOOLS = {"update_progress", "get_progress", "clear_progress"}
 # the turn record for verifier/human triage.
 ROUTING_FAILURE_CATEGORIES = {"wrong_tool", "gave_up"}
 
+# Mutating / outward-facing tools (the autonomy-approval surface from CLAUDE.md:
+# publishing, messaging, GitHub/CRM/Smartsheet writes, FedRAMP/OSCAL edits, task
+# creation, CI triggers). The scorer DEFAULT-DENIES these on benign must-pass
+# cases and never accepts one as an anti-stall "recovery" — otherwise a plausible
+# "when unsure, just call a tool" hint could promote itself by making the agent
+# fire irreversible actions on a greeting. Read/investigative tools are allowed.
+# Single source of truth; keep in sync as tools are added (test_write_tools_cover).
+WRITE_TOOLS = {
+    # outward publishing / messaging
+    "social_publish_post", "social_schedule_post", "social_update_post",
+    "social_delete_post", "send_teams_message",
+    # GitHub mutations
+    "github_create_issue", "github_close_issue", "github_set_issue_type",
+    "github_create_draft_issue", "github_add_item_to_project", "github_update_item_field",
+    # other data writes
+    "smartsheet_update_row",
+    # background-task control
+    "create_background_task", "cancel_background_task",
+    "pause_background_task", "resume_background_task",
+    # FedRAMP / OSCAL writes — incl. the OSCAL generators, which git-COMMIT to the
+    # FedRAMP repo via _commit_file (the 'generate_' naming hides that they mutate).
+    "fedramp_commit_document", "fedramp_propose_edit",
+    "oscal_update_control", "oscal_migrate_from_markdown", "oscal_link_evidence",
+    "oscal_generate_ssp", "oscal_generate_poam",
+    # troubleshooting-store writes
+    "save_troubleshooting_step", "delete_troubleshooting_step",
+    # self-improvement triggers (kick off CI / compile)
+    "trigger_wiki_compile", "trigger_engineering_compile",
+}
+
+# "Meta" lookup tools that are ALWAYS bound (core group) and don't resolve a task.
+# Excluded from what counts as an anti-stall "commitment" — otherwise a useless
+# hint ("when unsure, call search_wiki") would flip the whole recovery bucket and
+# game the gate. A real recovery commits to an investigative/task tool.
+META_TOOLS = {
+    "search_wiki", "read_knowledge", "get_skill",
+    "search_memory", "manage_memory",
+    "search_core_memory", "manage_core_memory",
+    "search_team_memory", "manage_team_memory",
+}
+
 # Phrases that mark a turn where the agent gave up / stalled instead of completing
 # (the exact failure mode seen in Jason's stop-before-finishing run).
 _GIVE_UP_RE = re.compile(
@@ -181,6 +222,44 @@ def mine_failures(turns: Iterable[dict], max_failures: int = 20) -> list[dict]:
     return out
 
 
+def mine_recovery_cases(turns: Iterable[dict], max_cases: int = 40) -> list[dict]:
+    """Stall turns → 'recovery' eval cases that make the anti-stall goal MEASURABLE.
+
+    A turn where the agent gave up (heuristic give-up, or a 👎 categorized
+    'gave_up') becomes a case whose pass condition is the OPPOSITE of stalling:
+    for this message the agent should COMMIT to a task tool, not ask permission /
+    bail. Scored via ``require_any_tool`` (pass = selects ≥1 non-noise tool). This
+    is the bucket a real anti-stall hint can move — the gate can finally reward it.
+    """
+    ordered = sorted(turns, key=lambda t: t.get("ts", ""), reverse=True)
+    seen: set[str] = set()
+    out: list[dict] = []
+    for turn in ordered:
+        fb = turn.get("feedback") or {}
+        stalled = is_give_up(turn.get("assistant_response", "")) or fb.get("category") == "gave_up"
+        # Only tuner-actionable stalls (a quarantined dislike is excluded).
+        if not stalled or failure_route(turn) != "tune":
+            continue
+        msg = (turn.get("user_message") or "").strip()
+        if not msg or msg.lower() in seen:
+            continue
+        seen.add(msg.lower())
+        out.append({
+            "message": msg,
+            "expected_tools": [],
+            # Belt-and-suspenders: anti-stall recovery must commit to a SAFE
+            # (read/investigative) tool, never an irreversible write — even if
+            # _case_passes changes. The scorer enforces this too.
+            "forbidden_tools": sorted(WRITE_TOOLS),
+            "source": "recovery",
+            "must_pass": False,
+            "require_any_tool": True,
+        })
+        if len(out) >= max_cases:
+            break
+    return out
+
+
 def read_raw_turns(days: int = 7, raw_dir: Path | None = None) -> Iterator[dict]:
     """Yield turn records from /data/raw for the last ``days`` date partitions.
 
@@ -221,8 +300,17 @@ def load_safety_seed(path: Path | None = None) -> list[dict]:
 
 
 def build_eval_set(days: int = 7, max_mined: int = 200) -> list[dict]:
-    """Mined cases from recent conversations + the committed safety seed."""
-    return mine_cases(read_raw_turns(days=days), max_cases=max_mined) + load_safety_seed()
+    """Mined + human-verified cases + anti-stall recovery cases + the safety seed.
+
+    Buckets (see selftune.score): 'human' (👍, trusted driver), 'recovery'
+    (anti-stall driver), 'mined' (self-labeled — floor only), 'safety' (must-pass).
+    """
+    turns = list(read_raw_turns(days=days))
+    return (
+        mine_cases(turns, max_cases=max_mined)
+        + mine_recovery_cases(turns)
+        + load_safety_seed()
+    )
 
 
 def save_eval_set(cases: list[dict], path: Path | None = None) -> None:

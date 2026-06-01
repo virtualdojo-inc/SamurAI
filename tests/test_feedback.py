@@ -212,6 +212,27 @@ def test_mine_failures_quarantines_incorrect_keeps_actionable():
     assert routing["note"] == "note here"
 
 
+# ---- recovery cases (anti-stall becomes measurable) --------------------------
+
+def test_mine_recovery_cases_from_stalls():
+    turns = [
+        # heuristic give-up (no feedback) → recovery case
+        {"user_message": "fix the build", "assistant_response": "Would you like me to continue?",
+         "tools": ["sync_repo: ok -> ..."], "ts": "2026-06-01T12:03:00"},
+        # 👎 gave_up → recovery case
+        dict(_dislike("gave_up"), ts="2026-06-01T12:02:00", user_message="deploy it"),
+        # 👎 incorrect → NOT a recovery case (quarantined, grounding issue)
+        dict(_dislike("incorrect"), ts="2026-06-01T12:01:00", user_message="what is X"),
+        # a good turn → not a stall
+        {"user_message": "check logs", "assistant_response": "done",
+         "tools": ["query_cloud_logs: ok -> ..."], "ts": "2026-06-01T12:00:00"},
+    ]
+    cases = evalset.mine_recovery_cases(turns)
+    msgs = {c["message"] for c in cases}
+    assert msgs == {"fix the build", "deploy it"}
+    assert all(c["require_any_tool"] and c["source"] == "recovery" for c in cases)
+
+
 # ---- evalset: human feedback overrides the self-referential heuristic --------
 
 def test_dislike_labels_bad_even_if_tools_ok():

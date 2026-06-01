@@ -34,6 +34,15 @@ MIN_CASES = int(os.environ.get("KB_TUNE_MIN_CASES", "15"))
 CONVERGED_STREAK = int(os.environ.get("KB_TUNE_CONVERGED_STREAK", "5"))
 MAX_EVAL_CASES = int(os.environ.get("KB_TUNE_MAX_CASES", "60"))
 EVAL_MODEL = os.environ.get("KB_TUNE_EVAL_MODEL", "gemini-3.5-flash")  # choice A: production
+K_CANDIDATES = int(os.environ.get("KB_TUNE_CANDIDATES", "3"))  # propose N, gate the best
+
+# Diversity steers so K candidates explore different edits (EvoPrompt-style, no
+# extra search machinery). Indexed by candidate number.
+_VARIANTS = (
+    "Make the single highest-impact fix.",
+    "Take a different angle — address a root cause, not the obvious surface fix.",
+    "Be maximally concise: the smallest edit that still helps.",
+)
 
 _PROPOSE_SYS = (
     "You improve a SUPPORT AGENT's 'learned operational guidance' — a short doc "
@@ -95,7 +104,9 @@ def _make_select_fn():
     from langchain_core.messages import HumanMessage, SystemMessage
     from langchain_google_genai import ChatGoogleGenerativeAI
 
-    model = ChatGoogleGenerativeAI(model=EVAL_MODEL, **agent._GCP_KWARGS)
+    # temperature=0 → reproducible scoring, so a pass-rate delta reflects the hint
+    # edit, not sampling noise (the old unpinned default made promotions coin-flips).
+    model = ChatGoogleGenerativeAI(model=EVAL_MODEL, temperature=0, **agent._GCP_KWARGS)
 
     def select(hints_text: str, message: str) -> list:
         system = agent._select_prompt_sections(message, hints_override=hints_text)
@@ -119,7 +130,8 @@ def _make_propose_fn():
 
     llm = get_kb_llm()
 
-    def propose(current_hints: str, good_cases: list[dict], failures: list[dict]) -> str:
+    def propose(current_hints, good_cases, failures, score_fails=None, variant=0):
+        eval_fails = score_fails or []
         ctx = (
             "CURRENT GUIDANCE:\n" + (current_hints or "(empty)") + "\n\n"
             "RECENT FAILURES (fix these):\n"
@@ -129,15 +141,32 @@ def _make_propose_fn():
                 + (f" note={f['note']!r}" if f.get("note") else "")
                 for f in failures[:20]
             )
+            + "\n\nWHERE THE CURRENT GUIDANCE FAILS THE EVAL (these are what to move):\n"
+            + "\n".join(
+                f"- [{f['bucket']}] {f['message']!r}"
+                + (" — should commit to a tool but did not"
+                   if f.get("require_any_tool")
+                   else f" expected={f['expected']} selected={f['selected']}")
+                for f in eval_fails[:20]
+            )
             + "\n\nGOOD EXAMPLES (message → tools that worked):\n"
             + "\n".join(f"- {c['message']!r} → {c['expected_tools']}"
                         for c in good_cases[:20]
                         if c.get("source") in ("mined", "human-verified"))
+            + "\n\nAPPROACH FOR THIS REVISION: " + _VARIANTS[variant % len(_VARIANTS)]
         )
         resp = llm.invoke([SystemMessage(content=_PROPOSE_SYS), HumanMessage(content=ctx)])
         return resp.content if isinstance(resp.content, str) else str(resp.content)
 
     return propose
+
+
+def _safe_propose(propose_fn, current, good_cases, failures, score_fails, variant):
+    """Call propose_fn with the rich signature; tolerate older 3-arg fakes (tests)."""
+    try:
+        return propose_fn(current, good_cases, failures, score_fails, variant)
+    except TypeError:
+        return propose_fn(current, good_cases, failures)
 
 
 def run_tuning_cycle(force: bool = False, propose_fn=None, select_fn=None, cases=None) -> dict:
@@ -159,24 +188,58 @@ def run_tuning_cycle(force: bool = False, propose_fn=None, select_fn=None, cases
     select_fn = select_fn or _make_select_fn()
     failures = evalset.mine_failures(evalset.read_raw_turns(days=7))
 
-    candidate = (propose_fn(current, cases, failures) or "").strip()
-    if not candidate or candidate == (current or "").strip():
+    # Score current FIRST so the proposer can reflect on what the eval fails (GEPA).
+    cur = score.score_prompt(cases, select_fn, current)
+    if not score.has_driver_coverage(cur):
+        # Fail-safe, but the loop is inert until 👍 feedback or logged stalls exist.
+        print("[selftune] no driver coverage (no human-verified/recovery cases) — "
+              "nothing can promote this cycle.", flush=True)
+
+    # Propose up to K diverse candidates; dedup identical / no-op proposals.
+    seen = {(current or "").strip()}
+    candidates: list[str] = []
+    for i in range(K_CANDIDATES):
+        cand_text = (_safe_propose(propose_fn, current, cases, failures, cur.get("fails"), i) or "").strip()
+        if cand_text and cand_text not in seen:
+            seen.add(cand_text)
+            candidates.append(cand_text)
+    if not candidates:
         _bump(state, accepted=False)
         print("[selftune] no candidate change proposed.", flush=True)
         return {"result": "no_change", "n": len(cases)}
 
-    cur = score.score_prompt(cases, select_fn, current)
-    cand = score.score_prompt(cases, select_fn, candidate)
-    promote, reason = score.gate(cur, cand)
+    # Score each candidate; keep the best PROMOTABLE one (the weighted gate decides).
+    scored = [(c, score.score_prompt(cases, select_fn, c)) for c in candidates]
+    best = None
+    for c, cstats in scored:
+        ok, reason = score.gate(cur, cstats)
+        if ok:
+            # Rank by quality-adjusted gain so a precise candidate beats an
+            # over-calling one that merely saturates recovery.
+            gain = score.quality_gain(cur, cstats)
+            if best is None or gain > best[3]:
+                best = (c, cstats, reason, gain)
+
+    promote = best is not None
     if promote:
-        save_hints(candidate)
+        cand_text, cand, reason, _gain = best
+        save_hints(cand_text)
+    else:
+        cand = scored[0][1]
+        _ok, reason = score.gate(cur, cand)  # report a representative verdict
     _bump(state, accepted=promote)
+
+    def _rates(s):
+        out = {k: s[k] for k in ("pass_rate", "must_pass_ok", "token_estimate")}
+        out["buckets"] = {b: round(v["pass_rate"], 3) for b, v in s.get("buckets", {}).items()}
+        return out
 
     stats = {
         "result": "promoted" if promote else "rejected",
         "reason": reason,
-        "current": {k: cur[k] for k in ("pass_rate", "must_pass_ok", "token_estimate")},
-        "candidate": {k: cand[k] for k in ("pass_rate", "must_pass_ok", "token_estimate")},
+        "candidates": len(candidates),
+        "current": _rates(cur),
+        "candidate": _rates(cand),
         "n": len(cases),
         "streak": state.get("streak"),
     }
