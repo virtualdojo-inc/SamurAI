@@ -1271,6 +1271,16 @@ async def run_agent(
         "recursion_limit": recursion_limit,
     }
 
+    # Fallback for any tool missing from _tool_labels: turn a raw snake_case
+    # name into a human label so we never surface "search_wiki" to the user.
+    def _humanize_tool_name(n: str) -> str:
+        for prefix in ("github_", "fedramp_", "oscal_", "social_", "smartsheet_",
+                       "virtualdojo_", "db_", "gcp_"):
+            if n.startswith(prefix):
+                n = n[len(prefix):]
+                break
+        return n.replace("_", " ").strip().capitalize() or "Working"
+
     # Friendly tool names for status updates
     _tool_labels = {
         "sync_repo": "Syncing repository",
@@ -1369,6 +1379,22 @@ async def run_agent(
         "smartsheet_list_sheets": "Listing Smartsheets",
         "smartsheet_get_sheet": "Reading Smartsheet rows",
         "smartsheet_update_row": "Updating Smartsheet row",
+        # Knowledge base & skills
+        "get_skill": "Looking up a skill",
+        "read_knowledge": "Reading knowledge article",
+        "search_wiki": "Searching the knowledge base",
+        # CRM
+        "virtualdojo_crm": "Querying VirtualDojo CRM",
+        "virtualdojo_list_tools": "Checking CRM capabilities",
+        # Database
+        "db_query": "Querying the database",
+        "db_list_tables": "Listing database tables",
+        "db_describe_table": "Inspecting table schema",
+        "db_check_user": "Looking up user record",
+        "db_recent_audit_logs": "Checking audit logs",
+        # Self-improvement
+        "trigger_wiki_compile": "Updating knowledge base",
+        "trigger_engineering_compile": "Updating engineering knowledge",
         # Progress tracking
         "update_progress": "Updating plan",
     }
@@ -1428,7 +1454,7 @@ async def run_agent(
                     if status_callback:
                         new_labels = []
                         for n in tool_names:
-                            label = _tool_labels.get(n, n)
+                            label = _tool_labels.get(n) or _humanize_tool_name(n)
                             if label not in _sent_statuses:
                                 _sent_statuses.add(label)
                                 new_labels.append(label)
