@@ -484,3 +484,79 @@ def test_log_support_chat_writes_when_enabled(monkeypatch):
     body = next(iter(written.values()))
     assert "authoritative: false" in body  # marked as log, not source
     assert "login broken" in body
+
+
+# ---- kb.gemini: in-boundary regional guard (#1) -----------------------------
+
+def test_gemini_refuses_global_endpoint(monkeypatch):
+    """The KB engine must refuse the global Vertex endpoint (FedRAMP residency)."""
+    import pytest
+    from kb import gemini
+    monkeypatch.setattr(gemini, "KB_VERTEX_LOCATION", "global")
+    monkeypatch.setattr(gemini, "_llm", None)  # reset singleton so the guard runs
+    with pytest.raises(RuntimeError, match="regional"):
+        gemini.get_kb_llm()
+
+
+# ---- kb.storage: single-flight lease lock impl (#2) -------------------------
+
+class _FakeBlob:
+    def __init__(self, exists=False, payload="", generation=1):
+        self._exists, self._payload, self.generation = exists, payload, generation
+        self.uploaded, self.deleted = [], False
+
+    def upload_from_string(self, data, content_type=None, if_generation_match=None):
+        from google.api_core.exceptions import PreconditionFailed
+        if if_generation_match == 0 and self._exists:
+            raise PreconditionFailed("object exists")  # atomic-create lost the race
+        self._payload, self._exists = data, True
+        self.uploaded.append((data, if_generation_match))
+
+    def reload(self):
+        pass
+
+    def download_as_text(self):
+        return self._payload
+
+    def delete(self):
+        self.deleted = True
+
+
+def _patch_bucket(monkeypatch, blob):
+    from kb import storage
+    monkeypatch.setattr(storage, "_bucket", lambda: type("B", (), {"blob": lambda self, p: blob})())
+
+
+def test_acquire_lock_fresh(monkeypatch):
+    from kb import storage
+    blob = _FakeBlob(exists=False)
+    _patch_bucket(monkeypatch, blob)
+    assert storage.acquire_lock("p", ttl_seconds=100) is True
+    assert blob.uploaded and blob.uploaded[0][1] == 0  # atomic create (if_generation_match=0)
+
+
+def test_acquire_lock_held_not_stale(monkeypatch):
+    import json
+    import time as _t
+    from kb import storage
+    blob = _FakeBlob(exists=True, payload=json.dumps({"acquired_at": _t.time()}), generation=5)
+    _patch_bucket(monkeypatch, blob)
+    assert storage.acquire_lock("p", ttl_seconds=1800) is False  # held + fresh → no takeover
+
+
+def test_acquire_lock_takes_over_stale(monkeypatch):
+    import json
+    import time as _t
+    from kb import storage
+    blob = _FakeBlob(exists=True, payload=json.dumps({"acquired_at": _t.time() - 99999}), generation=5)
+    _patch_bucket(monkeypatch, blob)
+    assert storage.acquire_lock("p", ttl_seconds=1800) is True  # stale → take over
+    assert any(g == 5 for _, g in blob.uploaded)  # takeover guarded by generation
+
+
+def test_release_lock(monkeypatch):
+    from kb import storage
+    blob = _FakeBlob(exists=True)
+    _patch_bucket(monkeypatch, blob)
+    storage.release_lock("p")
+    assert blob.deleted is True
