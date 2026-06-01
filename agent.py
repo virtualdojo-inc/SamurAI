@@ -69,7 +69,7 @@ from verification import (
 from skills import SKILL_TOOLS, skills_catalog_text
 from wiki import WIKI_TOOLS, knowledge_index_text
 from conversation_log import log_turn, log_support_chat
-from selftune.hints import learned_hints_text
+from selftune.hints import learned_hints_text, wrap_hints
 
 logger = logging.getLogger(__name__)
 
@@ -782,7 +782,7 @@ PROMPT_SECTIONS = {
 }
 
 
-def _select_prompt_sections(message: str) -> str:
+def _select_prompt_sections(message: str, hints_override: str | None = None) -> str:
     """Build the system prompt by selecting only relevant sections.
 
     Core section is always included. Other sections load when their keywords
@@ -806,7 +806,9 @@ def _select_prompt_sections(message: str) -> str:
         parts.append(index)
     # Learned operational guidance — the single mutable, self-tuned prompt layer
     # (selftune). Injected LAST so it refines, never overrides, the frozen core.
-    hints = learned_hints_text()
+    # hints_override lets the self-tuning loop evaluate a candidate doc against
+    # the exact production prompt; None = use the live doc.
+    hints = wrap_hints(hints_override) if hints_override is not None else learned_hints_text()
     if hints:
         parts.append(hints)
     return "\n\n".join(parts)

@@ -111,6 +111,24 @@ def mine_cases(turns: Iterable[dict], max_cases: int = 200) -> list[dict]:
     return cases
 
 
+def mine_failures(turns: Iterable[dict], max_failures: int = 20) -> list[dict]:
+    """Recent 'bad' turns (errored tool or give-up) — the propose step's context."""
+    ordered = sorted(turns, key=lambda t: t.get("ts", ""), reverse=True)
+    out: list[dict] = []
+    for turn in ordered:
+        if label_turn(turn) != "bad":
+            continue
+        tools = parse_tools(turn.get("tools", []))
+        out.append({
+            "message": (turn.get("user_message") or "")[:200],
+            "errored_tools": [n for n, o in tools if o == "error"],
+            "gave_up": is_give_up(turn.get("assistant_response", "")),
+        })
+        if len(out) >= max_failures:
+            break
+    return out
+
+
 def read_raw_turns(days: int = 7, raw_dir: Path | None = None) -> Iterator[dict]:
     """Yield turn records from /data/raw for the last ``days`` date partitions.
 

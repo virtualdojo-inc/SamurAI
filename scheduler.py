@@ -78,6 +78,20 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
         )
         logger.info("KB engineering pipeline scheduled (daily 9am, in-boundary Gemini).")
 
+    # Prompt self-tuning loop: propose→evaluate→promote edits to the mutable
+    # learned_hints.md, gated by an objective eval set. Adaptive cadence is
+    # self-managed inside run_tuning_cycle. Gated by KB_TUNE_ENABLED.
+    from selftune.loop import tune_enabled
+
+    if tune_enabled():
+        _scheduler.add_job(
+            _run_tuning_cycle,
+            CronTrigger.from_crontab(os.environ.get("KB_TUNE_CRON", "0 7 * * *")),
+            id="selftune_cycle",
+            replace_existing=True,
+        )
+        logger.info("Prompt self-tuning scheduled (in-boundary, eval-gated).")
+
     _scheduler.start()
     logger.info("Scheduler started with %d active tasks", len(tasks))
     return _scheduler
@@ -101,6 +115,16 @@ async def _run_kb_engineering_pipeline() -> None:
         await asyncio.to_thread(run_engineering_pipeline)
     except Exception as e:  # never let a pipeline run crash the scheduler
         logger.error("[kb.run] engineering pipeline failed: %s: %s", type(e).__name__, e)
+
+
+async def _run_tuning_cycle() -> None:
+    """Run the prompt self-tuning cycle off the event loop."""
+    from selftune.loop import run_tuning_cycle
+
+    try:
+        await asyncio.to_thread(run_tuning_cycle)
+    except Exception as e:  # never let a tuning run crash the scheduler
+        logger.error("[selftune] cycle failed: %s: %s", type(e).__name__, e)
 
 
 def _register_job(task: dict) -> None:

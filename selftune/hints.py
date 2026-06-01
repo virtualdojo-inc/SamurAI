@@ -49,9 +49,13 @@ def load_hints(force: bool = False) -> str:
     return text
 
 
-def learned_hints_text() -> str:
-    """The injectable prompt block (header + capped body), or '' if no hints yet."""
-    body = load_hints().strip()
+def wrap_hints(body: str) -> str:
+    """Wrap a raw hints body into the injectable prompt block (header + cap).
+
+    Used for both the live hints and for evaluating a candidate, so the eval
+    prompt matches production exactly. '' for an empty body (no injection).
+    """
+    body = (body or "").strip()
     if not body:
         return ""
     if len(body) > _MAX_HINTS_CHARS:
@@ -63,6 +67,11 @@ def learned_hints_text() -> str:
         "tips. These REFINE the rules above; if anything here conflicts with the "
         "core rules or autonomy rules, the core rules win.\n\n" + body
     )
+
+
+def learned_hints_text() -> str:
+    """The injectable prompt block from the live doc, or '' if no hints yet."""
+    return wrap_hints(load_hints())
 
 
 def save_hints(text: str) -> None:

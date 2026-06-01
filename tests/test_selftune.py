@@ -4,6 +4,7 @@ import json
 
 from selftune import evalset, score
 from selftune import hints as hints_mod
+from selftune import loop as loop_mod
 
 
 def _point_hints(tmp_path, monkeypatch):
@@ -194,3 +195,87 @@ def test_hints_hard_cap(tmp_path, monkeypatch):
     block = hints_mod.learned_hints_text()
     # body is truncated to the cap (plus a small fixed header)
     assert len(block) <= hints_mod._MAX_HINTS_CHARS + 400
+
+
+# ---- the propose -> evaluate -> promote loop --------------------------------
+
+def _setup_loop(tmp_path, monkeypatch):
+    _point_hints(tmp_path, monkeypatch)
+    monkeypatch.setattr(loop_mod, "STATE_PATH", tmp_path / "tune_state.json")
+    # no /data dependency in the cycle
+    monkeypatch.setattr(evalset, "read_raw_turns", lambda **k: [])
+    monkeypatch.setenv("KB_TUNE_ENABLED", "on")
+
+
+def _case(msg, expected=None, forbidden=None, must_pass=False, source="mined"):
+    return {"message": msg, "expected_tools": expected or [], "forbidden_tools": forbidden or [],
+            "must_pass": must_pass, "source": source}
+
+
+def test_cycle_promotes_improvement(tmp_path, monkeypatch):
+    _setup_loop(tmp_path, monkeypatch)
+    cases = [_case("a", expected=["t1"])] * 15
+    select = lambda hints, message: (["t1"] if "USE_T1" in (hints or "") else [])
+    propose = lambda cur, good, fails: "USE_T1: prefer t1 for 'a'"
+    out = loop_mod.run_tuning_cycle(force=True, propose_fn=propose, select_fn=select, cases=cases)
+    assert out["result"] == "promoted"
+    assert "USE_T1" in hints_mod.load_hints(force=True)
+
+
+def test_cycle_rejects_no_improvement(tmp_path, monkeypatch):
+    _setup_loop(tmp_path, monkeypatch)
+    cases = [_case("a", expected=["t1"])] * 15
+    select = lambda hints, message: []  # neither current nor candidate selects t1
+    propose = lambda cur, good, fails: "some unhelpful change"
+    out = loop_mod.run_tuning_cycle(force=True, propose_fn=propose, select_fn=select, cases=cases)
+    assert out["result"] == "rejected"
+    assert hints_mod.load_hints(force=True) == ""  # not promoted
+
+
+def test_cycle_rejects_safety_regression(tmp_path, monkeypatch):
+    _setup_loop(tmp_path, monkeypatch)
+    cases = [_case("greet", forbidden=["social_publish_post"], must_pass=True, source="safety-seed")] * 15
+    # candidate makes it pick the forbidden tool; current does not
+    select = lambda hints, message: (["social_publish_post"] if "BAD" in (hints or "") else [])
+    propose = lambda cur, good, fails: "BAD change that publishes on greetings"
+    out = loop_mod.run_tuning_cycle(force=True, propose_fn=propose, select_fn=select, cases=cases)
+    assert out["result"] == "rejected"
+    assert "safety" in out["reason"]
+    assert hints_mod.load_hints(force=True) == ""
+
+
+def test_cycle_no_change(tmp_path, monkeypatch):
+    _setup_loop(tmp_path, monkeypatch)
+    cases = [_case("a", expected=["t1"])] * 15
+    out = loop_mod.run_tuning_cycle(force=True, propose_fn=lambda *a: "", select_fn=lambda *a: [], cases=cases)
+    assert out["result"] == "no_change"
+
+
+def test_cycle_skips_insufficient_cases(tmp_path, monkeypatch):
+    _setup_loop(tmp_path, monkeypatch)
+    out = loop_mod.run_tuning_cycle(force=True, propose_fn=lambda *a: "x", select_fn=lambda *a: [],
+                                    cases=[_case("a", expected=["t1"])])
+    assert out["skipped"] == "insufficient_cases"
+
+
+def test_cycle_disabled_without_force(tmp_path, monkeypatch):
+    _setup_loop(tmp_path, monkeypatch)
+    monkeypatch.setenv("KB_TUNE_ENABLED", "off")
+    assert loop_mod.run_tuning_cycle(force=False)["skipped"] == "disabled"
+
+
+def test_should_run_force_and_not_converged():
+    assert loop_mod._should_run({"streak": 99}, force=True) is True
+    assert loop_mod._should_run({"streak": 0}, force=False) is True  # still improving → run
+
+
+def test_streak_resets_on_accept_and_grows_on_reject(tmp_path, monkeypatch):
+    _setup_loop(tmp_path, monkeypatch)
+    cases = [_case("a", expected=["t1"])] * 15
+    # reject → streak grows
+    loop_mod.run_tuning_cycle(force=True, propose_fn=lambda *a: "noop", select_fn=lambda *a: [], cases=cases)
+    assert loop_mod._load_state()["streak"] == 1
+    # accept → streak resets
+    loop_mod.run_tuning_cycle(force=True, propose_fn=lambda *a: "USE_T1",
+                              select_fn=lambda h, m: (["t1"] if "USE_T1" in h else []), cases=cases)
+    assert loop_mod._load_state()["streak"] == 0
