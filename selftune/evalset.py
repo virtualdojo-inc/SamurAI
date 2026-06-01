@@ -33,6 +33,14 @@ SAFETY_SEED = Path(__file__).parent / "seeds" / "safety.jsonl"
 # tool-selection signal we evaluate.
 NOISE_TOOLS = {"update_progress", "get_progress", "clear_progress"}
 
+# Dislike categories the self-tuning loop can actually ACT on: tool routing and
+# anti-stall are the only levers the hints doc has. Other dislikes are real
+# negatives but not fixable by routing hints — a factual error ("incorrect") is a
+# grounding/verifier problem, "other" is unknown — so they're QUARANTINED from the
+# proposer (else it tries to fix a grounding bug with a routing hint) and left on
+# the turn record for verifier/human triage.
+ROUTING_FAILURE_CATEGORIES = {"wrong_tool", "gave_up"}
+
 # Phrases that mark a turn where the agent gave up / stalled instead of completing
 # (the exact failure mode seen in Jason's stop-before-finishing run).
 _GIVE_UP_RE = re.compile(
@@ -65,9 +73,19 @@ def label_turn(turn: dict) -> str:
         return "skip"
     if not (turn.get("user_message") or "").strip():
         return "skip"
+    # Human 👍/👎 (from the Teams feedback card) is the INDEPENDENT, authoritative
+    # signal — it overrides the self-referential heuristic. A 👎 is 'bad' even if
+    # tools returned ok; a 👍 is trusted over the error/give-up heuristics (which
+    # can misfire). This is what breaks the "grade the model against its own past
+    # choices" circularity. See conversation_log.record_feedback.
+    reaction = (turn.get("feedback") or {}).get("reaction")
+    if reaction == "dislike":
+        return "bad"
     task = [(n, o) for n, o in parse_tools(turn.get("tools", [])) if n not in NOISE_TOOLS]
     if not task:
         return "skip"  # no task-tool selection to learn from
+    if reaction == "like":
+        return "good"
     if any(o == "error" for _, o in task):
         return "bad"
     if is_give_up(turn.get("assistant_response", "")):
@@ -83,12 +101,16 @@ def turn_to_case(turn: dict) -> dict | None:
                        if o == "ok" and n not in NOISE_TOOLS})
     if not expected:
         return None
+    # A 👍'd turn is a human-verified positive — a trustworthy label, unlike the
+    # self-labeled 'mined' cases. Tagged so the gate can weight it higher (next step).
+    human_verified = (turn.get("feedback") or {}).get("reaction") == "like"
     return {
         "message": turn["user_message"].strip(),
         "expected_tools": expected,
         "forbidden_tools": [],
-        "source": "mined",
+        "source": "human-verified" if human_verified else "mined",
         "must_pass": False,
+        "human_verified": human_verified,
     }
 
 
@@ -111,18 +133,48 @@ def mine_cases(turns: Iterable[dict], max_cases: int = 200) -> list[dict]:
     return cases
 
 
+def failure_route(turn: dict) -> str | None:
+    """Where a failed turn should go.
+
+    Returns:
+      'tune'       — a failure the routing/anti-stall tuner should learn from
+                     (heuristic tool-error/give-up, or a 👎 categorized wrong_tool/gave_up)
+      'quarantine' — a real negative the tuner CANNOT fix (a 👎 categorized
+                     'incorrect'/'other'/uncategorized) — kept for verifier/human triage
+      None         — not a failure ('good'/'skip')
+
+    For a human 👎 the category decides (we trust the human's read of the result);
+    a heuristic 'bad' (no human verdict) is routing/anti-stall relevant by nature.
+    """
+    if label_turn(turn) != "bad":
+        return None
+    fb = turn.get("feedback") or {}
+    if fb.get("reaction") == "dislike":
+        return "tune" if (fb.get("category") or "") in ROUTING_FAILURE_CATEGORIES else "quarantine"
+    return "tune"
+
+
 def mine_failures(turns: Iterable[dict], max_failures: int = 20) -> list[dict]:
-    """Recent 'bad' turns (errored tool or give-up) — the propose step's context."""
+    """Recent tuner-actionable failures — the propose step's context.
+
+    Only 'tune'-routed failures (see ``failure_route``); a factual-error 👎 is
+    quarantined so the proposer doesn't try to fix grounding with a routing hint.
+    Includes the human category + note (the propose model runs IN-BOUNDARY, so
+    surfacing the user's note to it is compliant).
+    """
     ordered = sorted(turns, key=lambda t: t.get("ts", ""), reverse=True)
     out: list[dict] = []
     for turn in ordered:
-        if label_turn(turn) != "bad":
+        if failure_route(turn) != "tune":
             continue
         tools = parse_tools(turn.get("tools", []))
+        fb = turn.get("feedback") or {}
         out.append({
             "message": (turn.get("user_message") or "")[:200],
             "errored_tools": [n for n, o in tools if o == "error"],
-            "gave_up": is_give_up(turn.get("assistant_response", "")),
+            "gave_up": is_give_up(turn.get("assistant_response", "")) or fb.get("category") == "gave_up",
+            "category": fb.get("category") or "",
+            "note": (fb.get("text") or "")[:200],
         })
         if len(out) >= max_failures:
             break

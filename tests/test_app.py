@@ -18,7 +18,9 @@ def patched_app():
         patch("botbuilder.core.BotFrameworkAdapter") as mock_adapter_cls,
     ):
         mock_adapter = MagicMock()
-        mock_adapter.process_activity = AsyncMock()
+        # Real BotFrameworkAdapter.process_activity returns None for message
+        # activities (only invoke activities yield an InvokeResponse).
+        mock_adapter.process_activity = AsyncMock(return_value=None)
         mock_adapter_cls.return_value = mock_adapter
 
         import app as app_module

@@ -79,6 +79,15 @@ async def on_message(turn_context: TurnContext):
         await _handle_file_consent(turn_context)
         return
 
+    # Teams native feedback-loop (👍/👎) — custom dialog flow.
+    # Thumb click → fetch our validation card; form submit → persist the feedback.
+    if activity_name == "message/fetchTask":
+        await _handle_feedback_fetch(turn_context)
+        return
+    if activity_name == "message/submitAction":
+        await _handle_feedback_submit(turn_context)
+        return
+
     # Handle Adaptive Card Action.Submit callbacks (buttons clicked)
     if turn_context.activity.value and isinstance(turn_context.activity.value, dict):
         # Don't catch file consent invokes here
@@ -350,7 +359,16 @@ async def on_message(turn_context: TurnContext):
             turn_context, "fedramp_file_upload", fedramp_card, response, conversation_id
         )
     else:
-        await turn_context.send_activity(Activity(type="message", text=response))
+        # Native Teams 👍/👎 footer buttons (passive, not a card). type:"custom"
+        # routes a click to _handle_feedback_fetch so we can show our own
+        # validation card. The thumbs render on the plain markdown message.
+        await turn_context.send_activity(
+            Activity(
+                type="message",
+                text=response,
+                channel_data={"feedbackLoop": {"type": "custom"}},
+            )
+        )
 
     # Send edited file via FileConsentCard if one was created
     if edited_file:
@@ -456,6 +474,80 @@ async def _send_card_response(
     else:
         # Unknown card type — fall back to text
         await turn_context.send_activity(Activity(type="message", text=text_fallback))
+
+
+async def _handle_feedback_fetch(turn_context: TurnContext):
+    """A 👍/👎 was clicked → return our feedback-validation card as a dialog.
+
+    Teams sends message/fetchTask with value.actionValue.reaction (like|dislike).
+    We correlate to the latest turn (reply_to_id is unreliable) and embed that
+    turn_id in the card so the submit can attach feedback to the exact turn.
+    """
+    from botbuilder.core import CardFactory
+    from botbuilder.schema import ActivityTypes, InvokeResponse
+    from botbuilder.schema.teams import (
+        TaskModuleContinueResponse,
+        TaskModuleResponse,
+        TaskModuleTaskInfo,
+    )
+
+    from cards.feedback import build_feedback_card, extract_reaction
+    from conversation_log import find_latest_turn_id
+
+    value = turn_context.activity.value or {}
+    reaction = extract_reaction(value) or "like"
+    conversation_id = turn_context.activity.conversation.id
+    turn_id = find_latest_turn_id(conversation_id) or ""
+
+    card = build_feedback_card(reaction=reaction, turn_id=turn_id)
+    task_info = TaskModuleTaskInfo(
+        title="Send feedback",
+        card=CardFactory.adaptive_card(card),
+        width="medium",
+        height="small",
+    )
+    body = TaskModuleResponse(task=TaskModuleContinueResponse(value=task_info))
+    await turn_context.send_activity(
+        Activity(
+            type=ActivityTypes.invoke_response,
+            value=InvokeResponse(status=200, body=body.serialize()),
+        )
+    )
+
+
+async def _handle_feedback_submit(turn_context: TurnContext):
+    """The feedback form was submitted → persist onto the turn record.
+
+    Teams sends message/submitAction. value.actionValue.feedback is a JSON-encoded
+    STRING; our card's Action.Submit data (turn_id, reaction, category) may surface
+    inside it, directly under actionValue, or at the top level — parse defensively.
+    MUST return 200 with an empty body, or Teams shows error 400.
+    """
+    from botbuilder.schema import ActivityTypes, InvokeResponse
+
+    from cards.feedback import parse_feedback_submit
+    from conversation_log import record_feedback
+
+    parsed = parse_feedback_submit(turn_context.activity.value)
+    conversation_id = turn_context.activity.conversation.id
+
+    record_feedback(
+        conversation_id=conversation_id,
+        turn_id=parsed["turn_id"],
+        reaction=parsed["reaction"],
+        category=parsed["category"],
+        text=parsed["text"],
+    )
+    print(
+        f"[feedback] reaction={parsed['reaction']} category={parsed['category'] or '-'} conv={conversation_id}",
+        flush=True,
+    )
+    await turn_context.send_activity(
+        Activity(
+            type=ActivityTypes.invoke_response,
+            value=InvokeResponse(status=200, body={}),
+        )
+    )
 
 
 async def _handle_file_consent(turn_context: TurnContext):
@@ -565,7 +657,13 @@ async def messages(req: web.Request) -> web.Response:
     activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
 
-    await adapter.process_activity(activity, auth_header, on_message)
+    # process_activity returns an InvokeResponse for invoke activities (e.g. the
+    # message/fetchTask feedback dialog). The previous code discarded it, so the
+    # dialog body never reached Teams. Emit it when present; otherwise plain 200
+    # (preserves existing fileConsent/message behavior, which sets no invoke body).
+    invoke_response = await adapter.process_activity(activity, auth_header, on_message)
+    if invoke_response is not None:
+        return web.json_response(data=invoke_response.body, status=invoke_response.status)
     return web.Response(status=200)
 
 

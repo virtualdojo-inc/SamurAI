@@ -123,11 +123,16 @@ def _make_propose_fn():
         ctx = (
             "CURRENT GUIDANCE:\n" + (current_hints or "(empty)") + "\n\n"
             "RECENT FAILURES (fix these):\n"
-            + "\n".join(f"- {f['message']!r} errored={f['errored_tools']} gave_up={f['gave_up']}"
-                        for f in failures[:20])
+            + "\n".join(
+                f"- {f['message']!r} errored={f['errored_tools']} gave_up={f['gave_up']}"
+                + (f" user_said={f['category']}" if f.get("category") else "")
+                + (f" note={f['note']!r}" if f.get("note") else "")
+                for f in failures[:20]
+            )
             + "\n\nGOOD EXAMPLES (message → tools that worked):\n"
             + "\n".join(f"- {c['message']!r} → {c['expected_tools']}"
-                        for c in good_cases[:20] if c.get("source") == "mined")
+                        for c in good_cases[:20]
+                        if c.get("source") in ("mined", "human-verified"))
         )
         resp = llm.invoke([SystemMessage(content=_PROPOSE_SYS), HumanMessage(content=ctx)])
         return resp.content if isinstance(resp.content, str) else str(resp.content)
