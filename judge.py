@@ -124,6 +124,7 @@ WRITE_TOOL_NAMES: frozenset[str] = frozenset({
     # GitHub writes
     "github_create_issue",
     "github_close_issue",
+    "github_edit_issue",
     "github_set_issue_type",
     "github_create_draft_issue",
     "github_add_item_to_project",

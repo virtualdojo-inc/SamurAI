@@ -53,7 +53,7 @@ WRITE_TOOLS = {
     "social_publish_post", "social_schedule_post", "social_update_post",
     "social_delete_post", "send_teams_message",
     # GitHub mutations
-    "github_create_issue", "github_close_issue", "github_set_issue_type",
+    "github_create_issue", "github_close_issue", "github_edit_issue", "github_set_issue_type",
     "github_create_draft_issue", "github_add_item_to_project", "github_update_item_field",
     # other data writes
     "smartsheet_update_row",

@@ -760,3 +760,56 @@ def test_search_issues_handles_paginated_list_index_error(mock_gh):
     assert "No issues" in out
     assert "IndexError" not in out
     assert "list index out of range" not in out
+
+
+# --- github_edit_issue ---
+
+
+@patch("tools.github._github")
+def test_edit_issue_updates_title_and_body(mock_gh):
+    from tools.github import github_edit_issue
+
+    issue = MagicMock()
+    issue.title = "New title"
+    mock_gh.return_value.get_repo.return_value.get_issue.return_value = issue
+
+    result = github_edit_issue.invoke(
+        {
+            "repo": "virtualdojo-inc/virtualdojo",
+            "issue_number": 7,
+            "title": "New title",
+            "body": "New body",
+        }
+    )
+
+    issue.edit.assert_called_once_with(title="New title", body="New body")
+    assert "title and body" in result
+    assert "#7" in result
+
+
+@patch("tools.github._github")
+def test_edit_issue_only_sends_provided_fields(mock_gh):
+    """A blank field is left unchanged — it must not be passed to issue.edit,
+    otherwise PyGithub would overwrite the body with an empty string."""
+    from tools.github import github_edit_issue
+
+    issue = MagicMock()
+    issue.title = "Fixed typo"
+    mock_gh.return_value.get_repo.return_value.get_issue.return_value = issue
+
+    github_edit_issue.invoke(
+        {"repo": "org/repo", "issue_number": 12, "title": "Fixed typo"}
+    )
+
+    issue.edit.assert_called_once_with(title="Fixed typo")
+
+
+@patch("tools.github._github")
+def test_edit_issue_noop_when_nothing_provided(mock_gh):
+    """Both fields blank: never touch GitHub at all."""
+    from tools.github import github_edit_issue
+
+    result = github_edit_issue.invoke({"repo": "org/repo", "issue_number": 99})
+
+    assert "Nothing to edit" in result
+    mock_gh.return_value.get_repo.assert_not_called()

@@ -34,6 +34,7 @@ from tools.github import (
     github_list_workflow_runs,
     github_get_workflow_run_details,
     github_close_issue,
+    github_edit_issue,
     PROJECT_TOOLS,
 )
 from tools.virtualdojo_mcp import create_virtualdojo_tool, create_virtualdojo_list_tools
@@ -123,6 +124,7 @@ TOOL_GROUPS = {
             github_list_workflow_runs,
             github_get_workflow_run_details,
             github_close_issue,
+            github_edit_issue,
         ] + PROJECT_TOOLS,
         "keywords": [
             "github", "pr", "pull request", "issue", "commit", "ci/cd",
@@ -1307,6 +1309,7 @@ async def run_agent(
         "github_get_issue_type": "Reading issue type",
         "github_set_issue_type": "Setting issue type",
         "github_close_issue": "Closing GitHub issue",
+        "github_edit_issue": "Editing GitHub issue",
         "github_list_workflow_runs": "Checking CI/CD workflows",
         "github_get_workflow_run_details": "Reading workflow details",
         "fedramp_collect_evidence": "Collecting FedRAMP evidence",

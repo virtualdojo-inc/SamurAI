@@ -52,6 +52,14 @@ def test_smartsheet_update_row_is_a_write():
     assert "smartsheet_update_row" in WRITE_TOOL_NAMES
 
 
+def test_github_edit_issue_is_a_write():
+    """Editing an issue's title/body mutates GitHub, so the judge must gate
+    it before it runs."""
+    from judge import WRITE_TOOL_NAMES
+
+    assert "github_edit_issue" in WRITE_TOOL_NAMES
+
+
 def test_smartsheet_get_sheet_is_a_read():
     from judge import READ_ONLY_TOOL_NAMES
 

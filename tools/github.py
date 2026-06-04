@@ -1004,6 +1004,38 @@ def github_close_issue(repo: str, issue_number: int, reason: str = "") -> str:
     return f"Closed issue #{issue_number}: {issue.title}"
 
 
+@tool
+def github_edit_issue(
+    repo: str, issue_number: int, title: str = "", body: str = ""
+) -> str:
+    """Edit the title and/or body of an existing GitHub issue.
+
+    Use this to fix a typo, clarify the description, or add detail to an issue
+    that already exists. Leave a field blank ('') to keep it unchanged. This
+    edits the issue text only — to change the Bug/Feature/Task classification
+    use github_set_issue_type, and to close an issue use github_close_issue.
+
+    Args:
+        repo: Repository in 'owner/repo' format.
+        issue_number: The issue number to edit.
+        title: New title. Leave blank to keep the current title.
+        body: New body/description (supports markdown). Leave blank to keep
+            the current body.
+    """
+    if not title and not body:
+        return "Nothing to edit: provide a new title and/or body."
+    repo_obj = _github().get_repo(repo)
+    issue = repo_obj.get_issue(number=issue_number)
+    kwargs = {}
+    if title:
+        kwargs["title"] = title
+    if body:
+        kwargs["body"] = body
+    issue.edit(**kwargs)
+    changed = " and ".join(k for k in ("title", "body") if k in kwargs)
+    return f"Edited {changed} on {repo}#{issue_number}: {issue.title}"
+
+
 # All project tools for easy import
 PROJECT_TOOLS = [
     github_list_projects,
