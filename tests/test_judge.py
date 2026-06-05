@@ -693,10 +693,12 @@ async def test_stage1_llm_error_defaults_to_review(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stage2_llm_error_fails_open(monkeypatch):
-    """If Stage 2 LLM call raises, fail OPEN (let the call through). The
-    judge is meant to catch model mistakes; if the judge itself is broken,
-    breaking the agent on top of that is worse than letting the call ship."""
+async def test_stage2_llm_error_fails_closed(monkeypatch):
+    """If the Stage 2 LLM call raises on both attempts, fail CLOSED: a write
+    that cannot be safety-checked is blocked, not shipped. A blocked
+    legitimate write is recoverable (the user re-confirms); a shipped bad
+    write may not be. The block carries transient-failure wording so the
+    agent surfaces it to the user instead of hunting for a new target."""
     monkeypatch.setenv("SAMURAI_JUDGE_WRITES", "enforce")
     import judge
 
@@ -714,12 +716,22 @@ async def test_stage2_llm_error_fails_open(monkeypatch):
         }
         result = await judge.judge_writes_node(state)
 
-    assert result == {"messages": []}
+    # Both attempts raised → fail closed → one synthetic block message.
+    assert broken_llm.ainvoke.await_count == 2
+    assert len(result["messages"]) == 1
+    block = result["messages"][0]
+    assert isinstance(block, ToolMessage)
+    assert block.name == "_judge_block"
+    assert block.status == "error"
+    assert "BLOCKED" in block.content
+    assert "temporarily unavailable" in block.content
 
 
 @pytest.mark.asyncio
-async def test_stage2_unparseable_json_defaults_to_pass(monkeypatch):
-    """If Stage 2 returns garbage JSON, treat as 'pass' (no block)."""
+async def test_stage2_unparseable_json_fails_closed(monkeypatch):
+    """If Stage 2 returns garbage JSON on both attempts, fail CLOSED: the
+    write is blocked with a transient-failure (judge_error) message rather
+    than shipped unreviewed."""
     monkeypatch.setenv("SAMURAI_JUDGE_WRITES", "enforce")
     import judge
 
@@ -735,7 +747,14 @@ async def test_stage2_unparseable_json_defaults_to_pass(monkeypatch):
         }
         result = await judge.judge_writes_node(state)
 
-    assert result == {"messages": []}
+    assert len(result["messages"]) == 1
+    block = result["messages"][0]
+    assert isinstance(block, ToolMessage)
+    assert block.name == "_judge_block"
+    assert block.status == "error"
+    assert "BLOCKED" in block.content
+    # Transient-failure wording, not the wrong-target wording.
+    assert "temporarily unavailable" in block.content
 
 
 def test_parse_stage2_response_strips_code_fences():
@@ -758,12 +777,14 @@ def test_parse_stage2_response_handles_prose_around_json():
     assert reason == "ok"
 
 
-def test_parse_stage2_response_non_dict_returns_pass():
-    """If the model returns a JSON list / scalar, fall back to pass."""
+def test_parse_stage2_response_non_dict_raises():
+    """A parseable-but-wrong-shape response (JSON list / scalar) is a parse
+    failure, not a verdict — it must raise so _stage_2 retries and, if it
+    persists, fails closed (block) rather than manufacturing a pass."""
     from judge import _parse_stage2_response
 
-    verdict, reason = _parse_stage2_response('["approve"]')
-    assert verdict == "pass"
+    with pytest.raises(ValueError):
+        _parse_stage2_response('["approve"]')
 
 
 @pytest.mark.asyncio
