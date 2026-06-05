@@ -200,7 +200,7 @@ def _get_stage1_llm():
 # the code-fence / stray-prose / wrong-shape failure modes that
 # response_mime_type alone does not prevent. Empty responses from
 # safety-filter blocks can still occur — that path is handled by the
-# retry + fail-open logic in _stage_2.
+# retry + fail-closed logic in _stage_2.
 _STAGE_2_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -350,19 +350,37 @@ def _make_block_tool_message(tool_call_id: str, reason: str) -> ToolMessage:
     LangGraph requires every AIMessage tool_call to be matched by a
     ToolMessage with the same tool_call_id. The block message takes
     the place of the real tool result.
+
+    Two flavors, keyed on the reason. A "judge_error:" reason means the
+    judge itself failed to render a verdict (fail-closed path); the call
+    was not actually judged unsafe, so the agent should not go hunting
+    for a different target — it should surface the transient failure and
+    let the user decide. Any other reason is a real safety verdict.
     """
-    return ToolMessage(
-        name=_BLOCK_TOOL_NAME,
-        tool_call_id=tool_call_id,
-        status="error",
-        content=(
+    if reason.startswith("judge_error:"):
+        content = (
+            f"BLOCKED: the safety check could not be completed "
+            f"({reason}), so this write was held rather than shipped "
+            f"unreviewed. This is a transient failure of the safety "
+            f"check itself, NOT a problem with your call. Do not retry "
+            f"automatically — tell the user the safety check is "
+            f"temporarily unavailable and ask them to confirm the "
+            f"action or retry shortly."
+        )
+    else:
+        content = (
             f"BLOCKED by safety judge.\n\n"
             f"Reason: {reason}\n\n"
             f"Do not retry the same call. Either pick a different "
             f"target, verify the IDs by calling a read tool "
             f"(smartsheet_get_sheet, github_get_issue_details, etc.), "
             f"or ask the user to confirm."
-        ),
+        )
+    return ToolMessage(
+        name=_BLOCK_TOOL_NAME,
+        tool_call_id=tool_call_id,
+        status="error",
+        content=content,
     )
 
 
@@ -435,10 +453,16 @@ async def _stage_1(user_messages: str, tool_call: dict) -> Literal["safe", "revi
 def _parse_stage2_response(raw: str) -> tuple[Literal["approve", "block", "pass"], str]:
     """Parse a Stage 2 LLM response into (verdict, reason).
 
-    Tolerant of three observed failure modes:
+    Tolerant of two observed recoverable failure modes:
     - JSON mode strays and wraps output in ```json ... ``` fences
     - Model emits prose before/after the JSON object
-    - Top-level value is not a dict (e.g. a JSON list) — coerce to pass
+
+    A top-level value that is not a dict (e.g. a JSON list) is treated
+    as a parse failure (raises) rather than coerced to a verdict — the
+    judge produced no usable verdict, so this routes through the
+    _stage_2 retry and, if it persists, the fail-closed block. This
+    matches the fail-closed posture: never manufacture a pass-through
+    from a malformed safety verdict.
     """
     text = raw.strip()
     # Strip ```json ... ``` or plain ``` ... ``` fences if present.
@@ -454,7 +478,7 @@ def _parse_stage2_response(raw: str) -> tuple[Literal["approve", "block", "pass"
             raise
         data = json.loads(match.group(0))
     if not isinstance(data, dict):
-        return "pass", "(non-dict response)"
+        raise ValueError(f"non-dict stage-2 response: {type(data).__name__}")
     verdict_raw = data.get("verdict", "pass")
     verdict = str(verdict_raw).lower() if verdict_raw is not None else "pass"
     if verdict not in ("approve", "block", "pass"):
@@ -471,9 +495,16 @@ async def _stage_2(
     Retries once on parse failure or transient LLM errors. Gemini under
     load occasionally returns malformed JSON or empty content even in
     JSON mode; a single re-call usually clears it. If both attempts
-    fail, fall back to "pass" (fail-open) — the judge exists to catch
-    model mistakes, so breaking the agent when the judge itself breaks
-    is worse than letting the call ship.
+    fail, fall back to "block" (fail-CLOSED) — a write that can't be
+    safety-checked must not ship unreviewed. A blocked legitimate write
+    is recoverable (the user re-confirms); a shipped bad write may not
+    be. The block message for this path (reason prefix "judge_error:")
+    carries transient-failure wording so the agent asks the user to
+    confirm or retry rather than picking a different target.
+
+    Lifetime audit (judge enforce-by-default since 2026-05-25): this
+    fallback had never fired across ~100 judged writes when fail-closed
+    was adopted — see docs/judge-design.md / session notes 2026-06-04.
     """
     prompt = _STAGE_2_PROMPT.format(
         user_messages=user_messages,
@@ -500,8 +531,10 @@ async def _stage_2(
                 e,
                 (last_raw or "")[:300],
             )
-    # Both attempts failed — fail-open with diagnostic info.
-    return "pass", f"judge_error: {type(last_err).__name__}"
+    # Both attempts failed — fail-CLOSED with diagnostic info. The
+    # "judge_error:" prefix routes _make_block_tool_message to the
+    # transient-failure wording.
+    return "block", f"judge_error: {type(last_err).__name__}"
 
 
 # ──────────────────────────────────────────────────────────────────────
