@@ -75,7 +75,7 @@ def _format_step(step: dict) -> str:
     return "\n".join(lines)
 
 
-def _save_step(
+async def _save_step(
     *,
     symptom: str,
     winning_hypothesis: str,
@@ -115,8 +115,8 @@ def _save_step(
         "retrieval_count": 0,
     }
 
-    store = get_memory_store()
-    store.put(TROUBLESHOOTING_NAMESPACE, step_id, value)
+    store = await get_memory_store()
+    await store.aput(TROUBLESHOOTING_NAMESPACE, step_id, value)
     logger.info(
         "[troubleshooting] saved step id=%s symptom=%r source=%s",
         step_id,
@@ -127,7 +127,7 @@ def _save_step(
 
 
 @tool
-def save_troubleshooting_step(
+async def save_troubleshooting_step(
     symptom: str,
     winning_hypothesis: str,
     discriminating_evidence: str,
@@ -168,7 +168,7 @@ def save_troubleshooting_step(
         github_issue: GitHub issue number if one tracks this bug.
     """
     try:
-        step_id = _save_step(
+        step_id = await _save_step(
             symptom=symptom,
             winning_hypothesis=winning_hypothesis,
             discriminating_evidence=discriminating_evidence,
@@ -186,7 +186,7 @@ def save_troubleshooting_step(
 
 
 @tool
-def search_troubleshooting(query: str, limit: int = 5) -> str:
+async def search_troubleshooting(query: str, limit: int = 5) -> str:
     """Search the troubleshooting DB for patterns matching a symptom.
 
     Retrieval also happens automatically in the background on every message —
@@ -200,8 +200,8 @@ def search_troubleshooting(query: str, limit: int = 5) -> str:
     from memory import get_memory_store
 
     try:
-        store = get_memory_store()
-        results = store.search(
+        store = await get_memory_store()
+        results = await store.asearch(
             TROUBLESHOOTING_NAMESPACE, query=query, limit=limit
         )
     except Exception as e:
@@ -218,7 +218,7 @@ def search_troubleshooting(query: str, limit: int = 5) -> str:
 
 
 @tool
-def delete_troubleshooting_step(step_id: str) -> str:
+async def delete_troubleshooting_step(step_id: str) -> str:
     """Delete a troubleshooting step by its full UUID.
 
     Use for cleanup of stale, incorrect, or low-value patterns. The step_id
@@ -230,8 +230,8 @@ def delete_troubleshooting_step(step_id: str) -> str:
     from memory import get_memory_store
 
     try:
-        store = get_memory_store()
-        store.delete(TROUBLESHOOTING_NAMESPACE, step_id)
+        store = await get_memory_store()
+        await store.adelete(TROUBLESHOOTING_NAMESPACE, step_id)
         logger.info("[troubleshooting] deleted step id=%s", step_id)
         return f"Deleted troubleshooting step {step_id[:8]}."
     except Exception as e:
@@ -249,7 +249,7 @@ TROUBLESHOOTING_TOOLS = [
 # --- Retrieval helper used by memory.retrieve_relevant_memories ---
 
 
-def retrieve_troubleshooting_patterns(query: str, limit: int = 3) -> Optional[str]:
+async def retrieve_troubleshooting_patterns(query: str, limit: int = 3) -> Optional[str]:
     """Return a formatted string of top-K troubleshooting patterns for injection
     into the system prompt, or None if no matches.
 
@@ -259,8 +259,8 @@ def retrieve_troubleshooting_patterns(query: str, limit: int = 3) -> Optional[st
     from memory import get_memory_store
 
     try:
-        store = get_memory_store()
-        results = store.search(
+        store = await get_memory_store()
+        results = await store.asearch(
             TROUBLESHOOTING_NAMESPACE, query=query, limit=limit
         )
     except Exception as e:
@@ -275,7 +275,7 @@ def retrieve_troubleshooting_patterns(query: str, limit: int = 3) -> Optional[st
         try:
             val = dict(r.value)
             val["retrieval_count"] = int(val.get("retrieval_count", 0)) + 1
-            store.put(TROUBLESHOOTING_NAMESPACE, r.key, val)
+            await store.aput(TROUBLESHOOTING_NAMESPACE, r.key, val)
         except Exception:
             pass
 

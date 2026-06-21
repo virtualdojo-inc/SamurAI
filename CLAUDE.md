@@ -200,6 +200,46 @@ The bot uses a **SingleTenant** Azure Bot Service registration. All three of the
 2. The client secret in GCP Secret Manager matches a valid credential on the Azure app registration (`az ad app credential list --id 35e1851a-0377-47f3-8b47-09110fec743c`)
 3. The Azure Bot Service app type (`az bot show --name samurai-dojo-bot --resource-group samurai-rg --query 'properties.msaAppType'`) is `SingleTenant`
 
+## Admin endpoint (`POST /admin`)
+
+A secured operations endpoint on the bot's public Cloud Run URL for upgrades and
+inspection — run a read query, pull logs, trigger a known migration, or run a
+test chat through the agent. Code: `admin.py` (handler + ops), wired in `app.py`
+(`app.router.add_post("/admin", handle_admin)`).
+
+### Security model (it's on the public URL, so this is load-bearing)
+- **Fail closed.** Disabled (HTTP 404) unless `SAMURAI_ADMIN_KEY` is set. The key
+  lives in Secret Manager (`samurai-admin-key`, region-pinned us-central1) and is
+  wired to the service via `--update-secrets=SAMURAI_ADMIN_KEY=samurai-admin-key:latest`.
+- **Auth:** `Authorization: Bearer <key>`, compared with `hmac.compare_digest`
+  (constant-time — no timing oracle).
+- **Fixed op allowlist — there is deliberately NO arbitrary-code / arbitrary-SQL op.**
+- **Per-IP rate limit** (best-effort, in-process) + **every call audited to stdout**
+  (`[admin] op=… ip=… OK/FAILED`), visible in Cloud Logging.
+- Mutating/arbitrary work belongs behind the **approval-card flow**, not here.
+
+### Ops (`{"op": "<name>", "args": {...}}`)
+| op | what it does |
+|----|--------------|
+| `ping` | liveness + current revision |
+| `db_query` | **read-only** single `SELECT`/`WITH` against Postgres — forbidden-keyword + `;` block, read-only transaction, `statement_timeout`, 200-row cap |
+| `logs` | recent Cloud Logging entries for `samurai-bot` (read-only) |
+| `migrate_data` | one-shot, idempotent `/data` SQLite → Postgres migration (`migrate_data.py`) |
+| `chat` | run the agent on `args.message` and return the reply (bypasses Teams; full graph — writes stay judge-gated). Use to verify the bot end-to-end without a Teams round-trip |
+
+### Calling it
+```bash
+KEY=$(gcloud secrets versions access latest --secret=samurai-admin-key --project=virtualdojo-samurai)
+URL=https://<service-url>     # or the candidate tag URL during a deploy
+curl -s -X POST "$URL/admin" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"op":"db_query","args":{"sql":"SELECT count(*) FROM tasks"}}'
+curl -s -X POST "$URL/admin" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"op":"chat","args":{"message":"what do you remember about the deploy?"}}'
+```
+`db_query`, `migrate_data`, and `chat` assume the Postgres backbone (`DATABASE_URL`
+→ in-boundary Cloud SQL `samurai-db`). Rotate the key by adding a new
+`samurai-admin-key` secret version.
+
 ## Knowledge bucket + learning loop
 
 SamurAI maintains a self-improving knowledge base in **`gs://virtualdojo-knowledge`**

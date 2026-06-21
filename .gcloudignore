@@ -1,0 +1,24 @@
+# Keep Cloud Build source uploads clean + free of local-only / sensitive files.
+.git/
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.benchmarks/
+# Local DBs + journals (the whole point of the Postgres migration)
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+# Local secrets / env — never upload to the build
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.claude/
+node_modules/
