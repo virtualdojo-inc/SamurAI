@@ -931,7 +931,7 @@ async def _build_graph(user_id: str = "default"):
     llm_synth = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", **_GCP_KWARGS)
 
     # User-specific tools
-    memory_tools = create_memory_tools(user_id)
+    memory_tools = await create_memory_tools(user_id)
     crm_tools = [
         create_virtualdojo_tool(user_id),
         create_virtualdojo_list_tools(user_id),
@@ -1050,7 +1050,7 @@ async def _build_graph(user_id: str = "default"):
     )
 
     checkpointer = await get_checkpointer()
-    store = get_memory_store()
+    store = await get_memory_store()
     return graph.compile(checkpointer=checkpointer, store=store)
 
 
@@ -1646,7 +1646,8 @@ async def run_agent(
         ("team", get_team_extractor, 3.0),
     ):
         try:
-            getter().submit(msg_payload, config=user_config, after_seconds=delay)
+            executor = await getter()
+            executor.submit(msg_payload, config=user_config, after_seconds=delay)
             print(f"[memory.extract] {tier_name} submit OK", flush=True)
         except Exception as e:
             print(
@@ -1661,9 +1662,9 @@ async def run_agent(
     # the core=0 case.
     try:
         from memory import CORE_NAMESPACE, TEAM_NAMESPACE, get_memory_store
-        store = get_memory_store()
-        core_count = len(store.search(CORE_NAMESPACE, query="x", limit=1000))
-        team_count = len(store.search(TEAM_NAMESPACE, query="x", limit=1000))
+        store = await get_memory_store()
+        core_count = len(await store.asearch(CORE_NAMESPACE, query="x", limit=1000))
+        team_count = len(await store.asearch(TEAM_NAMESPACE, query="x", limit=1000))
         print(
             f"[memory.store] core={core_count} team={team_count}",
             flush=True,
