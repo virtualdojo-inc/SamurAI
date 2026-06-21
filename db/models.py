@@ -15,12 +15,13 @@ Mirrors the CMO service's ``db/models.py`` conventions (DeclarativeBase,
 """
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import datetime
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, DateTime, Index, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -100,4 +101,69 @@ class CodeRun(Base):
     __table_args__ = (Index("ix_code_runs_reusable", "reusable"),)
 
 
-__all__ = ["Base", "PendingApproval", "CodeRun", "EMBED_DIM"]
+# ── Background tasks / conversation refs / team roster ───────────────────
+# Migrated from the SQLite-on-GCS-FUSE store. Cross-dialect generic types
+# (String/Text/Integer/Float) so the SAME models run on SQLite (tests/local,
+# no DATABASE_URL) and Postgres (prod). Timestamps stay epoch-float (set in
+# task_store) to preserve the existing dict-return contract.
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[str] = mapped_column(String(8), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(320), nullable=False)
+    user_name: Mapped[str] = mapped_column(String(320), nullable=False, default="")
+    user_email: Mapped[str] = mapped_column(String(320), nullable=False, default="")
+    user_timezone: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    conversation_id: Mapped[str] = mapped_column(String(500), nullable=False)
+    task_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    cron_expression: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    run_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    created_at: Mapped[float] = mapped_column(Float, nullable=False, default=time.time)
+    last_run_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    next_run_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    run_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    max_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    locked_until: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    __table_args__ = (
+        Index("idx_tasks_user", "user_id"),
+        Index("idx_tasks_status", "status"),
+    )
+
+
+class ConversationRef(Base):
+    __tablename__ = "conversation_refs"
+
+    conversation_id: Mapped[str] = mapped_column(String(500), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(320), nullable=False)
+    ref_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False, default=time.time)
+
+
+class TeamRoster(Base):
+    __tablename__ = "team_roster"
+
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    teams_id: Mapped[str] = mapped_column(String(500), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(320), nullable=False, default="")
+    service_url: Mapped[str] = mapped_column(String(1000), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False, default=time.time)
+
+
+# Tables migrated from the old SQLite task store — created via create_all on the
+# store's own engine (works on SQLite + Postgres). The pgvector table (code_runs)
+# is intentionally excluded so the SQLite fallback path never sees a Vector column.
+TASK_STORE_TABLES = [Task.__table__, ConversationRef.__table__, TeamRoster.__table__]
+
+
+__all__ = [
+    "Base", "PendingApproval", "CodeRun", "EMBED_DIM",
+    "Task", "ConversationRef", "TeamRoster", "TASK_STORE_TABLES",
+]

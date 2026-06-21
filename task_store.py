@@ -1,12 +1,30 @@
-"""SQLite-backed persistence for background tasks, conversation references, and team roster."""
+"""Persistence for background tasks, conversation references, and team roster.
 
-import json
+Migrated from raw aiosqlite to async SQLAlchemy so the SAME code runs on:
+  - SQLite (tests/local — when no DATABASE_URL is set), and
+  - the in-boundary Cloud SQL Postgres instance `samurai-db` (prod — DATABASE_URL).
+
+The public API (TaskStore + get_task_store + the dict-returning methods) is
+unchanged, so scheduler.py / tools/background_tasks.py / app.py are untouched.
+``TaskStore(db_path)`` still accepts a SQLite file path (used by the test suite);
+``get_task_store()`` uses DATABASE_URL in prod, falling back to the SQLite file.
+"""
+
 import logging
 import os
 import time
 import uuid
 
-import aiosqlite
+from sqlalchemy import delete, select, update
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from db.models import (
+    Base,
+    ConversationRef,
+    TASK_STORE_TABLES,
+    Task,
+    TeamRoster,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,76 +34,31 @@ TASK_DB_PATH = os.path.join(DATA_DIR, "tasks.sqlite")
 _task_store = None
 
 
+def _row_to_dict(obj) -> dict:
+    """Map an ORM row to the plain dict shape the old aiosqlite store returned."""
+    return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+
+
 class TaskStore:
-    """Manages background tasks, conversation references, and team roster in SQLite."""
+    """Background tasks, conversation references, and team roster (async SQLAlchemy)."""
 
     def __init__(self, db_path: str):
+        # Accept either a SQLAlchemy URL (e.g. postgresql+asyncpg://…) or a plain
+        # SQLite file path (the historical constructor arg, used by tests).
         self.db_path = db_path
+        self._url = db_path if "://" in db_path else f"sqlite+aiosqlite:///{db_path}"
+        self._engine = None
+        self._sessionmaker: async_sessionmaker | None = None
 
     async def initialize(self) -> None:
-        """Create tables and indexes. Called once at startup."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("PRAGMA journal_mode=DELETE")
-
-            await db.execute(
-                """CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    user_name TEXT NOT NULL DEFAULT '',
-                    user_email TEXT NOT NULL DEFAULT '',
-                    user_timezone TEXT NOT NULL DEFAULT '',
-                    conversation_id TEXT NOT NULL,
-                    task_type TEXT NOT NULL,
-                    prompt TEXT NOT NULL,
-                    cron_expression TEXT,
-                    run_at TEXT,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at REAL NOT NULL,
-                    last_run_at REAL,
-                    next_run_at TEXT,
-                    run_count INTEGER NOT NULL DEFAULT 0,
-                    error_count INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    max_failures INTEGER NOT NULL DEFAULT 3,
-                    locked_until REAL NOT NULL DEFAULT 0
-                )"""
+        """Create the engine + the task-store tables. Idempotent."""
+        if self._engine is None:
+            self._engine = create_async_engine(self._url, future=True)
+            self._sessionmaker = async_sessionmaker(self._engine, expire_on_commit=False)
+        async with self._engine.begin() as conn:
+            await conn.run_sync(
+                lambda c: Base.metadata.create_all(c, tables=TASK_STORE_TABLES, checkfirst=True)
             )
-            await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id)"
-            )
-            await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
-            )
-
-            # Migration: add locked_until column to existing tables
-            try:
-                await db.execute(
-                    "ALTER TABLE tasks ADD COLUMN locked_until REAL NOT NULL DEFAULT 0"
-                )
-            except Exception:
-                pass  # Column already exists
-
-            await db.execute(
-                """CREATE TABLE IF NOT EXISTS conversation_refs (
-                    conversation_id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    ref_json TEXT NOT NULL,
-                    updated_at REAL NOT NULL
-                )"""
-            )
-
-            await db.execute(
-                """CREATE TABLE IF NOT EXISTS team_roster (
-                    email TEXT PRIMARY KEY,
-                    teams_id TEXT NOT NULL,
-                    display_name TEXT NOT NULL DEFAULT '',
-                    service_url TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL DEFAULT '',
-                    updated_at REAL NOT NULL
-                )"""
-            )
-
-            await db.commit()
         logger.info("Task store initialized: %s", self.db_path)
 
     # ── Task CRUD ──────────────────────────────────────────────────────
@@ -103,144 +76,88 @@ class TaskStore:
         run_at: str | None = None,
         max_failures: int = 3,
     ) -> dict:
-        """Insert a new task. Returns the full task dict."""
         task_id = str(uuid.uuid4())[:8]
-        now = time.time()
-        task = {
-            "id": task_id,
-            "user_id": user_id,
-            "user_name": user_name,
-            "user_email": user_email,
-            "user_timezone": user_timezone,
-            "conversation_id": conversation_id,
-            "task_type": task_type,
-            "prompt": prompt,
-            "cron_expression": cron_expression,
-            "run_at": run_at,
-            "status": "active",
-            "created_at": now,
-            "last_run_at": None,
-            "next_run_at": None,
-            "run_count": 0,
-            "error_count": 0,
-            "last_error": None,
-            "max_failures": max_failures,
-        }
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """INSERT INTO tasks
-                   (id, user_id, user_name, user_email, user_timezone,
-                    conversation_id, task_type, prompt, cron_expression,
-                    run_at, status, created_at, run_count, error_count, max_failures)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    task_id,
-                    user_id,
-                    user_name,
-                    user_email,
-                    user_timezone,
-                    conversation_id,
-                    task_type,
-                    prompt,
-                    cron_expression,
-                    run_at,
-                    "active",
-                    now,
-                    0,
-                    0,
-                    max_failures,
-                ),
-            )
-            await db.commit()
+        obj = Task(
+            id=task_id,
+            user_id=user_id,
+            user_name=user_name,
+            user_email=user_email,
+            user_timezone=user_timezone,
+            conversation_id=conversation_id,
+            task_type=task_type,
+            prompt=prompt,
+            cron_expression=cron_expression,
+            run_at=run_at,
+            status="active",
+            created_at=time.time(),
+            run_count=0,
+            error_count=0,
+            max_failures=max_failures,
+            locked_until=0.0,
+        )
+        async with self._sessionmaker() as session:
+            session.add(obj)
+            await session.commit()
         logger.info("Created task %s: %s", task_id, prompt[:60])
-        return task
+        return _row_to_dict(obj)
 
     async def get_task(self, task_id: str) -> dict | None:
-        """Fetch a single task by ID."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
-            row = await cursor.fetchone()
-            return dict(row) if row else None
+        async with self._sessionmaker() as session:
+            obj = await session.get(Task, task_id)
+            return _row_to_dict(obj) if obj else None
 
     async def list_tasks(
-        self,
-        user_id: str | None = None,
-        status: str | None = None,
+        self, user_id: str | None = None, status: str | None = None
     ) -> list[dict]:
-        """List tasks, optionally filtered by user and/or status."""
-        query = "SELECT * FROM tasks"
-        params: list = []
-        conditions: list[str] = []
+        stmt = select(Task)
         if user_id:
-            conditions.append("user_id = ?")
-            params.append(user_id)
+            stmt = stmt.where(Task.user_id == user_id)
         if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(query, params)
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            stmt = stmt.where(Task.status == status)
+        stmt = stmt.order_by(Task.created_at.desc())
+        async with self._sessionmaker() as session:
+            result = await session.execute(stmt)
+            return [_row_to_dict(o) for o in result.scalars().all()]
 
     async def update_task(self, task_id: str, **fields) -> bool:
-        """Update arbitrary fields on a task. Returns True if row existed."""
         if not fields:
             return False
-        set_clause = ", ".join(f"{k} = ?" for k in fields)
-        values = list(fields.values()) + [task_id]
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                f"UPDATE tasks SET {set_clause} WHERE id = ?", values
+        async with self._sessionmaker() as session:
+            result = await session.execute(
+                update(Task).where(Task.id == task_id).values(**fields)
             )
-            await db.commit()
-            return cursor.rowcount > 0
+            await session.commit()
+            return result.rowcount > 0
 
     async def delete_task(self, task_id: str) -> bool:
-        """Hard-delete a task by ID."""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            await db.commit()
-            return cursor.rowcount > 0
+        async with self._sessionmaker() as session:
+            result = await session.execute(delete(Task).where(Task.id == task_id))
+            await session.commit()
+            return result.rowcount > 0
 
     async def try_lock(self, task_id: str, lock_duration: float = 300) -> bool:
-        """Atomically try to lock a task for execution.
-
-        Returns True if lock acquired, False if another instance already holds it.
-        Uses an atomic UPDATE ... WHERE to prevent race conditions.
-        """
+        """Atomically lock a task for execution (UPDATE ... WHERE locked_until < now)."""
         now = time.time()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "UPDATE tasks SET locked_until = ? WHERE id = ? AND locked_until < ?",
-                (now + lock_duration, task_id, now),
+        async with self._sessionmaker() as session:
+            result = await session.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.locked_until < now)
+                .values(locked_until=now + lock_duration)
             )
-            await db.commit()
-            return cursor.rowcount > 0
+            await session.commit()
+            return result.rowcount > 0
 
     async def unlock(self, task_id: str) -> None:
-        """Release the execution lock on a task."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE tasks SET locked_until = 0 WHERE id = ?", (task_id,)
+        async with self._sessionmaker() as session:
+            await session.execute(
+                update(Task).where(Task.id == task_id).values(locked_until=0)
             )
-            await db.commit()
+            await session.commit()
 
     async def record_run(
-        self,
-        task_id: str,
-        success: bool,
-        error_message: str | None = None,
+        self, task_id: str, success: bool, error_message: str | None = None
     ) -> dict | None:
-        """After execution: update run_count, handle errors, auto-pause if needed.
-
-        Returns updated task dict, or None if task not found.
-        """
+        """After execution: update run_count, handle errors, auto-pause if needed."""
         task = await self.get_task(task_id)
         if not task:
             return None
@@ -272,34 +189,27 @@ class TaskStore:
     # ── Conversation References ────────────────────────────────────────
 
     async def save_conversation_ref(
-        self,
-        conversation_id: str,
-        user_id: str,
-        ref_json: str,
+        self, conversation_id: str, user_id: str, ref_json: str
     ) -> None:
-        """Upsert a serialized ConversationReference."""
-        now = time.time()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """INSERT INTO conversation_refs (conversation_id, user_id, ref_json, updated_at)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(conversation_id) DO UPDATE SET
-                       user_id = excluded.user_id,
-                       ref_json = excluded.ref_json,
-                       updated_at = excluded.updated_at""",
-                (conversation_id, user_id, ref_json, now),
+        async with self._sessionmaker() as session:
+            await session.merge(
+                ConversationRef(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    ref_json=ref_json,
+                    updated_at=time.time(),
+                )
             )
-            await db.commit()
+            await session.commit()
 
     async def get_conversation_ref(self, conversation_id: str) -> str | None:
-        """Load serialized ConversationReference JSON. Returns None if not found."""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT ref_json FROM conversation_refs WHERE conversation_id = ?",
-                (conversation_id,),
+        async with self._sessionmaker() as session:
+            result = await session.execute(
+                select(ConversationRef.ref_json).where(
+                    ConversationRef.conversation_id == conversation_id
+                )
             )
-            row = await cursor.fetchone()
-            return row[0] if row else None
+            return result.scalar_one_or_none()
 
     # ── Team Roster ────────────────────────────────────────────────────
 
@@ -311,48 +221,45 @@ class TaskStore:
         service_url: str,
         tenant_id: str = "",
     ) -> None:
-        """Upsert a team member into the roster."""
-        now = time.time()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """INSERT INTO team_roster (email, teams_id, display_name, service_url, tenant_id, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(email) DO UPDATE SET
-                       teams_id = excluded.teams_id,
-                       display_name = excluded.display_name,
-                       service_url = excluded.service_url,
-                       tenant_id = excluded.tenant_id,
-                       updated_at = excluded.updated_at""",
-                (email.lower(), teams_id, display_name, service_url, tenant_id, now),
+        async with self._sessionmaker() as session:
+            await session.merge(
+                TeamRoster(
+                    email=email.lower(),
+                    teams_id=teams_id,
+                    display_name=display_name,
+                    service_url=service_url,
+                    tenant_id=tenant_id,
+                    updated_at=time.time(),
+                )
             )
-            await db.commit()
+            await session.commit()
 
     async def get_team_member(self, email: str) -> dict | None:
-        """Look up a team member by email."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM team_roster WHERE email = ?", (email.lower(),)
-            )
-            row = await cursor.fetchone()
-            return dict(row) if row else None
+        async with self._sessionmaker() as session:
+            obj = await session.get(TeamRoster, email.lower())
+            return _row_to_dict(obj) if obj else None
 
     async def list_team_members(self) -> list[dict]:
-        """Return all known team members."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM team_roster ORDER BY display_name"
+        async with self._sessionmaker() as session:
+            result = await session.execute(
+                select(TeamRoster).order_by(TeamRoster.display_name)
             )
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            return [_row_to_dict(o) for o in result.scalars().all()]
 
 
 async def get_task_store() -> TaskStore:
-    """Get or create the singleton TaskStore."""
+    """Get or create the singleton TaskStore.
+
+    Uses DATABASE_URL (Postgres) in prod; falls back to the SQLite file on /data
+    when DATABASE_URL is unset (tests/local).
+    """
     global _task_store
     if _task_store is None:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        _task_store = TaskStore(TASK_DB_PATH)
+        url = os.environ.get("DATABASE_URL")
+        if url:
+            _task_store = TaskStore(url)
+        else:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            _task_store = TaskStore(TASK_DB_PATH)
         await _task_store.initialize()
     return _task_store
