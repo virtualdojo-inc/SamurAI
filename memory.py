@@ -27,6 +27,7 @@ USER_NAMESPACE = ("memories", "{user_id}")  # Personal preferences — per user
 
 # Singletons
 _store = None
+_store_pool = None
 _checkpointer = None
 _checkpoint_conn = None
 _checkpoint_pool = None
@@ -88,25 +89,66 @@ def _create_extractor_llm():
 # ── Memory Store (InMemoryStore + SQLite persistence) ─────────────────
 
 
-def get_memory_store():
-    """Get the singleton LangGraph InMemoryStore with embedding search."""
-    global _store
-    if _store is None:
-        from langgraph.store.memory import InMemoryStore
+async def get_memory_store():
+    """Get the singleton memory store with embedding search.
 
-        _store = InMemoryStore(
-            index={
-                # text-embedding-005 on Vertex returns 768-dim vectors by default.
-                "dims": 768,
-                "embed": _create_embed_fn(),
-            }
-        )
-        # Load persisted memories from SQLite
-        _load_persisted_memories(_store)
-        logger.info("LangMem memory store ready (InMemoryStore + SQLite backup)")
-        # print() mirrors the logger line so it's guaranteed to surface in
-        # Cloud Run's captured stdout (some logger handlers silently drop).
-        print("[memory] store ready", flush=True)
+    Postgres (pgvector via AsyncPostgresStore) when DATABASE_URL is set — memories
+    + embeddings live IN the DB, shared across instances, with NO startup load and
+    NO re-embedding (this removes the multi-minute cold start the InMemoryStore had
+    from re-embedding thousands of memories off GCS-FUSE SQLite). Falls back to the
+    InMemoryStore + SQLite backup (tests/local, no DATABASE_URL).
+
+    Async because the Postgres store needs an async connection pool + setup; all
+    callers use ``await store.asearch(...)`` which works on both backends.
+    """
+    global _store, _store_pool
+    if _store is not None:
+        return _store
+
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        try:
+            from langgraph.store.postgres.aio import AsyncPostgresStore
+            from psycopg.rows import dict_row
+            from psycopg_pool import AsyncConnectionPool
+
+            conninfo = database_url.replace("postgresql+asyncpg://", "postgresql://")
+            _store_pool = AsyncConnectionPool(
+                conninfo=conninfo,
+                min_size=1,
+                max_size=5,
+                open=False,
+                kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
+            )
+            await _store_pool.open()
+            _store = AsyncPostgresStore(
+                _store_pool,
+                index={"dims": 768, "embed": _create_embed_fn()},
+            )
+            await _store.setup()
+            logger.info("Postgres memory store ready (pgvector, no startup load)")
+            print("[memory] postgres store ready", flush=True)
+            return _store
+        except Exception as e:
+            logger.warning("Postgres store unavailable, falling back to InMemoryStore: %s", e)
+            print(f"[memory] postgres store failed: {type(e).__name__}: {e}", flush=True)
+            _store = None
+
+    from langgraph.store.memory import InMemoryStore
+
+    _store = InMemoryStore(
+        index={
+            # text-embedding-005 on Vertex returns 768-dim vectors by default.
+            "dims": 768,
+            "embed": _create_embed_fn(),
+        }
+    )
+    # Load persisted memories from SQLite (fallback path only).
+    _load_persisted_memories(_store)
+    logger.info("LangMem memory store ready (InMemoryStore + SQLite backup)")
+    # print() mirrors the logger line so it's guaranteed to surface in
+    # Cloud Run's captured stdout (some logger handlers silently drop).
+    print("[memory] store ready", flush=True)
     return _store
 
 
@@ -139,11 +181,19 @@ def _load_persisted_memories(store):
 
 
 def persist_memories():
-    """Flush the InMemoryStore to SQLite for persistence across restarts."""
+    """Flush the InMemoryStore to SQLite for persistence across restarts.
+
+    No-op for the Postgres store (writes land in the DB immediately) and when
+    no store has been created yet.
+    """
     import sqlite3
 
     if _store is None:
         return
+    from langgraph.store.memory import InMemoryStore
+
+    if not isinstance(_store, InMemoryStore):
+        return  # Postgres-backed store persists on write; nothing to flush.
 
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -248,11 +298,11 @@ async def get_checkpointer():
 # ── LangMem Memory Tools ─────────────────────────────────────────────
 
 
-def create_memory_tools(user_id: str) -> list:
+async def create_memory_tools(user_id: str) -> list:
     """Create LangMem memory tools for all three memory tiers."""
     from langmem import create_manage_memory_tool, create_search_memory_tool
 
-    store = get_memory_store()
+    store = await get_memory_store()
     return [
         # User memory — personal preferences, per-individual
         create_manage_memory_tool(
@@ -311,7 +361,7 @@ def create_memory_tools(user_id: str) -> list:
 # ── Background Memory Extraction ─────────────────────────────────────
 
 
-def get_background_extractor():
+async def get_background_extractor():
     """Get the singleton background memory extractor.
 
     Automatically extracts and consolidates memories from conversations
@@ -321,7 +371,7 @@ def get_background_extractor():
     if _background_executor is None:
         from langmem import create_memory_store_manager, ReflectionExecutor
 
-        store = get_memory_store()
+        store = await get_memory_store()
         manager = create_memory_store_manager(
             _create_extractor_llm(),
             namespace=USER_NAMESPACE,
@@ -347,7 +397,7 @@ def get_background_extractor():
     return _background_executor
 
 
-def get_core_extractor():
+async def get_core_extractor():
     """Get the singleton background extractor for core operational knowledge.
 
     Core memories are shared across ALL users (including future external users).
@@ -357,7 +407,7 @@ def get_core_extractor():
     if _core_executor is None:
         from langmem import create_memory_store_manager, ReflectionExecutor
 
-        store = get_memory_store()
+        store = await get_memory_store()
         manager = create_memory_store_manager(
             _create_extractor_llm(),
             namespace=CORE_NAMESPACE,
@@ -389,7 +439,7 @@ def get_core_extractor():
     return _core_executor
 
 
-def get_team_extractor():
+async def get_team_extractor():
     """Get the singleton background extractor for team knowledge.
 
     Team memories are shared within VirtualDojo but NOT with external users.
@@ -399,7 +449,7 @@ def get_team_extractor():
     if _team_executor is None:
         from langmem import create_memory_store_manager, ReflectionExecutor
 
-        store = get_memory_store()
+        store = await get_memory_store()
         manager = create_memory_store_manager(
             _create_extractor_llm(),
             namespace=TEAM_NAMESPACE,
@@ -449,11 +499,11 @@ async def retrieve_relevant_memories(user_id: str, query: str) -> str | None:
     Returns a formatted string with labeled sections, or None if nothing found.
     """
     try:
-        store = get_memory_store()
+        store = await get_memory_store()
 
-        core_results = store.search(CORE_NAMESPACE, query=query, limit=3)
-        team_results = store.search(TEAM_NAMESPACE, query=query, limit=3)
-        user_results = store.search(("memories", user_id), query=query, limit=3)
+        core_results = await store.asearch(CORE_NAMESPACE, query=query, limit=3)
+        team_results = await store.asearch(TEAM_NAMESPACE, query=query, limit=3)
+        user_results = await store.asearch(("memories", user_id), query=query, limit=3)
 
         sections = []
 
@@ -475,7 +525,7 @@ async def retrieve_relevant_memories(user_id: str, query: str) -> str | None:
         try:
             from tools.troubleshooting import retrieve_troubleshooting_patterns
 
-            ts = retrieve_troubleshooting_patterns(query, limit=3)
+            ts = await retrieve_troubleshooting_patterns(query, limit=3)
             if ts:
                 sections.append(ts)
                 # The formatter emits one leading "- " bullet per match.
