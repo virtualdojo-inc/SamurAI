@@ -45,12 +45,13 @@ def mock_llm():
 def test_static_tools_list(mock_llm):
     _, agent = mock_llm
     assert len(agent.STATIC_TOOLS) == len(agent.ALL_TOOLS)
-    assert len(agent.ALL_TOOLS) == 91  # Static tools (memory tools added per-user separately)
+    assert len(agent.ALL_TOOLS) == 94  # Static tools (memory tools added per-user separately)
     tool_names = {t.name for t in agent.STATIC_TOOLS}
     assert "query_cloud_logs" in tool_names
     assert "get_skill" in tool_names
     assert "read_knowledge" in tool_names
     assert "search_wiki" in tool_names
+    assert "get_tracker_diagnostics" in tool_names
     assert "list_cloud_run_services" in tool_names
     assert "check_gcp_metrics" in tool_names
     assert "github_list_prs" in tool_names
@@ -246,6 +247,24 @@ def test_select_tool_groups_investigate_not_loaded_for_simple(mock_llm):
         assert "investigate" not in names, f"investigate wrongly loaded for: {msg!r}"
 
 
+def test_select_tool_groups_fix_issue_loads_localization(mock_llm):
+    """The controlled issue-fix flow ('fix issue' / 'attempt a fix' / 'fix plan')
+    must load the read-only localization tools so SamurAI can build a brief."""
+    _, agent = mock_llm
+    for msg in [
+        "fix issue 123 in the data service",
+        "attempt a fix for issue #5",
+        "create the fix plan for issue 9",
+    ]:
+        names = {t.name for t in agent._select_tool_groups(msg)}
+        assert "sync_repo" in names, f"sync_repo not loaded for: {msg!r}"
+        assert "search_repo_code" in names, f"search_repo_code not loaded for: {msg!r}"
+        assert "investigate" in names, f"investigate not loaded for: {msg!r}"
+        assert (
+            "github_search_issues" in names
+        ), f"github_search_issues not loaded for: {msg!r}"
+
+
 def test_select_tool_groups_social(mock_llm):
     """Social media query should load social tools."""
     _, agent = mock_llm
@@ -378,6 +397,15 @@ def test_needs_pro_model_for_oscal(mock_llm):
     assert agent._needs_pro_model([HumanMessage(content="render PDF of the SSP")])
     assert agent._needs_pro_model([HumanMessage(content="propose edit to the IR plan")])
     assert agent._needs_pro_model([HumanMessage(content="look up control AC-2")])
+
+
+def test_needs_pro_model_for_fix_issue(mock_llm):
+    """Controlled issue-fix phrasings should route to the Pro model."""
+    _, agent = mock_llm
+    from langchain_core.messages import HumanMessage
+
+    assert agent._needs_pro_model([HumanMessage(content="fix issue 123")])
+    assert agent._needs_pro_model([HumanMessage(content="attempt a fix for issue 5")])
 
 
 def test_needs_pro_model_for_troubleshooting(mock_llm):

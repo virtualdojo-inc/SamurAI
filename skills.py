@@ -22,7 +22,9 @@ Skills are plain files, so the nightly self-improvement pipeline can tune them
 from __future__ import annotations
 
 import logging
+import os
 import re
+import time
 from pathlib import Path
 
 import yaml
@@ -38,37 +40,46 @@ _NAME_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 _RESERVED_WORDS = ("anthropic", "claude")
 _MAX_DESCRIPTION = 1024
 
+# Editable skills live in the in-boundary bucket at this prefix. Chosen
+# deliberately: it sits UNDER the `support/` scope (so the runtime SA's existing
+# conditioned read+write grant covers it — verified against live IAM) but is
+# OUTSIDE the compile's source prefix (`support/raw/`) and the wiki's served
+# subdirs (`support/{wiki,playbooks,troubleshooting}`), so a bucket skill is
+# never harvested into a playbook nor served as a knowledge article. The guard
+# test in tests/test_skills.py enforces that separation.
+SKILLS_BUCKET_PREFIX = "support/skills/"
+# Off by default (kill switch, mirrors the KB_*_ENABLED pattern): keeps the bucket
+# read dormant until explicitly enabled, and keeps tests/local hermetic.
+_BUCKET_ENV = "SKILLS_BUCKET_ENABLED"
+_CACHE_TTL = 300  # seconds — pick up bucket edits without a redeploy (mirrors wiki.py)
+
 _catalog_cache: list[dict] | None = None
+_cache_ts: float = 0.0
 
 
-def _parse_skill_md(path: Path) -> dict | None:
-    """Parse a SKILL.md into ``{name, description, body, dir}``.
+def _parse_skill_text(text: str, source: str) -> dict | None:
+    """Parse SKILL.md *text* into ``{name, description, body, dir}`` or None.
 
+    ``source`` is a label for logging (a file path or a bucket object name).
     Returns ``None`` (and logs a warning) for any malformed skill so one bad
     file can never crash agent startup.
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        logger.warning("[skills] could not read %s (%s); skipping", path, e)
-        return None
-
     # Frontmatter is a leading '---' delimited block.
     if not text.lstrip().startswith("---"):
-        logger.warning("[skills] %s missing frontmatter; skipping", path)
+        logger.warning("[skills] %s missing frontmatter; skipping", source)
         return None
     parts = text.split("---", 2)
     if len(parts) < 3:
-        logger.warning("[skills] %s malformed frontmatter; skipping", path)
+        logger.warning("[skills] %s malformed frontmatter; skipping", source)
         return None
 
     try:
         meta = yaml.safe_load(parts[1]) or {}
     except yaml.YAMLError as e:
-        logger.warning("[skills] %s bad YAML frontmatter (%s); skipping", path, e)
+        logger.warning("[skills] %s bad YAML frontmatter (%s); skipping", source, e)
         return None
     if not isinstance(meta, dict):
-        logger.warning("[skills] %s frontmatter is not a mapping; skipping", path)
+        logger.warning("[skills] %s frontmatter is not a mapping; skipping", source)
         return None
 
     # `key:` with no value parses to None in YAML — coerce to "" so the
@@ -78,39 +89,103 @@ def _parse_skill_md(path: Path) -> dict | None:
     body = parts[2].strip()
 
     if not _NAME_RE.match(name) or any(w in name for w in _RESERVED_WORDS):
-        logger.warning("[skills] %s has invalid name %r; skipping", path, name)
+        logger.warning("[skills] %s has invalid name %r; skipping", source, name)
         return None
     if not description or len(description) > _MAX_DESCRIPTION:
-        logger.warning("[skills] %s has invalid/empty description; skipping", path)
+        logger.warning("[skills] %s has invalid/empty description; skipping", source)
         return None
 
-    return {"name": name, "description": description, "body": body, "dir": path.parent.name}
+    return {"name": name, "description": description, "body": body, "dir": source}
 
 
-def load_skill_catalog(force: bool = False) -> list[dict]:
-    """Load and cache all valid skills from :data:`SKILLS_DIR`."""
-    global _catalog_cache
-    if _catalog_cache is not None and not force:
-        return _catalog_cache
+def _parse_skill_md(path: Path) -> dict | None:
+    """Parse a repo SKILL.md file into ``{name, description, body, dir}``."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("[skills] could not read %s (%s); skipping", path, e)
+        return None
+    parsed = _parse_skill_text(text, str(path))
+    if parsed is not None:
+        parsed["dir"] = path.parent.name
+    return parsed
 
+
+def _load_repo_skills() -> list[dict]:
+    """Skills committed to the repo under ``skills/<name>/SKILL.md``."""
     skills: list[dict] = []
     if SKILLS_DIR.is_dir():
         for skill_md in sorted(SKILLS_DIR.glob("*/SKILL.md")):
             parsed = _parse_skill_md(skill_md)
             if parsed is not None:
                 skills.append(parsed)
+    return skills
 
-    # Guard against two skills declaring the same name.
-    seen: set[str] = set()
-    deduped: list[dict] = []
-    for s in skills:
-        if s["name"] in seen:
+
+def _bucket_skills_enabled() -> bool:
+    return os.environ.get(_BUCKET_ENV, "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _load_bucket_skills() -> list[dict]:
+    """Editable skills authored to the in-boundary bucket (``support/skills/``).
+
+    Read via the google-cloud-storage client (same in-boundary path as wiki.py).
+    Dormant unless ``SKILLS_BUCKET_ENABLED`` is set. Guarded: any failure (no
+    bucket, no creds, in tests) yields an empty list so the repo skills still
+    load — the bucket is additive, never required.
+    """
+    if not _bucket_skills_enabled():
+        return []
+    try:
+        from kb import storage  # lazy: avoids hard dep at import / in tests
+
+        items = storage.list_text(SKILLS_BUCKET_PREFIX)
+    except Exception as e:
+        logger.warning("[skills] bucket read failed (%s); using repo skills only", e)
+        return []
+
+    out: list[dict] = []
+    for path_name, text in items:
+        base = path_name.rsplit("/", 1)[-1].lower()
+        if base in ("index.md", ".keep") or not base.endswith(".md"):
+            continue
+        parsed = _parse_skill_text(text, path_name)
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
+def load_skill_catalog(force: bool = False) -> list[dict]:
+    """Load + cache skills: repo skills, with bucket skills overriding by name.
+
+    A bucket skill wins on a name clash so a chat-time edit (authored to
+    ``support/skills/``) takes effect without a redeploy. TTL-cached so bucket
+    edits are picked up within ``_CACHE_TTL`` seconds.
+    """
+    global _catalog_cache, _cache_ts
+    fresh = _catalog_cache is not None and (time.time() - _cache_ts) < _CACHE_TTL
+    if fresh and not force:
+        return _catalog_cache
+
+    # Repo first (dedup keep-first among repo files), then bucket overrides by name.
+    by_name: dict[str, dict] = {}
+    order: list[str] = []
+    for s in _load_repo_skills():
+        if s["name"] in by_name:
             logger.warning("[skills] duplicate skill name %r; keeping first", s["name"])
             continue
-        seen.add(s["name"])
-        deduped.append(s)
+        order.append(s["name"])
+        by_name[s["name"]] = s
+    for s in _load_bucket_skills():
+        if s["name"] not in by_name:
+            order.append(s["name"])
+        else:
+            logger.info("[skills] bucket overrides repo skill %r", s["name"])
+        by_name[s["name"]] = s
 
+    deduped = [by_name[n] for n in order]
     _catalog_cache = deduped
+    _cache_ts = time.time()
     logger.info(
         "[skills] loaded %d skills: %s", len(deduped), [s["name"] for s in deduped]
     )

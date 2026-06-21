@@ -92,6 +92,23 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
         )
         logger.info("Prompt self-tuning scheduled (in-boundary, eval-gated).")
 
+    # DH Tech Issue Tracker triage: pre-compute fact-grounded diagnoses for
+    # new/changed rows so they're ready when a team member engages. Read-only
+    # (never acts). Frequent during business hours — NOTE cron is UTC-only, so
+    # the default targets ~8am-5pm US-Central (M-F). Gated by TRACKER_TRIAGE_ENABLED.
+    from tracker_triage import triage_enabled
+
+    if triage_enabled():
+        _scheduler.add_job(
+            _run_tracker_triage,
+            CronTrigger.from_crontab(
+                os.environ.get("TRACKER_TRIAGE_CRON", "*/10 13-23 * * 1-5")
+            ),
+            id="tracker_triage",
+            replace_existing=True,
+        )
+        logger.info("Tracker triage scheduled (business hours UTC, read-only).")
+
     _scheduler.start()
     logger.info("Scheduler started with %d active tasks", len(tasks))
     return _scheduler
@@ -125,6 +142,16 @@ async def _run_tuning_cycle() -> None:
         await asyncio.to_thread(run_tuning_cycle)
     except Exception as e:  # never let a tuning run crash the scheduler
         logger.error("[selftune] cycle failed: %s: %s", type(e).__name__, e)
+
+
+async def _run_tracker_triage() -> None:
+    """Diagnose new/changed DH Tech Issue Tracker rows; park the results."""
+    from tracker_triage import run_triage_batch
+
+    try:
+        await run_triage_batch()
+    except Exception as e:  # never let a triage run crash the scheduler
+        logger.error("[tracker.triage] batch failed: %s: %s", type(e).__name__, e)
 
 
 def _register_job(task: dict) -> None:

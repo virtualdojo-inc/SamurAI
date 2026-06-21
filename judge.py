@@ -164,6 +164,9 @@ WRITE_TOOL_NAMES: frozenset[str] = frozenset({
     "edit_document",
     "edit_spreadsheet",
     "fill_spreadsheet_column",
+    # Skill authoring (writes to the in-boundary bucket support/skills/)
+    "save_skill",
+    "delete_skill",
 })
 
 
