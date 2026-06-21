@@ -50,6 +50,11 @@ def exists(path: str) -> bool:
     return _bucket().blob(path).exists()
 
 
+def delete(path: str) -> None:
+    """Delete the object at ``path``. Raises if it does not exist."""
+    _bucket().blob(path).delete()
+
+
 def list_paths(prefix: str) -> list[str]:
     """List object paths under ``prefix`` (full object names, not content)."""
     return [b.name for b in _bucket().list_blobs(prefix=prefix)]

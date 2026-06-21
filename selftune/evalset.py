@@ -69,6 +69,8 @@ WRITE_TOOLS = {
     "save_troubleshooting_step", "delete_troubleshooting_step",
     # self-improvement triggers (kick off CI / compile)
     "trigger_wiki_compile", "trigger_engineering_compile",
+    # skill authoring (writes support/skills/ in the in-boundary bucket)
+    "save_skill", "delete_skill",
 }
 
 # "Meta" lookup tools that are ALWAYS bound (core group) and don't resolve a task.

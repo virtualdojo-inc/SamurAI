@@ -51,6 +51,7 @@ from tools.troubleshooting import TROUBLESHOOTING_TOOLS
 from tools.file_handler import FILE_HANDLER_TOOLS
 from tools.smartsheet import SMARTSHEET_TOOLS
 from tools.self_improve import SELF_IMPROVE_TOOLS
+from tools.skill_authoring import SKILL_AUTHORING_TOOLS
 from tools.progress import (
     PROGRESS_TOOLS,
     clear_progress,
@@ -69,6 +70,10 @@ from verification import (
 )
 from skills import SKILL_TOOLS, skills_catalog_text
 from wiki import WIKI_TOOLS, knowledge_index_text
+from tracker_diagnostics import (
+    TRACKER_DIAGNOSTICS_TOOLS,
+    tracker_diagnostics_index_text,
+)
 from conversation_log import log_turn, log_support_chat
 from selftune.hints import learned_hints_text, wrap_hints
 
@@ -88,6 +93,9 @@ TOOL_GROUPS = {
             *PROGRESS_TOOLS,
             *SKILL_TOOLS,
             *WIKI_TOOLS,
+            # Read-only: serve pre-computed DH Tech Issue Tracker diagnoses.
+            # Always available so any team member gets the parked analysis.
+            *TRACKER_DIAGNOSTICS_TOOLS,
             # Background-task/scheduling tools are ALWAYS available: they're few,
             # high-value, and creating a task already requires approval. Keyword-
             # gating them previously hid them when users asked for recurring work
@@ -180,13 +188,18 @@ TOOL_GROUPS = {
         ],
     },
     "self_improve": {
-        "tools": SELF_IMPROVE_TOOLS,
+        "tools": SELF_IMPROVE_TOOLS + SKILL_AUTHORING_TOOLS,
         "keywords": [
             "improve yourself", "self improve", "self-improve",
             "learn from today", "update your knowledge", "update your skills",
             "compile your wiki", "learn from our chats", "learn from the chats",
             "learn the codebase", "learn the system", "update the system map",
             "engineering knowledge", "sync the system map", "study the repo",
+            # Skill authoring (save_skill / delete_skill — Devin/Cyrus only,
+            # judge-gated, write to support/skills/).
+            "skill", "edit skill", "create skill", "create a skill", "save skill",
+            "new skill", "update skill", "delete skill", "author a skill",
+            "write a skill", "add a skill",
         ],
     },
     "repo": {
@@ -204,6 +217,9 @@ TOOL_GROUPS = {
             "ground", "identify", "diagnose", "find the cause",
             "look at the", "check the source", "trace the",
             "fix the", "where is", "find where",
+            # Controlled issue-fix flow: load localization tools when asked to
+            # attempt/plan a fix for an issue (see the controlled-issue-fix skill).
+            "fix issue", "attempt a fix", "attempt the fix", "fix plan",
         ],
     },
 }
@@ -806,6 +822,9 @@ def _select_prompt_sections(message: str, hints_override: str | None = None) -> 
     index = knowledge_index_text()
     if index:
         parts.append(index)
+    tracker_index = tracker_diagnostics_index_text()
+    if tracker_index:
+        parts.append(tracker_index)
     # Learned operational guidance — the single mutable, self-tuned prompt layer
     # (selftune). Injected LAST so it refines, never overrides, the frozen core.
     # hints_override lets the self-tuning loop evaluate a candidate doc against
@@ -834,6 +853,7 @@ PRO_MODEL_KEYWORDS = [
     "traceback", "exception", "bug", "broken", "not working",
     "investigate", "diagnose", "analyze code", "code review",
     "what's wrong", "error in", "fix the", "failing",
+    "fix issue", "attempt a fix", "attempt the fix",
     # Operations & log analysis (added 2026-05 — Flash was being chosen
     # for the most common troubleshooting phrasings, hurting answer quality)
     "logs", "errors", "regression", "outage", "alert", "alerts",

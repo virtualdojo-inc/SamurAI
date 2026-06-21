@@ -1,0 +1,262 @@
+name: Controlled Fix (SamurAI · TDD · gated)
+
+# Controlled, bounded, observable bug-fix run — the hardened sibling of
+# autofix-bug.yml. Dispatched by SamurAI (gated by its fail-closed judge + a
+# deny-by-default workflow allowlist) AFTER a human-reviewed fix plan, OR by hand
+# during trust-build. It NEVER merges: it opens a DRAFT PR to `development`, which
+# is protected (required checks + code-owner review). The job is INERT unless the
+# CONTROLLED_FIX_ENABLED repo variable is 'true'.
+#
+# NOTE: workflow_dispatch workflows are only dispatchable once this file is on the
+# default branch (main). It is safe to merge to main while disabled — it does
+# nothing until the kill-switch var is set AND someone dispatches it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "GitHub issue number to fix"
+        required: true
+        type: string
+      brief:
+        description: "SamurAI localization brief (root-cause files, approach, reproduction). Repo source + issue text ONLY — never logs/CRM/PII."
+        required: true
+        type: string
+      max_files:
+        description: "Max files the fix may change"
+        required: true
+        type: number
+        default: 5
+      max_diff_lines:
+        description: "Max changed lines (added+removed) the fix may produce"
+        required: true
+        type: number
+        default: 150
+
+permissions:
+  contents: write       # push the bugfix branch
+  pull-requests: write  # open the draft PR
+  issues: write         # comment status on the issue
+
+jobs:
+  controlled-fix:
+    # KILL SWITCH — the whole pipeline is inert unless this is 'true'.
+    if: vars.CONTROLLED_FIX_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25   # hard wall-clock budget — failed runs cost ~4-5x; cap them
+    env:
+      BASE: development
+      ISSUE: ${{ github.event.inputs.issue_number }}
+      BRIEF: ${{ github.event.inputs.brief }}
+      MAX_FILES: ${{ github.event.inputs.max_files }}
+      MAX_DIFF_LINES: ${{ github.event.inputs.max_diff_lines }}
+      BRANCH: bugfix/issue-${{ github.event.inputs.issue_number }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: development
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-test.txt
+
+      - name: Capture pre-fix baseline
+        # Record which tests already fail on development so a pre-existing failure
+        # is never blamed on the fix (and a pre-existing pass is never our "win").
+        run: |
+          set +e
+          python -m pytest -q -p no:cacheprovider > /tmp/baseline.txt 2>&1
+          echo "BASELINE_EXIT=$?" >> "$GITHUB_ENV"
+          set -e
+          echo "::group::baseline tail"; tail -n 25 /tmp/baseline.txt; echo "::endgroup::"
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Create fix branch
+        run: |
+          git config user.name "samurai-dojo[bot]"
+          git config user.email "samurai-dojo[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+      - name: Build prompt (injection-safe)
+        # Inputs reach the script ONLY via env vars and python argv — never
+        # interpolated into the shell — so a hostile brief/issue body cannot
+        # inject commands (GitHub script-injection mitigation).
+        run: |
+          cat > /tmp/prompt_head.txt <<'PROMPT'
+          You are fixing a bug in virtualdojo-inc/virtualdojo. You are on a branch
+          created from `development`. Follow this TDD process strictly:
+
+          1. INVESTIGATE: read the files named in the brief; confirm the root cause.
+          2. TEST FIRST (Red): add failing regression tests that reproduce the bug.
+             - Put them in a class named TestIssue<ISSUE>Regression.
+             - ADD tests only. NEVER delete, skip, weaken, or relax existing tests;
+               the pipeline rejects the run if you do.
+          3. CONFIRM RED: run the new tests; verify they FAIL on the current code.
+          4. FIX (Green): implement the MINIMAL change. Keep it small and focused.
+          5. CONFIRM GREEN: new tests pass AND the full suite shows no new failures
+             vs the pre-fix baseline.
+          6. SELF-REVIEW: check the diff for security, edge cases, correctness.
+          7. COMMIT: git commit -m "fix: <desc> (closes #<ISSUE>)"
+
+          If the bug is already fixed, out of scope, or too risky, do NOT commit.
+          Instead write AUTOFIX_RESULT.md explaining what you found and why you stopped.
+          PROMPT
+          python - "$ISSUE" "$BRIEF" > /tmp/prompt.txt <<'PY'
+          import sys, pathlib
+          issue, brief = sys.argv[1], sys.argv[2]
+          head = pathlib.Path("/tmp/prompt_head.txt").read_text().replace("<ISSUE>", issue)
+          print(head)
+          print(f"\nGitHub issue #{issue}.\n")
+          print("SamurAI localization brief (authoritative starting point):")
+          print(brief)
+          PY
+
+      - name: Run Claude Code (bounded · pinned · scoped)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude -p \
+            --model claude-sonnet-4-6 \
+            --allowedTools "Edit,Write,Read,Glob,Grep,Bash(git:*),Bash(python -m pytest:*)" \
+            --max-turns 25 \
+            "$(cat /tmp/prompt.txt)"
+
+      - name: Detect outcome
+        id: outcome
+        run: |
+          if [ "$(git rev-list "$BASE"..HEAD --count)" -gt 0 ]; then
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ───────── GATES (run only when the agent committed a change) ─────────
+
+      - name: Gate · diff size (files + lines)
+        if: steps.outcome.outputs.committed == 'true'
+        run: |
+          FILES=$(git diff --name-only "$BASE"..HEAD | grep -vx 'AUTOFIX_RESULT.md' | grep -c . || true)
+          LINES=$(git diff --numstat "$BASE"..HEAD | awk '{a+=$1; d+=$2} END{print a+d+0}')
+          echo "changed files=$FILES (cap $MAX_FILES) · changed lines=$LINES (cap $MAX_DIFF_LINES)"
+          if [ "$FILES" -gt "$MAX_FILES" ]; then echo "::error::diff touches $FILES files > cap $MAX_FILES"; exit 1; fi
+          if [ "$LINES" -gt "$MAX_DIFF_LINES" ]; then echo "::error::diff changes $LINES lines > cap $MAX_DIFF_LINES"; exit 1; fi
+
+      - name: Gate · scope-guard (deny high-risk paths)
+        if: steps.outcome.outputs.committed == 'true'
+        run: |
+          # Defense-in-depth behind SamurAI's eligibility classifier: hard-deny the
+          # bug classes the classifier is supposed to refuse. Tune to repo layout.
+          BAD=$(git diff --name-only "$BASE"..HEAD | grep -iE \
+            '(\.vue$|\.scss$|\.css$|^frontend/|/migrations/|^alembic/|^\.github/|requirements.*\.txt$|package(-lock)?\.json$)' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::fix touches out-of-scope paths:"; echo "$BAD"; exit 1
+          fi
+
+      - name: Gate · secret-scan (added lines only)
+        if: steps.outcome.outputs.committed == 'true'
+        run: |
+          ADDED=$(git diff "$BASE"..HEAD --unified=0 | grep '^+' | grep -v '^+++' || true)
+          if echo "$ADDED" | grep -nE \
+            'AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9-]{20,}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'; then
+            echo "::error::possible secret in added lines"; exit 1
+          fi
+
+      - name: Gate · test integrity (add-only; no weakening)
+        if: steps.outcome.outputs.committed == 'true'
+        # Reject the run if any existing test was deleted or weakened — the core
+        # anti-gaming guard (an agent must not force green by gutting tests).
+        run: |
+          python - <<'PY'
+          import subprocess, re, sys
+          base = "development"
+          def sh(*a): return subprocess.run(a, capture_output=True, text=True).stdout
+          changed = [l for l in sh("git","diff","--name-only",f"{base}..HEAD").splitlines()
+                     if re.search(r'(^|/)(test_[^/]+|[^/]+_test)\.py$|(^|/)tests?/', l)]
+          def count_tests(ref, path):
+              blob = sh("git","show",f"{ref}:{path}")
+              return len(re.findall(r'^\s*def\s+test', blob, re.M))
+          failures = []
+          for path in changed:
+              existed = subprocess.run(["git","cat-file","-e",f"{base}:{path}"]).returncode == 0
+              if not existed:
+                  continue  # brand-new test file — allowed
+              before, after = count_tests(base, path), count_tests("HEAD", path)
+              if after < before:
+                  failures.append(f"{path}: test count {before} -> {after} (tests removed/weakened)")
+          if failures:
+              print("::error::test integrity violation:")
+              print("\n".join(failures)); sys.exit(1)
+          print("test integrity OK")
+          PY
+
+      - name: Gate · red→green (reproduction test must fail pre-fix, pass post-fix)
+        if: steps.outcome.outputs.committed == 'true'
+        # The strongest gate: prove the regression test actually reproduces the bug.
+        run: |
+          set -e
+          SRC=$(git diff --name-only "$BASE"..HEAD | grep -E '\.py$' \
+                | grep -vE '(^|/)(test_[^/]+|[^/]+_test)\.py$|(^|/)tests?/' || true)
+          K="TestIssue${ISSUE}Regression"
+          # 1) RED: revert source to baseline, keep the new tests, expect FAILURE.
+          if [ -n "$SRC" ]; then echo "$SRC" | xargs git checkout "$BASE" --; fi
+          set +e
+          python -m pytest -q -p no:cacheprovider -k "$K" > /tmp/red.txt 2>&1
+          RED=$?
+          set -e
+          echo "::group::red phase"; tail -n 25 /tmp/red.txt; echo "::endgroup::"
+          if [ "$RED" -eq 0 ]; then
+            echo "::error::regression test passed WITHOUT the fix — it does not reproduce the bug"; exit 1
+          fi
+          # restore the committed fix state (reverts the baseline checkout above)
+          git reset --hard HEAD
+          # 2) GREEN: with the fix, the regression test must pass.
+          python -m pytest -q -p no:cacheprovider -k "$K"
+
+      - name: Gate · full suite (no new failures vs baseline)
+        if: steps.outcome.outputs.committed == 'true'
+        run: python -m pytest -q -p no:cacheprovider
+
+      # ───────── OUTCOME ─────────
+
+      - name: Push branch + open DRAFT PR
+        if: steps.outcome.outputs.committed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push -u origin "$BRANCH"
+          gh pr create --draft --base "$BASE" --head "$BRANCH" \
+            --title "fix: controlled fix for #${ISSUE}" \
+            --body "$(cat <<EOF
+          ## Controlled fix for #${ISSUE}
+
+          Generated by SamurAI's **controlled** fixer (bounded run, all CI gates passed).
+
+          - [x] diff within caps (≤ ${MAX_FILES} files / ${MAX_DIFF_LINES} lines)
+          - [x] scope-guard + secret-scan
+          - [x] test integrity (add-only)
+          - [x] reproduction test red→green
+          - [x] full suite green
+
+          Closes #${ISSUE}
+
+          > Draft — human review + code-owner approval required before merge.
+          EOF
+          )"
+
+      - name: Report (no fix produced)
+        if: steps.outcome.outputs.committed == 'false'
+        run: |
+          echo "### Controlled fix: no fix produced for #${ISSUE}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f AUTOFIX_RESULT.md ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat AUTOFIX_RESULT.md >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

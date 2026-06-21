@@ -96,31 +96,20 @@ def smartsheet_list_sheets(modified_since: Optional[str] = None) -> dict:
     return {"total": data.get("totalCount", len(sheets)), "sheets": sheets}
 
 
-@tool
-def smartsheet_get_sheet(
+def get_sheet(
     sheet_id: str,
     max_rows: int = 100,
     column_names: Optional[list[str]] = None,
 ) -> dict:
     """Read rows from a Smartsheet sheet as compact {column: value} dicts.
 
-    Args:
-        sheet_id: The Smartsheet sheet ID as a STRING (from
-            smartsheet_list_sheets — pass it through exactly as returned).
-            Smartsheet sheet IDs are 16-digit 64-bit integers; passing them
-            as JSON numbers risks the LLM truncating the last few digits
-            into a 404. Always quote it.
-        max_rows: Maximum rows to return (default 100). The sheet may have more;
-            check `total_rows` in the response.
-        column_names: Optional list of column titles to include. If omitted, all
-            columns are returned. Use this to reduce token usage on wide sheets.
+    Plain (non-tool) entry point so in-process workers (e.g. the tracker-triage
+    pipeline) can read a sheet without routing through the LLM tool wrapper.
+    The ``smartsheet_get_sheet`` tool is a thin wrapper over this.
 
-    Returns:
-        A dict with `name`, `total_rows`, `columns` (list of titles in order),
-        and `rows` (list of {column_title: display_value, ...}). Each row
-        also includes `_row_id` (string — pass it through verbatim to
-        smartsheet_update_row) and `_row_number` (display position).
-        Empty cells are omitted from each row dict.
+    Returns a dict with ``name``, ``total_rows``, ``columns`` (titles in order),
+    and ``rows`` (list of {column_title: display_value, ..., _row_id, _row_number}).
+    Empty cells are omitted from each row dict.
     """
     sheet_id = str(sheet_id)
     params = {"exclude": "filteredOutRows,nonexistentCells"}
@@ -161,6 +150,35 @@ def smartsheet_get_sheet(
         "columns": titles_out,
         "rows": rows_out,
     }
+
+
+@tool
+def smartsheet_get_sheet(
+    sheet_id: str,
+    max_rows: int = 100,
+    column_names: Optional[list[str]] = None,
+) -> dict:
+    """Read rows from a Smartsheet sheet as compact {column: value} dicts.
+
+    Args:
+        sheet_id: The Smartsheet sheet ID as a STRING (from
+            smartsheet_list_sheets — pass it through exactly as returned).
+            Smartsheet sheet IDs are 16-digit 64-bit integers; passing them
+            as JSON numbers risks the LLM truncating the last few digits
+            into a 404. Always quote it.
+        max_rows: Maximum rows to return (default 100). The sheet may have more;
+            check `total_rows` in the response.
+        column_names: Optional list of column titles to include. If omitted, all
+            columns are returned. Use this to reduce token usage on wide sheets.
+
+    Returns:
+        A dict with `name`, `total_rows`, `columns` (list of titles in order),
+        and `rows` (list of {column_title: display_value, ...}). Each row
+        also includes `_row_id` (string — pass it through verbatim to
+        smartsheet_update_row) and `_row_number` (display position).
+        Empty cells are omitted from each row dict.
+    """
+    return get_sheet(sheet_id, max_rows=max_rows, column_names=column_names)
 
 
 @tool
