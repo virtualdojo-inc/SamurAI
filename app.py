@@ -742,10 +742,13 @@ async def health(req: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+from admin import handle_admin  # secured admin endpoint (fail-closed; allowlisted ops)
+
 app = web.Application()
 app.router.add_post("/api/messages", messages)
 app.router.add_get("/api/oauth/callback", oauth_callback)
 app.router.add_get("/health", health)
+app.router.add_post("/admin", handle_admin)
 
 
 async def on_startup(app_instance):
