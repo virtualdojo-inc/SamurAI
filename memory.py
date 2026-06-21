@@ -29,6 +29,7 @@ USER_NAMESPACE = ("memories", "{user_id}")  # Personal preferences — per user
 _store = None
 _checkpointer = None
 _checkpoint_conn = None
+_checkpoint_pool = None
 _background_executor = None
 _core_executor = None
 _team_executor = None
@@ -188,24 +189,59 @@ def persist_memories():
 
 
 async def get_checkpointer():
-    """Get or create the singleton SQLite checkpointer for LangGraph."""
-    global _checkpointer, _checkpoint_conn
-    if _checkpointer is None:
+    """Get or create the singleton LangGraph checkpointer.
+
+    Postgres (durable, shared across Cloud Run instances) when DATABASE_URL is
+    set — replacing the per-instance, ephemeral /tmp SQLite checkpointer that
+    couldn't survive instance recycling or load-balanced approval clicks. Falls
+    back to SQLite (tests/local, no DATABASE_URL), then in-memory as a last resort.
+    """
+    global _checkpointer, _checkpoint_conn, _checkpoint_pool
+    if _checkpointer is not None:
+        return _checkpointer
+
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
         try:
-            import aiosqlite
-            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            from psycopg.rows import dict_row
+            from psycopg_pool import AsyncConnectionPool
 
-            _checkpoint_conn = await aiosqlite.connect(CHECKPOINT_DB_PATH)
-            _checkpointer = AsyncSqliteSaver(_checkpoint_conn)
-            await _checkpointer.setup()
-            logger.info("SQLite checkpointer ready: %s", CHECKPOINT_DB_PATH)
-        except Exception as e:
-            logger.warning(
-                "SQLite checkpointer unavailable, falling back to in-memory: %s", e
+            # psycopg uses the bare postgresql:// scheme (not the SQLAlchemy
+            # +asyncpg form). AsyncPostgresSaver requires autocommit + dict rows.
+            conninfo = database_url.replace("postgresql+asyncpg://", "postgresql://")
+            _checkpoint_pool = AsyncConnectionPool(
+                conninfo=conninfo,
+                min_size=1,
+                max_size=5,
+                open=False,
+                kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
             )
-            from langgraph.checkpoint.memory import MemorySaver
+            await _checkpoint_pool.open()
+            _checkpointer = AsyncPostgresSaver(_checkpoint_pool)
+            await _checkpointer.setup()
+            logger.info("Postgres checkpointer ready (durable, shared)")
+            print("[memory] postgres checkpointer ready", flush=True)
+            return _checkpointer
+        except Exception as e:
+            logger.warning("Postgres checkpointer unavailable, falling back: %s", e)
+            print(f"[memory] postgres checkpointer failed: {type(e).__name__}: {e}", flush=True)
 
-            _checkpointer = MemorySaver()
+    try:
+        import aiosqlite
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        _checkpoint_conn = await aiosqlite.connect(CHECKPOINT_DB_PATH)
+        _checkpointer = AsyncSqliteSaver(_checkpoint_conn)
+        await _checkpointer.setup()
+        logger.info("SQLite checkpointer ready: %s", CHECKPOINT_DB_PATH)
+    except Exception as e:
+        logger.warning(
+            "SQLite checkpointer unavailable, falling back to in-memory: %s", e
+        )
+        from langgraph.checkpoint.memory import MemorySaver
+
+        _checkpointer = MemorySaver()
     return _checkpointer
 
 
