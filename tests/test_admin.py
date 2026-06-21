@@ -1,5 +1,6 @@
 """Tests for the secured admin endpoint (admin.py)."""
 import json
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -75,7 +76,27 @@ async def test_unknown_op_rejected(monkeypatch):
         _Req(headers={"Authorization": "Bearer k"}, body={"op": "rm_rf_slash"})
     )
     assert resp.status == 400
-    assert set(_body(resp)["allowed"]) == {"ping", "db_query", "logs", "migrate_data"}
+    assert set(_body(resp)["allowed"]) == {"ping", "db_query", "logs", "migrate_data", "chat"}
+
+
+async def test_chat_op_runs_agent(monkeypatch):
+    monkeypatch.setenv("SAMURAI_ADMIN_KEY", "k")
+    with patch("agent.run_agent", new_callable=AsyncMock, return_value="pong") as ra:
+        resp = await admin.handle_admin(
+            _Req(headers={"Authorization": "Bearer k"},
+                 body={"op": "chat", "args": {"message": "hi there"}})
+        )
+    assert resp.status == 200
+    assert _body(resp)["result"]["reply"] == "pong"
+    assert ra.call_args.kwargs["user_message"] == "hi there"
+
+
+async def test_chat_requires_message(monkeypatch):
+    monkeypatch.setenv("SAMURAI_ADMIN_KEY", "k")
+    resp = await admin.handle_admin(
+        _Req(headers={"Authorization": "Bearer k"}, body={"op": "chat", "args": {}})
+    )
+    assert "error" in _body(resp)["result"]
 
 
 # ── Read-only SQL guard (no DB needed — guard rejects before connecting) ──

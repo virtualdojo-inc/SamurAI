@@ -124,11 +124,33 @@ async def _op_migrate_data(args: dict) -> dict:
     return await migrate_run()
 
 
+async def _op_chat(args: dict) -> dict:
+    """Run the agent on a test message and return its reply (bypasses Teams).
+
+    For end-to-end verification (memory/Postgres/tools) without a real Teams
+    round-trip. Goes through the full agent graph — writes stay judge-gated.
+    """
+    message = (args.get("message") or "").strip()
+    if not message:
+        return {"error": "args.message is required"}
+    from agent import run_agent
+
+    reply = await run_agent(
+        user_message=message,
+        conversation_id=args.get("conversation_id", "admin-test"),
+        user_id=args.get("user_id", "admin"),
+        user_name=args.get("user_name", "Admin"),
+        user_email=args.get("user_email", "devin@virtualdojo.com"),
+    )
+    return {"reply": reply}
+
+
 _OPS = {
     "ping": _op_ping,
     "db_query": _op_db_query,
     "logs": _op_logs,
     "migrate_data": _op_migrate_data,
+    "chat": _op_chat,
 }
 
 
