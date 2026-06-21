@@ -33,4 +33,7 @@ asyncpg>=0.30
 alembic>=1.14
 pgvector>=0.4
 langgraph-checkpoint-postgres>=2.0
+# psycopg[binary] bundles libpq — plain psycopg has no libpq in the container
+# ("no pq wrapper available"), which breaks the pgvector store + checkpointer.
+psycopg[binary]>=3.1
 PyYAML>=6.0
