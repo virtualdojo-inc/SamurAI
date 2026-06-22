@@ -68,6 +68,23 @@ async def _keep_typing(turn_context: TurnContext, stop_event: asyncio.Event):
             pass
 
 
+def _clean_user_text(activity) -> str:
+    """Message text with the bot's own @mention removed (group chats / channels).
+    In 1:1 there is no mention so the text is unchanged; defensive fallback for
+    non-Teams / mock activities where mention parsing isn't available."""
+    try:
+        cleaned = TurnContext.remove_recipient_mention(activity)
+    except Exception:
+        cleaned = None
+    return (cleaned or getattr(activity, "text", "") or "").strip()
+
+
+def _is_group_scope(activity) -> bool:
+    """True for Teams group chats and channels (vs a personal 1:1 chat)."""
+    ct = getattr(getattr(activity, "conversation", None), "conversation_type", "") or ""
+    return ct in ("groupChat", "channel")
+
+
 async def on_message(turn_context: TurnContext):
     activity_type = turn_context.activity.type
     activity_name = getattr(turn_context.activity, "name", None)
@@ -97,8 +114,9 @@ async def on_message(turn_context: TurnContext):
             await handle_card_action(turn_context, turn_context.activity.value)
             return
 
-    user_message = turn_context.activity.text or ""
+    user_message = _clean_user_text(turn_context.activity)
     conversation_id = turn_context.activity.conversation.id
+    is_group = _is_group_scope(turn_context.activity)
 
     # Handle file attachments — download, parse, and append content to message
     file_context = ""
@@ -185,13 +203,16 @@ async def on_message(turn_context: TurnContext):
     if not user_email or not user_email.lower().endswith("@virtualdojo.com"):
         stop_typing.set()
         await typing_task
-        await turn_context.send_activity(
-            Activity(
-                type="message",
-                text="Sorry, SamurAI is only available to VirtualDojo team members.",
+        # In a group chat / channel, stay silent for a non-team sender — posting a
+        # rejection into a shared conversation is noise. Only reply in a 1:1 chat.
+        if not is_group:
+            await turn_context.send_activity(
+                Activity(
+                    type="message",
+                    text="Sorry, SamurAI is only available to VirtualDojo team members.",
+                )
             )
-        )
-        print(f"[on_message] BLOCKED unauthorized user: {user_email or user_id}", flush=True)
+        print(f"[on_message] BLOCKED unauthorized user: {user_email or user_id} group={is_group}", flush=True)
         return
 
     # Persist conversation reference for proactive messaging (background tasks)
