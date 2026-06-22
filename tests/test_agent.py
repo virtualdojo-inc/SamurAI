@@ -45,11 +45,12 @@ def mock_llm():
 def test_static_tools_list(mock_llm):
     _, agent = mock_llm
     assert len(agent.STATIC_TOOLS) == len(agent.ALL_TOOLS)
-    assert len(agent.ALL_TOOLS) == 96  # Static tools (memory tools added per-user separately)
+    assert len(agent.ALL_TOOLS) == 97  # Static tools (memory tools added per-user separately)
     tool_names = {t.name for t in agent.STATIC_TOOLS}
     assert "query_cloud_logs" in tool_names
     assert "run_code" in tool_names
     assert "find_prior_script" in tool_names
+    assert "analyze_loom_video" in tool_names
     assert "get_skill" in tool_names
     assert "read_knowledge" in tool_names
     assert "search_wiki" in tool_names
@@ -118,6 +119,23 @@ def test_static_tools_list(mock_llm):
     assert "github_close_issue" in tool_names
     # GitHub edit issue
     assert "github_edit_issue" in tool_names
+
+
+def test_every_static_tool_has_a_friendly_label():
+    """Every bound tool needs an explicit Teams status label in run_agent's
+    _tool_labels, so a tool call shows a friendly name (not a humanized
+    fallback). Add a label to _tool_labels whenever you add a tool."""
+    import inspect
+    import re
+
+    import agent
+
+    src = inspect.getsource(agent)
+    block = src[src.index("_tool_labels = {"):]
+    block = block[: block.index("\n    }")]
+    labeled = set(re.findall(r'"([a-z0-9_]+)":', block))
+    missing = sorted(t.name for t in agent.ALL_TOOLS if t.name not in labeled)
+    assert not missing, f"tools missing a friendly label in _tool_labels: {missing}"
 
 
 def test_system_prompt_defined(mock_llm):
