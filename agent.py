@@ -1479,6 +1479,8 @@ async def run_agent(
         "analyze_loom_video": "Watching the Loom video",
         # Tenant data (support grants)
         "list_tenant_support_grants": "Listing tenant support grants",
+        "describe_tenant_schema": "Reading the tenant's schema",
+        "read_tenant_records": "Reading the tenant's records",
     }
 
     final_messages = []

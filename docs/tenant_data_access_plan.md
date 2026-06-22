@@ -1,5 +1,52 @@
 # SamurAI Tenant-Data Read Access via Support Grants — Plan
 
+## ✅ IMPLEMENTED DESIGN (SSO model — supersedes the API-key plan below)
+
+The shipped design (`tools/tenant_data.py`) **authenticates as the signed-in SamurAI user
+via their VirtualDojo SSO token, not a service/superadmin API key.** Why: an `sk-` API key
+resolves a *tenant* but not a *user*, so `get_current_user` (`deps.py`) 403s it. The SSO
+token is a standard JWT minted by `create_access_token(subject=user_id, tenant_id, scopes)`
+— and `get_current_user` just decodes any `SECRET_KEY`-signed JWT with `sub`+`exp`, so the
+**same SSO token authenticates `/api/v1` REST.** (Verified live: signed in as Superadmin
+Tenant → `GET /impersonation/my-grants` returned 6 active grants.)
+
+**Authorization = SSO sign-in + the user's explicit in-chat request.** The user signing in
+and asking IS the direct authorization (Devin confirmed SSO is sufficient), and reads run
+under *their* identity + `system_administrator` rights. **Never autonomous:** a background
+task has no signed-in user → `_signed_in_token()` returns the SSO prompt and never reaches
+the backend (covered by a test). No separate per-read approval card — the SSO model makes
+the human the load-bearing control. (A per-read card is an available future hardening.)
+
+**Tools (per-user factory `create_tenant_data_tools(user_id)`, gated `SAMURAI_TENANT_DATA_ENABLED`):**
+- `list_tenant_support_grants` → `GET /api/v1/impersonation/my-grants` (Phase 1, validated live).
+- `describe_tenant_schema(grant_id, object_name?)` → start a 15-min impersonation session as
+  the granting user (`POST /impersonation/start/{grant_id}`) → `GET /schema/objects[/{object}/schema]`.
+- `read_tenant_records(grant_id, object_name, limit, skip)` → start session → `GET /objects/{object}/records`.
+
+**Read-only by construction:** data + schema are GET-only and `confirm_write` is never sent.
+The *only* non-GET verb is impersonation session start/end (`_vdj_post`, asserted to
+`/impersonation/` paths) — it mints/ends a read token and mutates no customer data; the
+backend audits the session start into the customer tenant. Per-read audit (metadata only,
+never row contents): `[samurai.tenant_data_access]`.
+
+**#2 — env consistency (deploy requirement):** the SSO token only validates against
+`/api/v1` if the user signed in against the SAME backend that serves `VIRTUALDOJO_API_URL`
+(shared `SECRET_KEY`). So to enable in prod: set `VIRTUALDOJO_API_URL=https://app.virtualdojo.com`
+**and** point the bot's VirtualDojo SSO (`VIRTUALDOJO_MCP_URL`) at the same host
+(`https://app.virtualdojo.com/mcp/v1`). Today the CRM SSO defaults to **dev** — moving it to
+prod also moves the `virtualdojo_crm` tool to prod (a product decision to confirm).
+`_warn_if_sso_env_mismatch()` logs a loud hint if the hosts diverge.
+
+**⚠ Residency gate before enabling record reads in prod:** record rows may be customer
+PII/CUI. Reads are never fed to LangMem/KB and only metadata is logged, but the serving chat
+model is on the Vertex **global** endpoint — summarizing raw rows through it is a residency
+item to resolve / get ATO sign-off on. `describe_tenant_schema` (names only) is low-risk;
+`read_tenant_records` (rows) is what the residency decision gates. Code ships gated **off**.
+
+---
+
+## Original plan (API-key model — kept for reference; superseded above)
+
 Goal: let SamurAI read a customer tenant's data/schema **read-only**, via VirtualDojo's
 existing support-grant mechanism, authenticating as the **superadmin/support tenant**
 with a superadmin API key — and **only when a SamurAI user explicitly authorizes that
