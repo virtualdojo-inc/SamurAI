@@ -145,6 +145,60 @@ async def test_on_message_blocks_non_virtualdojo_user(patched_app):
     assert any("VirtualDojo" in t for t in sent_texts)
 
 
+# --- Group-chat support ---
+
+
+def test_clean_user_text_strips_bot_mention(patched_app):
+    from botbuilder.schema import Activity
+
+    # Built the way Teams actually sends a group-chat @mention (deserialized JSON).
+    act = Activity().deserialize({
+        "type": "message",
+        "text": "<at>SamurAI</at> show logs",
+        "recipient": {"id": "bot-1", "name": "SamurAI"},
+        "entities": [{
+            "type": "mention",
+            "text": "<at>SamurAI</at>",
+            "mentioned": {"id": "bot-1", "name": "SamurAI"},
+        }],
+    })
+    assert patched_app._clean_user_text(act) == "show logs"
+
+
+def test_clean_user_text_falls_back_on_plain_text(patched_app):
+    act = MagicMock()  # mock entities aren't iterable -> falls back to .text
+    act.text = "show logs"
+    assert patched_app._clean_user_text(act) == "show logs"
+
+
+def test_is_group_scope(patched_app):
+    def _act(ct):
+        a = MagicMock()
+        a.conversation.conversation_type = ct
+        return a
+    assert patched_app._is_group_scope(_act("groupChat")) is True
+    assert patched_app._is_group_scope(_act("channel")) is True
+    assert patched_app._is_group_scope(_act("personal")) is False
+
+
+@pytest.mark.asyncio
+async def test_on_message_silent_in_group_for_unauthorized(patched_app):
+    """In a group chat, an unauthorized sender gets no reply (no noise)."""
+    ctx, member = _make_turn_context("<at>SamurAI</at> show logs", email="guest@gmail.com")
+    ctx.activity.conversation.conversation_type = "groupChat"
+    with (
+        patch.object(patched_app, "run_agent", new_callable=AsyncMock) as mock_agent,
+        patch("botbuilder.core.teams.TeamsInfo.get_member", new_callable=AsyncMock, return_value=member),
+    ):
+        await patched_app.on_message(ctx)
+    mock_agent.assert_not_called()
+    msg_texts = [
+        call[0][0].text for call in ctx.send_activity.call_args_list
+        if hasattr(call[0][0], "type") and call[0][0].type == "message"
+    ]
+    assert msg_texts == []  # silent in a group — no rejection posted
+
+
 @pytest.mark.asyncio
 async def test_on_message_blocks_user_with_no_email(patched_app):
     ctx, member = _make_turn_context("show logs", email="")
