@@ -240,6 +240,33 @@ curl -s -X POST "$URL/admin" -H "Authorization: Bearer $KEY" -H "Content-Type: a
 → in-boundary Cloud SQL `samurai-db`). Rotate the key by adding a new
 `samurai-admin-key` secret version.
 
+## Code sandbox (`run_code`)
+
+SamurAI can generate-and-run Python in an isolated executor for computation,
+data analysis, transforms, parsing, and codegen-and-test over data it has
+**already fetched** with other tools — and reuse vetted prior scripts. Design
+decisions (2026-06-21): dedicated service (not a graph node), **pure compute
+over passed-in `inputs`** (no credentials, no network), **hybrid approval**
+(the safety judge reviews every script; persisting to prod still goes through
+the Approve/Revise/Reject card — the sandbox itself can't write anywhere).
+
+- `sandbox/` — `samurai-sandbox`, a standalone zero-privilege Cloud Run service.
+  `POST /run` runs an untrusted script in an isolated child (isolated-mode
+  interpreter, scrubbed env, best-effort rlimits, wall-clock process-group kill,
+  `/tmp`-only cwd, in-process network seatbelt, bearer auth). The real boundary
+  is the infra: zero-role SA, `--ingress=internal`, egress denied.
+- `tools/code_sandbox.py` — `run_code` (judge-gated; calls the sandbox, records
+  a `db.models.CodeRun` row + embedding) and `find_prior_script` (pgvector reuse
+  search). `run_code` is in `judge.WRITE_TOOL_NAMES`. Gated by
+  **`SAMURAI_SANDBOX_ENABLED`** (off by default); needs `SANDBOX_URL` +
+  `SANDBOX_TOKEN` on the bot.
+
+**State:** code merged on `feature/code-sandbox`; **prod infra not yet deployed**
+(Alembic-to-prod for `code_runs`/`pending_approvals`, the `samurai-sandbox`
+service + IAM, and the bot env wiring are pending approval). See
+`docs/code_sandbox_plan.md` for the exact steps and the future-work list (incl.
+Loom-video ingestion for the DH Tech Issue Tracker).
+
 ## Knowledge bucket + learning loop
 
 SamurAI maintains a self-improving knowledge base in **`gs://virtualdojo-knowledge`**
