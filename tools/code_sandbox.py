@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from langchain_core.tools import tool
@@ -65,6 +66,59 @@ def _inputs_hash(inputs: Any) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+# Defense-in-depth pre-screen (CODE-3): reject scripts using obvious escape /
+# network / process primitives BEFORE they reach the executor. The sandbox is
+# "pure compute over inputs" and legitimate scripts never need these. This is a
+# cheap backstop, NOT the boundary — the real controls are infra egress denial +
+# zero-role SA (see docs/code_sandbox_plan.md). The judge does not statically
+# inspect script bodies, so this closes the subprocess/raw-socket gap it misses.
+_BLOCKED_PRIMITIVES = [
+    ("ctypes", re.compile(r"\bctypes\b")),
+    ("_socket", re.compile(r"\b_socket\b")),
+    ("os.system", re.compile(r"\bos\.system\b")),
+    ("subprocess", re.compile(r"\bsubprocess\b")),
+    ("os.fork", re.compile(r"\bos\.fork\b")),
+    ("os.posix_spawn", re.compile(r"\bos\.posix_spawn\b")),
+    ("os.exec*", re.compile(r"\bos\.exec[lv]")),
+    ("importlib.reload", re.compile(r"\bimportlib\.reload\b|\breload\s*\(\s*socket\b")),
+]
+
+
+def _prescreen(script: str) -> Optional[str]:
+    """Return a reason string if the script must be refused, else None."""
+    for name, pat in _BLOCKED_PRIMITIVES:
+        if pat.search(script):
+            return (f"blocked primitive '{name}' — the sandbox is for pure compute "
+                    "over inputs (no process/network escape)")
+    return None
+
+
+_REDACTORS = [
+    re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"),                          # emails
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+"),                     # bearer tokens
+    re.compile(r"AIza[0-9A-Za-z._\-]{10,}"),                          # google api keys
+    re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[=:]\s*\S+"),
+]
+
+
+def _redact(s: str) -> str:
+    for r in _REDACTORS:
+        s = r.sub("[redacted]", s)
+    return s
+
+
+def _result_summary(out: dict) -> str:
+    """What to persist in code_runs.result_summary (CODE-3 hygiene): prefer the
+    structured `result`; otherwise a SIZE summary, never raw stdout/stderr
+    verbatim. Lightly redact obvious secrets either way."""
+    if out.get("result") is not None:
+        s = json.dumps(out["result"], default=str)
+    else:
+        s = (f"(no result var; stdout {len(out.get('stdout') or '')} chars, "
+             f"stderr {len(out.get('stderr') or '')} chars)")
+    return _redact(s)[:_RESULT_SUMMARY_CAP]
+
+
 def _embed(text: str) -> Optional[list[float]]:
     """Embed text with the same Vertex embedder the memory store uses. Returns
     None if embedding is unavailable (e.g., no Vertex auth in tests)."""
@@ -107,10 +161,7 @@ async def _record_run(description: str, script: str, inputs: Any, out: dict) -> 
         from db.models import CodeRun
         from db.session import get_sessionmaker
 
-        summary = (out.get("result") if out.get("result") is not None
-                   else out.get("stdout") or out.get("stderr") or "")
-        summary = (json.dumps(summary, default=str) if not isinstance(summary, str)
-                   else summary)[:_RESULT_SUMMARY_CAP]
+        summary = _result_summary(out)
         embedding = _embed(f"{description}\n\n{script}")
         row = CodeRun(
             description=description,
@@ -163,6 +214,10 @@ async def run_code(
     """
     if not _sandbox_enabled():
         return "The code sandbox is disabled (SAMURAI_SANDBOX_ENABLED is off)."
+
+    blocked = _prescreen(script)
+    if blocked:
+        return f"Refused before execution: {blocked}."
 
     out = await _execute(script, inputs, int(timeout_s))
     if "error" in out:

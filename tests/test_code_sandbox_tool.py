@@ -83,3 +83,48 @@ def test_run_code_is_judge_gated():
     import judge
 
     assert "run_code" in judge.WRITE_TOOL_NAMES
+
+
+# ── CODE-3: static pre-screen + result-summary hygiene ─────────────────────
+
+
+@pytest.mark.parametrize("bad", [
+    "import ctypes",
+    "import subprocess",
+    "os.system('ls')",
+    "import _socket",
+    "x = os.fork()",
+    "importlib.reload(socket)",
+])
+async def test_prescreen_blocks_escape_primitives(monkeypatch, bad):
+    monkeypatch.setenv("SAMURAI_SANDBOX_ENABLED", "on")
+    called = {"exec": False}
+
+    async def _fake_exec(*a, **k):
+        called["exec"] = True
+        return {"outcome": "ok"}
+
+    monkeypatch.setattr(cs, "_execute", _fake_exec)
+    out = await cs.run_code.ainvoke({"description": "x", "script": bad})
+    assert "Refused before execution" in out
+    assert called["exec"] is False  # never reached the sandbox
+
+
+def test_prescreen_allows_plain_compute():
+    assert cs._prescreen("result = sum(inputs['rows'])") is None
+
+
+def test_result_summary_does_not_persist_raw_stdout():
+    out = {"result": None, "stdout": "leaky secret line " * 50, "stderr": ""}
+    s = cs._result_summary(out)
+    assert "leaky secret line leaky" not in s  # raw stdout not stored
+    assert "chars" in s                          # size summary instead
+
+
+def test_result_summary_prefers_result_and_redacts():
+    out = {"result": {"email": "alice@example.com", "auth": "Bearer abc123def456"},
+           "stdout": "noise", "stderr": ""}
+    s = cs._result_summary(out)
+    assert "noise" not in s
+    assert "alice@example.com" not in s
+    assert "[redacted]" in s

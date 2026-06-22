@@ -29,6 +29,8 @@ import hmac
 import json
 import os
 import resource
+import selectors
+import shutil
 import signal
 import sys
 import tempfile
@@ -117,14 +119,28 @@ def _set_rlimits(timeout_s: int):
 
 def _run_blocking(script: str, inputs, timeout_s: int) -> dict:
     """Run the composed program in an isolated child process. Blocking — call
-    from a thread. Returns the result dict."""
+    from a thread. Returns the result dict.
+
+    Reads stdout/stderr with a bounded, deadline-driven selector loop (NOT
+    communicate()) so that:
+      - a child streaming unbounded output cannot balloon the parent's memory:
+        we keep at most ~2*OUTPUT_CAP buffered, then SIGKILL and report
+        outcome="blocked" (CODE-1);
+      - a forked grandchild that survives the group kill and holds the pipe open
+        cannot wedge the worker forever: the loop is bounded by the wall-clock
+        deadline + a short post-exit grace, never by EOF (CODE-2).
+    """
+    import subprocess
+
     workdir = tempfile.mkdtemp(prefix="sbx-")
     inputs_path = os.path.join(workdir, "inputs.json")
     result_path = os.path.join(workdir, "result.json")
+    prog_path = os.path.join(workdir, "prog.py")
     with open(inputs_path, "w") as f:
         json.dump(inputs, f, default=str)
+    with open(prog_path, "w") as f:
+        f.write(_HARNESS + "\n" + script)
 
-    program = _HARNESS + "\n" + script
     # Minimal, scrubbed environment — no inherited secrets. -I = isolated mode
     # (ignore PYTHON* env + user site), -B = no .pyc writes, -S = no site.
     env = {
@@ -136,34 +152,75 @@ def _run_blocking(script: str, inputs, timeout_s: int) -> dict:
         "PYTHONUNBUFFERED": "1",
     }
 
-    import subprocess
-
+    hard_cap = 2 * OUTPUT_CAP
     started = time.monotonic()
     try:
+        # Run from a file (not stdin) so the only pipes to manage are out/err.
         proc = subprocess.Popen(
-            [sys.executable, "-I", "-B", "-S", "-"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [sys.executable, "-I", "-B", "-S", prog_path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=workdir, env=env, preexec_fn=lambda: _set_rlimits(timeout_s),
-            text=True,
         )
     except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
         return {"outcome": "error", "stdout": "", "stderr": f"spawn failed: {e}",
                 "result": None, "elapsed_ms": 0, "exit_code": None}
 
+    bufs = {proc.stdout: bytearray(), proc.stderr: bytearray()}
+    sel = selectors.DefaultSelector()
+    for stream in (proc.stdout, proc.stderr):
+        os.set_blocking(stream.fileno(), False)
+        sel.register(stream, selectors.EVENT_READ)
+
     outcome = "ok"
+    deadline = started + timeout_s
+    exit_grace = None  # set once the child exits; bounds the lingering-pipe case
+    open_streams = 2
+    while open_streams > 0:
+        now = time.monotonic()
+        if now >= deadline:
+            outcome = "timeout"
+            break
+        if exit_grace is not None and now >= exit_grace:
+            break  # child exited; don't keep waiting on a grandchild's pipe
+        budget = deadline - now
+        if exit_grace is not None:
+            budget = min(budget, exit_grace - now)
+        for key, _ in sel.select(timeout=min(budget, 0.5)):
+            try:
+                chunk = os.read(key.fd, 65536)
+            except (BlockingIOError, OSError):
+                continue
+            if not chunk:  # EOF on this stream
+                sel.unregister(key.fileobj)
+                open_streams -= 1
+                continue
+            bufs[key.fileobj].extend(chunk)
+        if len(bufs[proc.stdout]) + len(bufs[proc.stderr]) > hard_cap:
+            outcome = "blocked"
+            break
+        if exit_grace is None and proc.poll() is not None:
+            exit_grace = time.monotonic() + 1.0  # brief drain window after exit
+
+    # Always tear the child + its process group down; never block on a survivor.
     try:
-        stdout, stderr = proc.communicate(input=program, timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        outcome = "timeout"
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=5)  # reaps the direct child (dead after SIGKILL)
+    except Exception:
+        pass
+    sel.close()
+    for stream in (proc.stdout, proc.stderr):
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+            stream.close()
+        except Exception:
             pass
-        stdout, stderr = proc.communicate()
     elapsed = int((time.monotonic() - started) * 1000)
 
     exit_code = proc.returncode
-    if outcome == "ok" and exit_code != 0:
+    if outcome == "ok" and exit_code not in (0, None):
         outcome = "error"
 
     result = None
@@ -174,17 +231,12 @@ def _run_blocking(script: str, inputs, timeout_s: int) -> dict:
     except Exception:
         result = None
 
-    # Best-effort cleanup of the workdir.
-    try:
-        import shutil
-        shutil.rmtree(workdir, ignore_errors=True)
-    except Exception:
-        pass
+    shutil.rmtree(workdir, ignore_errors=True)
 
     return {
         "outcome": outcome,
-        "stdout": (stdout or "")[:OUTPUT_CAP],
-        "stderr": (stderr or "")[:OUTPUT_CAP],
+        "stdout": bytes(bufs[proc.stdout])[:OUTPUT_CAP].decode("utf-8", "replace"),
+        "stderr": bytes(bufs[proc.stderr])[:OUTPUT_CAP].decode("utf-8", "replace"),
         "result": result,
         "elapsed_ms": elapsed,
         "exit_code": exit_code,

@@ -23,6 +23,17 @@ Decisions (locked 2026-06-21):
 
 Kill switch: `SAMURAI_SANDBOX_ENABLED` (off by default).
 
+## Security audit (2026-06-21)
+
+A pre-deployment adversarial red-team audit ran before go-live — see
+`docs/sandbox_security_audit.md`. Verdict: **conditional GO**. The in-process
+seatbelt is bypassable (by design — infra is the boundary). The two HIGH code
+fixes (CODE-1 parent-memory balloon, CODE-2 post-kill hang) + CODE-3 hardening
+are **DONE** (`feature/sandbox-hardening`). Go-live is gated on the infra
+verifications **INFRA-1…6** below — especially blocking the metadata server
+(INFRA-3) and PGA=False on a dedicated sandbox subnet (INFRA-4), which the
+original plan did not specify.
+
 ## Pending — prod infra (needs approval; not yet run)
 
 **1. Apply Alembic to prod** so `code_runs` + `pending_approvals` exist in prod
