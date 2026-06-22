@@ -85,6 +85,53 @@ def _is_group_scope(activity) -> bool:
     return ct in ("groupChat", "channel")
 
 
+def _vision_enabled() -> bool:
+    """Gate for image/screenshot intake (off by default — see SAMURAI_VISION_ENABLED)."""
+    return os.environ.get("SAMURAI_VISION_ENABLED", "").lower() in {"on", "1", "true", "yes"}
+
+
+# Image intake limits + Gemini-supported formats (screenshots are png/jpeg; webp common).
+_MAX_IMAGES = 4
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+_SUPPORTED_IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp")
+
+
+async def _ingest_image_attachment(att, image_parts: list) -> str:
+    """Download a Teams image attachment into image_parts (base64) for the model
+    to view. Returns a short user-facing note for skipped/failed images, else "".
+    Never raises — a bad image must not break message handling."""
+    import base64
+    import httpx
+
+    name = att.name or "image"
+    ctype = att.content_type or ""
+    if len(image_parts) >= _MAX_IMAGES:
+        return f"\n\n[Image {name} skipped — only the first {_MAX_IMAGES} images are processed.]"
+    if ctype not in _SUPPORTED_IMAGE_TYPES:
+        return f"\n\n[Image {name} ({ctype}) — unsupported format, skipped (PNG/JPEG/WebP only).]"
+    url = (
+        getattr(att, "content_url", None)
+        or (att.content or {}).get("contentUrl")
+        or (att.content or {}).get("downloadUrl")
+    )
+    if not url:
+        return f"\n\n[Image {name} — no downloadable URL found, skipped.]"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.content
+    except Exception as e:
+        print(f"[on_message] image download failed for {name}: {e}", flush=True)
+        return f"\n\n[Image {name} — couldn't fetch it ({type(e).__name__}); if it's from personal storage I may lack access.]"
+    if len(data) > _MAX_IMAGE_BYTES:
+        mb = _MAX_IMAGE_BYTES // (1024 * 1024)
+        return f"\n\n[Image {name} — too large ({len(data) // 1024} KB > {mb} MB), skipped.]"
+    image_parts.append({"mime_type": ctype, "data": base64.b64encode(data).decode()})
+    print(f"[on_message] image received: {name} ({ctype}, {len(data)} bytes)", flush=True)
+    return ""
+
+
 async def on_message(turn_context: TurnContext):
     activity_type = turn_context.activity.type
     activity_name = getattr(turn_context.activity, "name", None)
@@ -120,8 +167,12 @@ async def on_message(turn_context: TurnContext):
 
     # Handle file attachments — download, parse, and append content to message
     file_context = ""
+    image_parts: list[dict] = []  # screenshots/images for the model to view (gated)
     attachments = turn_context.activity.attachments or []
     for att in attachments:
+        if _vision_enabled() and (att.content_type or "").startswith("image/"):
+            file_context += await _ingest_image_attachment(att, image_parts)
+            continue
         if att.content_type == "application/vnd.microsoft.teams.file.download.info":
             try:
                 import httpx
@@ -154,8 +205,13 @@ async def on_message(turn_context: TurnContext):
                 print(f"[on_message] File download/parse failed: {e}", flush=True)
                 file_context += f"\n\n[Attached file: {att.name} — failed to process: {e}]"
 
+    if image_parts:
+        file_context += (
+            f"\n\n[The user attached {len(image_parts)} image(s)/screenshot(s); "
+            "they are included below for you to view directly.]"
+        )
     if file_context:
-        user_message = (user_message or "The user uploaded a file. Please review it.") + file_context
+        user_message = (user_message or "The user shared an attachment. Please review it.") + file_context
 
     if not user_message:
         return
@@ -323,6 +379,7 @@ async def on_message(turn_context: TurnContext):
             user_timezone=local_tz,
             user_email=user_email,
             status_callback=_send_status,
+            images=image_parts or None,
         ))
         _running_tasks[conversation_id] = agent_task
         try:

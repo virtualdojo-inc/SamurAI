@@ -1230,6 +1230,21 @@ def _generic_recovery_message(progress: dict | None) -> str:
     )
 
 
+def _build_human_content(message: str, images: list[dict] | None):
+    """HumanMessage content for the turn. Plain string normally; a multimodal list
+    (text block + image blocks) when images are attached so the model can SEE them.
+    langchain-google-genai requires the data-content-block form
+    {"type":"image","base64":..,"mime_type":..} — image_url forms are NOT accepted
+    by its parser. Malformed image entries are dropped."""
+    if not images:
+        return message
+    blocks: list = [{"type": "text", "text": message}]
+    for im in images:
+        if im.get("data") and im.get("mime_type"):
+            blocks.append({"type": "image", "base64": im["data"], "mime_type": im["mime_type"]})
+    return blocks
+
+
 async def run_agent(
     user_message: str,
     conversation_id: str = "default",
@@ -1240,6 +1255,7 @@ async def run_agent(
     status_callback=None,
     recursion_limit: int = 75,
     is_background_task: bool = False,
+    images: list[dict] | None = None,
 ) -> str:
     start = time.time()
 
@@ -1289,6 +1305,10 @@ async def run_agent(
         )
     if context_parts:
         message = f"[{' | '.join(context_parts)}]\n{message}"
+
+    # Multimodal: a content list (text + image blocks) when images are attached,
+    # plain string otherwise. See _build_human_content.
+    human_content = _build_human_content(message, images)
 
     # Fast acknowledgment via lightweight model (no tools, ~0.5s)
     if status_callback:
@@ -1467,7 +1487,7 @@ async def run_agent(
 
     try:
       async for event in graph.astream(
-        {"messages": [HumanMessage(content=message)]},
+        {"messages": [HumanMessage(content=human_content)]},
         config=config,
         stream_mode="updates",
       ):

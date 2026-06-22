@@ -199,6 +199,89 @@ async def test_on_message_silent_in_group_for_unauthorized(patched_app):
     assert msg_texts == []  # silent in a group — no rejection posted
 
 
+# --- Image / screenshot intake (gated by SAMURAI_VISION_ENABLED) ---
+
+
+class _FakeResp:
+    def __init__(self, content=b""):
+        self.content = content
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeClient:
+    def __init__(self, resp_or_exc):
+        self._r = resp_or_exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url):
+        if isinstance(self._r, Exception):
+            raise self._r
+        return self._r
+
+
+def _img_att(content_type="image/png", url="https://cdn.teams/img.png", name="shot.png"):
+    att = MagicMock()
+    att.name = name
+    att.content_type = content_type
+    att.content_url = url
+    att.content = None
+    return att
+
+
+@pytest.mark.asyncio
+async def test_ingest_image_success(patched_app, monkeypatch):
+    import base64
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: _FakeClient(_FakeResp(b"PNGBYTES")))
+    parts = []
+    note = await patched_app._ingest_image_attachment(_img_att(), parts)
+    assert note == ""
+    assert len(parts) == 1
+    assert parts[0]["mime_type"] == "image/png"
+    assert base64.b64decode(parts[0]["data"]) == b"PNGBYTES"
+
+
+@pytest.mark.asyncio
+async def test_ingest_image_unsupported_skipped(patched_app):
+    parts = []
+    note = await patched_app._ingest_image_attachment(_img_att(content_type="image/heic"), parts)
+    assert "unsupported" in note.lower()
+    assert parts == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_image_respects_cap(patched_app):
+    parts = [{"mime_type": "image/png", "data": "x"}] * patched_app._MAX_IMAGES
+    note = await patched_app._ingest_image_attachment(_img_att(), parts)
+    assert "only the first" in note.lower()
+    assert len(parts) == patched_app._MAX_IMAGES  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_ingest_image_download_error_is_graceful(patched_app, monkeypatch):
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: _FakeClient(RuntimeError("403 Forbidden")))
+    parts = []
+    note = await patched_app._ingest_image_attachment(_img_att(), parts)
+    assert "couldn't fetch" in note.lower()
+    assert parts == []  # no crash, nothing appended
+
+
+@pytest.mark.asyncio
+async def test_ingest_image_too_large_skipped(patched_app, monkeypatch):
+    big = b"x" * (patched_app._MAX_IMAGE_BYTES + 1)
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: _FakeClient(_FakeResp(big)))
+    parts = []
+    note = await patched_app._ingest_image_attachment(_img_att(), parts)
+    assert "too large" in note.lower()
+    assert parts == []
+
+
 @pytest.mark.asyncio
 async def test_on_message_blocks_user_with_no_email(patched_app):
     ctx, member = _make_turn_context("show logs", email="")
