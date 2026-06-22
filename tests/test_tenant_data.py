@@ -9,7 +9,7 @@ import tools.tenant_data as td
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for k in ("SAMURAI_TENANT_DATA_ENABLED", "VIRTUALDOJO_API_URL"):
+    for k in ("SAMURAI_TENANT_DATA_ENABLED", "SAMURAI_TENANT_RECORDS_ENABLED", "VIRTUALDOJO_API_URL"):
         monkeypatch.delenv(k, raising=False)
     yield
 
@@ -26,8 +26,10 @@ def _by_name(name, user_id="u1"):
     return next(t for t in _tools(user_id) if t.name == name)
 
 
-def _sign_in(monkeypatch, token="user-jwt"):
+def _sign_in(monkeypatch, token="user-jwt", records=True):
     monkeypatch.setenv("SAMURAI_TENANT_DATA_ENABLED", "on")
+    if records:
+        monkeypatch.setenv("SAMURAI_TENANT_RECORDS_ENABLED", "on")
     monkeypatch.setattr("tools.virtualdojo_mcp.is_user_authenticated", lambda uid: True)
     monkeypatch.setattr("tools.virtualdojo_mcp._get_access_token", AsyncMock(return_value=token))
 
@@ -86,6 +88,7 @@ async def test_schema_and_records_disabled_by_default():
 async def test_records_not_signed_in_is_barred(monkeypatch):
     # A background task has no signed-in user -> SSO prompt, never reaches the backend.
     monkeypatch.setenv("SAMURAI_TENANT_DATA_ENABLED", "on")
+    monkeypatch.setenv("SAMURAI_TENANT_RECORDS_ENABLED", "on")
     monkeypatch.setattr("tools.virtualdojo_mcp.is_user_authenticated", lambda uid: False)
     monkeypatch.setattr("tools.virtualdojo_mcp.get_login_url", lambda uid: "https://sso.vdj/login")
     start = AsyncMock()
@@ -93,6 +96,28 @@ async def test_records_not_signed_in_is_barred(monkeypatch):
     out = await _by_name("read_tenant_records").ainvoke({"grant_id": "g1", "object_name": "accounts"})
     assert "sign in" in out.lower()
     start.assert_not_called()  # never started an impersonation session
+
+
+async def test_records_gated_until_residency_flag(monkeypatch):
+    # Main tenant-data flag ON, but records flag OFF -> records refuse, never sign in / start.
+    monkeypatch.setenv("SAMURAI_TENANT_DATA_ENABLED", "on")  # records flag intentionally unset
+    start = AsyncMock()
+    monkeypatch.setattr(td, "_start_impersonation", start)
+    out = await _by_name("read_tenant_records").ainvoke({"grant_id": "g1", "object_name": "accounts"})
+    assert "residency" in out.lower()
+    start.assert_not_called()
+
+
+async def test_schema_works_without_records_flag(monkeypatch):
+    # describe_tenant_schema runs on the main flag alone (no row PII, no records flag needed).
+    _sign_in(monkeypatch, records=False)
+    monkeypatch.setattr(td, "_start_impersonation", AsyncMock(return_value={
+        "data": {"access_token": "imp-jwt", "target_user_email": "x@acme.com"}}))
+    monkeypatch.setattr(td, "_end_impersonation", AsyncMock())
+    monkeypatch.setattr(td, "_vdj_get", AsyncMock(return_value={
+        "data": [{"api_name": "accounts", "label": "Accounts"}]}))
+    out = await _by_name("describe_tenant_schema").ainvoke({"grant_id": "g1"})
+    assert "accounts" in out
 
 
 async def test_describe_schema_lists_objects(monkeypatch):

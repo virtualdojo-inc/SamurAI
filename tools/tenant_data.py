@@ -27,7 +27,10 @@ the granting customer user -> GET schema/records as that user -> end the session
 ⚠ PII / residency: record rows may be customer PII/CUI. Reads are NEVER fed to LangMem
 extraction or the KB bucket; only metadata (counts / object names) is logged. The serving
 chat model is on the Vertex *global* endpoint — summarizing raw rows through it is a
-residency item to resolve / get ATO sign-off on before enabling reads in prod.
+residency item to resolve / get ATO sign-off on before enabling reads in prod. Because of
+that, raw record reads have their OWN gate (``SAMURAI_TENANT_RECORDS_ENABLED``) on top of
+``SAMURAI_TENANT_DATA_ENABLED``: list-grants + describe-schema (no row PII) can run while
+record reads stay off until residency is signed off.
 
 Per-user factory, like create_virtualdojo_tool. See docs/tenant_data_access_plan.md.
 """
@@ -48,6 +51,13 @@ _MAX_RECORD_LIMIT = 200
 
 def _enabled() -> bool:
     return os.environ.get("SAMURAI_TENANT_DATA_ENABLED", "").lower() in {"on", "1", "true", "yes"}
+
+
+def _records_enabled() -> bool:
+    """Raw record reads (customer rows, PII/CUI) have a SEPARATE gate from list/schema so
+    they stay off until the data-residency question is signed off — even when the main
+    tenant-data switch is on. See the PII/residency note in the module docstring."""
+    return os.environ.get("SAMURAI_TENANT_RECORDS_ENABLED", "").lower() in {"on", "1", "true", "yes"}
 
 
 def _api_base() -> str:
@@ -294,6 +304,10 @@ def create_tenant_data_tools(user_id: str) -> list:
                                    limit: int = 50, skip: int = 0) -> str:
         if not _enabled():
             return "Tenant-data access is disabled (SAMURAI_TENANT_DATA_ENABLED is off)."
+        if not _records_enabled():
+            return ("Reading raw tenant records is gated off (SAMURAI_TENANT_RECORDS_ENABLED) "
+                    "pending data-residency sign-off — I can still list support grants and "
+                    "describe a tenant's schema.")
         _warn_if_sso_env_mismatch()
         limit = max(1, min(int(limit), _MAX_RECORD_LIMIT))
         token, prompt = await _signed_in_token()
