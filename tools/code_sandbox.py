@@ -44,7 +44,9 @@ def _sandbox_url() -> str:
 
 
 def _sandbox_token() -> str:
-    return os.environ.get("SANDBOX_TOKEN", "")
+    # .strip(): Secret Manager values often carry a trailing newline (e.g. from
+    # `openssl rand -hex 32`), which is an illegal HTTP header value.
+    return os.environ.get("SANDBOX_TOKEN", "").strip()
 
 
 def _is_postgres() -> bool:

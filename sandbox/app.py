@@ -85,10 +85,12 @@ def _authorized(request: web.Request) -> bool:
     This X-Sandbox-Token check is the defense-in-depth second factor. Fail
     closed: no token configured -> nobody gets in.
     """
-    secret = os.environ.get(TOKEN_ENV, "")
+    # .strip() both sides: Secret Manager values often carry a trailing newline
+    # (e.g. from `openssl rand -hex 32`); strip so the comparison still matches.
+    secret = os.environ.get(TOKEN_ENV, "").strip()
     if not secret:
         return False
-    provided = request.headers.get("X-Sandbox-Token", "")
+    provided = request.headers.get("X-Sandbox-Token", "").strip()
     return bool(provided) and hmac.compare_digest(provided, secret)
 
 
