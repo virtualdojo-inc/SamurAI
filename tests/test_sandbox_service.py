@@ -134,7 +134,17 @@ async def test_run_requires_token(monkeypatch):
 async def test_run_rejects_wrong_token(monkeypatch):
     monkeypatch.setenv("SANDBOX_TOKEN", "sk")
     resp = await sapp.handle_run(
-        _Req(headers={"Authorization": "Bearer nope"}, body={"script": "print(1)"})
+        _Req(headers={"X-Sandbox-Token": "nope"}, body={"script": "print(1)"})
+    )
+    assert resp.status == 401
+
+
+async def test_run_ignores_authorization_header(monkeypatch):
+    """The app token is X-Sandbox-Token; Authorization (Cloud Run IAM/OIDC) must
+    not satisfy the app-level check."""
+    monkeypatch.setenv("SANDBOX_TOKEN", "sk")
+    resp = await sapp.handle_run(
+        _Req(headers={"Authorization": "Bearer sk"}, body={"script": "print(1)"})
     )
     assert resp.status == 401
 
@@ -142,21 +152,21 @@ async def test_run_rejects_wrong_token(monkeypatch):
 async def test_run_fail_closed_when_no_token(monkeypatch):
     monkeypatch.delenv("SANDBOX_TOKEN", raising=False)
     resp = await sapp.handle_run(
-        _Req(headers={"Authorization": "Bearer anything"}, body={"script": "print(1)"})
+        _Req(headers={"X-Sandbox-Token": "anything"}, body={"script": "print(1)"})
     )
     assert resp.status == 401
 
 
 async def test_run_requires_script(monkeypatch):
     monkeypatch.setenv("SANDBOX_TOKEN", "sk")
-    resp = await sapp.handle_run(_Req(headers={"Authorization": "Bearer sk"}, body={}))
+    resp = await sapp.handle_run(_Req(headers={"X-Sandbox-Token": "sk"}, body={}))
     assert resp.status == 400
 
 
 async def test_run_executes_with_valid_token(monkeypatch):
     monkeypatch.setenv("SANDBOX_TOKEN", "sk")
     resp = await sapp.handle_run(
-        _Req(headers={"Authorization": "Bearer sk"}, body={"script": "print('ok')"})
+        _Req(headers={"X-Sandbox-Token": "sk"}, body={"script": "print('ok')"})
     )
     assert resp.status == 200
     data = json.loads(resp.body)
