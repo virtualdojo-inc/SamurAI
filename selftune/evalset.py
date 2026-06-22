@@ -71,6 +71,8 @@ WRITE_TOOLS = {
     "trigger_wiki_compile", "trigger_engineering_compile",
     # skill authoring (writes support/skills/ in the in-boundary bucket)
     "save_skill", "delete_skill",
+    # code sandbox: judge-gated execution of generated scripts (matches judge.WRITE_TOOL_NAMES)
+    "run_code",
 }
 
 # "Meta" lookup tools that are ALWAYS bound (core group) and don't resolve a task.

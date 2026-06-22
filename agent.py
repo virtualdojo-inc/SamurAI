@@ -52,6 +52,7 @@ from tools.file_handler import FILE_HANDLER_TOOLS
 from tools.smartsheet import SMARTSHEET_TOOLS
 from tools.self_improve import SELF_IMPROVE_TOOLS
 from tools.skill_authoring import SKILL_AUTHORING_TOOLS
+from tools.code_sandbox import CODE_SANDBOX_TOOLS
 from tools.progress import (
     PROGRESS_TOOLS,
     clear_progress,
@@ -110,6 +111,18 @@ TOOL_GROUPS = {
         "keywords": [
             "spreadsheet", "excel", "csv", "upload", "column",
             "fill", "edit cell", "worksheet", "uploaded file",
+        ],
+    },
+    "sandbox": {
+        # Isolated, zero-privilege code execution + reuse of vetted prior
+        # scripts. run_code is judge-gated (judge.WRITE_TOOL_NAMES); the sandbox
+        # has no network/credentials and only computes over passed-in inputs.
+        "tools": CODE_SANDBOX_TOOLS,
+        "keywords": [
+            "run code", "run a script", "execute code", "execute a script",
+            "sandbox", "write a script", "compute", "calculate", "crunch",
+            "analyze the data", "analyze this data", "transform", "parse",
+            "data analysis", "scratch script", "prior script", "reuse a script",
         ],
     },
     "memory": {
