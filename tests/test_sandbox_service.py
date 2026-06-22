@@ -79,6 +79,38 @@ def test_output_is_capped(monkeypatch):
     assert len(out["stdout"]) <= 100
 
 
+def test_streaming_output_is_bounded_and_blocked(monkeypatch):
+    """CODE-1: a child streaming unbounded output must not balloon the parent —
+    we cap accumulation at ~2*OUTPUT_CAP, then SIGKILL and report 'blocked'."""
+    monkeypatch.setattr(sapp, "OUTPUT_CAP", 1000)
+    script = "import sys\nwhile True:\n    sys.stdout.write('X' * 65536)\n    sys.stdout.flush()\n"
+    out = sapp._run_blocking(script, None, 10)
+    assert out["outcome"] == "blocked"
+    assert len(out["stdout"]) <= 1000
+
+
+def test_forked_grandchild_does_not_hang():
+    """CODE-2: a grandchild that escapes the process group and holds the pipe
+    open must not wedge the reader forever — the call returns promptly."""
+    import time as _t
+
+    script = (
+        "import os, sys, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    os.setsid()\n"          # escape the sandbox child's process group
+        "    time.sleep(5)\n"         # survive the kill, holding inherited stdout
+        "else:\n"
+        "    print('parent-exiting')\n"
+        "    sys.exit(0)\n"
+    )
+    t0 = _t.monotonic()
+    out = sapp._run_blocking(script, None, 3)
+    elapsed = _t.monotonic() - t0
+    assert elapsed < 12  # bounded (deadline + grace + reap), NOT forever
+    assert out["outcome"] in ("ok", "timeout", "error")
+
+
 # ── Auth on the HTTP handler ────────────────────────────────────────────────
 
 
