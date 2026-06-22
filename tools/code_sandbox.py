@@ -132,18 +132,42 @@ def _embed(text: str) -> Optional[list[float]]:
         return None
 
 
+def _oidc_token(audience: str) -> Optional[str]:
+    """Mint a Google OIDC identity token for the Cloud Run audience (the sandbox
+    URL), using the bot's service account via ADC/metadata. This is what Cloud
+    Run IAM checks — only the bot SA is granted run.invoker on the sandbox.
+    Returns None if it can't be minted (e.g. no ADC locally)."""
+    try:
+        import google.auth.transport.requests
+        from google.oauth2 import id_token as _id_token
+
+        return _id_token.fetch_id_token(
+            google.auth.transport.requests.Request(), audience
+        )
+    except Exception as e:  # pragma: no cover - depends on ADC/metadata
+        logger.warning("[code_sandbox] OIDC mint failed: %s", e)
+        return None
+
+
 async def _execute(script: str, inputs: Any, timeout_s: int) -> dict:
-    """Call the sandbox service. Returns its JSON, or an {"error": ...} dict."""
+    """Call the sandbox service. Returns its JSON, or an {"error": ...} dict.
+
+    Two auth layers: the OIDC identity token in Authorization (Cloud Run IAM —
+    the boundary) and the shared app token in X-Sandbox-Token (defense in depth).
+    """
     url, token = _sandbox_url(), _sandbox_token()
     if not url or not token:
         return {"error": "sandbox not configured (SANDBOX_URL / SANDBOX_TOKEN unset)"}
     import httpx
 
+    headers = {"X-Sandbox-Token": token}
+    oidc = _oidc_token(url)
+    if oidc:
+        headers["Authorization"] = f"Bearer {oidc}"
     try:
         async with httpx.AsyncClient(timeout=timeout_s + 10) as client:
             resp = await client.post(
-                f"{url}/run",
-                headers={"Authorization": f"Bearer {token}"},
+                f"{url}/run", headers=headers,
                 json={"script": script, "inputs": inputs, "timeout_s": timeout_s},
             )
         if resp.status_code != 200:

@@ -78,14 +78,18 @@ _atexit.register(_emit_result)
 
 
 def _authorized(request: web.Request) -> bool:
+    """App-level bearer check via the X-Sandbox-Token header.
+
+    Cloud Run IAM owns the `Authorization` header (it carries the caller's OIDC
+    identity token and is the primary boundary — only the bot SA may invoke).
+    This X-Sandbox-Token check is the defense-in-depth second factor. Fail
+    closed: no token configured -> nobody gets in.
+    """
     secret = os.environ.get(TOKEN_ENV, "")
     if not secret:
-        return False  # fail closed: no token configured -> nobody gets in
-    auth = request.headers.get("Authorization", "")
-    prefix = "Bearer "
-    if not auth.startswith(prefix):
         return False
-    return hmac.compare_digest(auth[len(prefix):], secret)
+    provided = request.headers.get("X-Sandbox-Token", "")
+    return bool(provided) and hmac.compare_digest(provided, secret)
 
 
 def _set_rlimits(timeout_s: int):
