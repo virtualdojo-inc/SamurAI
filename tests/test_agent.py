@@ -138,6 +138,29 @@ def test_every_static_tool_has_a_friendly_label():
     assert not missing, f"tools missing a friendly label in _tool_labels: {missing}"
 
 
+def test_build_human_content_multimodal(mock_llm):
+    _, agent = mock_llm
+    # No images -> plain string (unchanged default path)
+    assert agent._build_human_content("hi", None) == "hi"
+    # Images -> text block + image data-content-block(s)
+    out = agent._build_human_content("describe", [{"data": "QUFB", "mime_type": "image/png"}])
+    assert out[0] == {"type": "text", "text": "describe"}
+    assert out[1] == {"type": "image", "base64": "QUFB", "mime_type": "image/png"}
+    # Malformed image entries (missing data/mime) are dropped
+    assert agent._build_human_content("x", [{"mime_type": "image/png"}]) == [
+        {"type": "text", "text": "x"}
+    ]
+
+
+def test_loom_share_url_selects_loom_tool(mock_llm):
+    """A pasted bare Loom URL makes analyze_loom_video available (no keyword needed)."""
+    _, agent = mock_llm
+    tools = agent._select_tool_groups(
+        "https://www.loom.com/share/9614dd0b62e5475985d0b021ee3f33d4"
+    )
+    assert "analyze_loom_video" in {t.name for t in tools}
+
+
 def test_system_prompt_defined(mock_llm):
     _, agent = mock_llm
     assert "SamurAI" in agent.SYSTEM_PROMPT
