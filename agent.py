@@ -53,6 +53,7 @@ from tools.smartsheet import SMARTSHEET_TOOLS
 from tools.self_improve import SELF_IMPROVE_TOOLS
 from tools.skill_authoring import SKILL_AUTHORING_TOOLS
 from tools.code_sandbox import CODE_SANDBOX_TOOLS
+from tools.loom import LOOM_TOOLS
 from tools.progress import (
     PROGRESS_TOOLS,
     clear_progress,
@@ -123,6 +124,16 @@ TOOL_GROUPS = {
             "sandbox", "write a script", "compute", "calculate", "crunch",
             "analyze the data", "analyze this data", "transform", "parse",
             "data analysis", "scratch script", "prior script", "reuse a script",
+        ],
+    },
+    "loom": {
+        # Loom video analysis (audio + visual) for troubleshooting / ticket
+        # understanding. In-boundary Vertex Gemini; read-only.
+        "tools": LOOM_TOOLS,
+        "keywords": [
+            "loom", "loom.com", "loom video", "watch the video", "the video",
+            "screen recording", "screen-recording", "recording shows",
+            "tracker video", "what's in the video", "watch loom",
         ],
     },
     "memory": {
@@ -1433,6 +1444,15 @@ async def run_agent(
         "trigger_engineering_compile": "Updating engineering knowledge",
         # Progress tracking
         "update_progress": "Updating plan",
+        # Skills authoring + tracker diagnostics
+        "save_skill": "Saving a skill",
+        "delete_skill": "Deleting a skill",
+        "get_tracker_diagnostics": "Checking tracker diagnostics",
+        # Code sandbox
+        "run_code": "Running code in the sandbox",
+        "find_prior_script": "Finding a past script",
+        # Loom video analysis
+        "analyze_loom_video": "Watching the Loom video",
     }
 
     final_messages = []

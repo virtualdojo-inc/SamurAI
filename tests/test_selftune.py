@@ -287,6 +287,7 @@ _READ_SAFE_TOOLS = {
     "smartsheet_get_sheet", "smartsheet_list_sheets",
     "get_tracker_diagnostics",  # read-only: serves pre-computed tracker diagnoses
     "find_prior_script",  # read-only: semantic search over the code_runs library
+    "analyze_loom_video",  # read-only: download + in-boundary multimodal analysis of a Loom
     "social_generate_image", "social_get_post", "social_list_scheduled", "social_preview_post",
     "list_background_tasks", "list_team_members", "lookup_team_member",
     # consent-gated file mutators (staged behind a Teams FileConsentCard — not an
