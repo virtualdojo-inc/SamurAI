@@ -54,6 +54,7 @@ from tools.self_improve import SELF_IMPROVE_TOOLS
 from tools.skill_authoring import SKILL_AUTHORING_TOOLS
 from tools.code_sandbox import CODE_SANDBOX_TOOLS
 from tools.loom import LOOM_TOOLS
+from tools.tenant_data import create_tenant_data_tools
 from tools.progress import (
     PROGRESS_TOOLS,
     clear_progress,
@@ -960,11 +961,14 @@ async def _build_graph(user_id: str = "default"):
         create_virtualdojo_tool(user_id),
         create_virtualdojo_list_tools(user_id),
     ]
-    # Always-available user tools (CRM). Memory tools are keyword-gated.
-    always_user_tools = crm_tools
+    # Per-user read-only tenant-data tools (support grants), authenticated via the
+    # user's SSO session — runs as the signed-in user; prompts SSO sign-in if not.
+    tenant_tools = create_tenant_data_tools(user_id)
+    # Always-available user tools (CRM + tenant-data). Memory tools are keyword-gated.
+    always_user_tools = crm_tools + tenant_tools
 
     # ToolNode needs ALL tools so it can execute whatever the LLM selected
-    all_tools = ALL_TOOLS + crm_tools + memory_tools
+    all_tools = ALL_TOOLS + crm_tools + memory_tools + tenant_tools
     tool_node = ToolNode(all_tools, handle_tool_errors=True)
 
     async def call_model(state: MessagesState):
@@ -1473,6 +1477,10 @@ async def run_agent(
         "find_prior_script": "Finding a past script",
         # Loom video analysis
         "analyze_loom_video": "Watching the Loom video",
+        # Tenant data (support grants)
+        "list_tenant_support_grants": "Listing tenant support grants",
+        "describe_tenant_schema": "Reading the tenant's schema",
+        "read_tenant_records": "Reading the tenant's records",
     }
 
     final_messages = []
