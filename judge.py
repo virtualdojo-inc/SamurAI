@@ -167,6 +167,9 @@ WRITE_TOOL_NAMES: frozenset[str] = frozenset({
     # Skill authoring (writes to the in-boundary bucket support/skills/)
     "save_skill",
     "delete_skill",
+    # Code sandbox: the judge reviews the script before it executes in the
+    # isolated (no-network, no-credential) sandbox. See tools/code_sandbox.py.
+    "run_code",
 })
 
 

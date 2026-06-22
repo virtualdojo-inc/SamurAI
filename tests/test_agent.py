@@ -45,9 +45,11 @@ def mock_llm():
 def test_static_tools_list(mock_llm):
     _, agent = mock_llm
     assert len(agent.STATIC_TOOLS) == len(agent.ALL_TOOLS)
-    assert len(agent.ALL_TOOLS) == 94  # Static tools (memory tools added per-user separately)
+    assert len(agent.ALL_TOOLS) == 96  # Static tools (memory tools added per-user separately)
     tool_names = {t.name for t in agent.STATIC_TOOLS}
     assert "query_cloud_logs" in tool_names
+    assert "run_code" in tool_names
+    assert "find_prior_script" in tool_names
     assert "get_skill" in tool_names
     assert "read_knowledge" in tool_names
     assert "search_wiki" in tool_names
