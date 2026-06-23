@@ -952,19 +952,32 @@ async def _retrieve_memories_cached(user_id: str, last_human) -> str:
 # gemini-3.5-flash has a 1,048,576-token context window. Long, tool-heavy
 # conversations (history + tool traces + memory injections + checkpoint state)
 # can blow past it, hard-crashing the turn with GoogleContextOverflowError.
-# Trim oldest history down to this budget before each call; the headroom under
-# 1M leaves room for the system prompt, memory context, and the response.
-_MAX_INPUT_TOKENS = 700_000
+# Trim oldest history down to this budget before each call.
+#
+# Budget is deliberately conservative (300k, not ~700k) because:
+#   1. This bot's content (GCP logs, JSON, tracebacks, code) tokenizes denser
+#      than plain prose — closer to ~3 chars/token than 4 — so a char-based
+#      estimate undercounts real tokens.
+#   2. The tool schemas bound via bind_tools ALSO count toward the 1M limit but
+#      are NOT in the message list we trim — tens of thousands of extra tokens.
+#   3. The model still needs room to generate its response.
+# 300k estimated tokens leaves ~700k of headroom for all of the above.
+_MAX_INPUT_TOKENS = 300_000
+
+# Hard cap for any SINGLE message's content. A lone giant tool result or pasted
+# log can exceed the whole budget by itself, and trim_messages (strategy="last")
+# always keeps the most recent message — so we truncate oversized content before
+# trimming. ~150k chars ≈ 50k tokens; generous for a single message.
+_MAX_MSG_CHARS = 150_000
 
 
 def _approx_tokens(msg_or_msgs) -> int:
-    """Cheap, dependency-free token estimate (~4 chars/token) for trim_messages.
+    """Cheap, dependency-free token estimate for trim_messages.
 
-    trim_messages may call this with a single message OR a list of messages
-    (e.g. when measuring the system message separately), so handle both. Counts
-    content (str or multimodal parts) plus any tool-call args, with a small
-    per-message overhead. Deliberately an overestimate-friendly heuristic — we
-    only need it to keep us safely under the hard 1M limit, not be exact.
+    Uses ~3 chars/token (conservative for this bot's log/JSON/code-heavy
+    content) so we lean toward over-counting and trim sooner rather than risk
+    the hard 1M limit. trim_messages may call this with a single message OR a
+    list (e.g. measuring the system message separately), so handle both.
     """
     if isinstance(msg_or_msgs, (list, tuple)):
         return sum(_approx_tokens(m) for m in msg_or_msgs)
@@ -973,7 +986,33 @@ def _approx_tokens(msg_or_msgs) -> int:
     tool_calls = getattr(msg_or_msgs, "tool_calls", None)
     if tool_calls:
         n += len(str(tool_calls))
-    return n // 4 + 8
+    return n // 3 + 8
+
+
+def _cap_message_content(messages):
+    """Truncate any single message whose string content exceeds _MAX_MSG_CHARS.
+
+    Returns a new list; oversized messages are replaced with copies holding
+    head+tail of the content and a truncation marker (originals/ checkpoint
+    state are left untouched). Non-string content (multimodal parts) is left
+    as-is. This stops one huge tool output/paste from blowing the context limit
+    on its own, which plain trimming can't fix since the latest message is kept.
+    """
+    out = []
+    for m in messages:
+        content = m.content
+        if isinstance(content, str) and len(content) > _MAX_MSG_CHARS:
+            head = content[: _MAX_MSG_CHARS // 2]
+            tail = content[-_MAX_MSG_CHARS // 2 :]
+            dropped = len(content) - _MAX_MSG_CHARS
+            new_content = (
+                f"{head}\n\n... [truncated {dropped:,} chars to fit the context "
+                f"limit] ...\n\n{tail}"
+            )
+            out.append(m.model_copy(update={"content": new_content}))
+        else:
+            out.append(m)
+    return out
 
 
 async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 4):
@@ -1077,10 +1116,13 @@ async def _build_graph(user_id: str = "default"):
         if not any(isinstance(m, SystemMessage) for m in messages):
             messages = [SystemMessage(content=system_content)] + messages
 
-        # Guard the 1M-token context limit: trim oldest history (keeping the
-        # system message and a valid human-led tail) when a long conversation
-        # would otherwise overflow. No-op for normal-length turns.
+        # Guard the 1M-token context limit. First cap any single oversized
+        # message (a lone giant tool output/paste that trimming alone can't
+        # fix), then trim oldest history — keeping the system message and a
+        # valid human-led tail. Both are no-ops for normal-length turns.
+        messages = _cap_message_content(messages)
         before = len(messages)
+        est_before = _approx_tokens(messages)
         messages = trim_messages(
             messages,
             max_tokens=_MAX_INPUT_TOKENS,
@@ -1091,9 +1133,10 @@ async def _build_graph(user_id: str = "default"):
         )
         if len(messages) < before:
             logger.warning(
-                "Trimmed conversation history %d -> %d messages to stay under "
-                "the %d-token context budget",
-                before, len(messages), _MAX_INPUT_TOKENS,
+                "Trimmed conversation history %d -> %d messages (~%d -> ~%d est "
+                "tokens) to stay under the %d-token budget",
+                before, len(messages), est_before, _approx_tokens(messages),
+                _MAX_INPUT_TOKENS,
             )
 
         return {"messages": [await _ainvoke_with_backoff(llm_with_tools, messages)]}
