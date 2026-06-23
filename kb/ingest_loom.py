@@ -76,6 +76,21 @@ def _default_project() -> str:
     p = os.environ.get("GCP_PROJECT_ID")
     if p:
         return p
+    # In the Cloud Run runtime GCP_PROJECT_ID is not set and `gcloud` isn't on
+    # PATH, so the metadata server is the reliable source (this is how the
+    # google-genai SDK auto-resolves the project for the main agent path).
+    try:
+        import httpx
+
+        r = httpx.get(
+            "http://metadata.google.internal/computeMetadata/v1/project/project-id",
+            headers={"Metadata-Flavor": "Google"},
+            timeout=2,
+        )
+        if r.status_code == 200 and r.text.strip():
+            return r.text.strip()
+    except Exception:
+        pass
     try:
         return _run(["gcloud", "config", "get-value", "project"]).stdout.strip()
     except Exception:
@@ -112,6 +127,13 @@ def _vertex_multimodal(parts: list[dict], max_tokens: int = 700, temperature: fl
     import httpx
 
     project = _default_project()
+    if not project:
+        # A blank project yields a `projects//locations/...` URL and an opaque
+        # 400 — log loudly so the cause is obvious instead of cryptic.
+        logger.warning(
+            "[kb.ingest_loom] could not resolve GCP project (env GCP_PROJECT_ID "
+            "unset and metadata/gcloud lookups failed); Vertex call will 400"
+        )
     url = (
         f"https://{KB_VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/"
         f"{project}/locations/{KB_VERTEX_LOCATION}/publishers/google/models/"

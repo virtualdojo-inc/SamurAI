@@ -121,7 +121,12 @@ async def _run_kb_pipeline() -> None:
     try:
         await asyncio.to_thread(run_support_pipeline)
     except Exception as e:  # never let a pipeline run crash the scheduler
-        logger.error("[kb.run] support pipeline failed: %s: %s", type(e).__name__, e)
+        # exc_info=True so the FULL traceback lands in Cloud Logging — without
+        # it we only get "<Type>: <msg>" and the real failure stays hidden.
+        logger.error(
+            "[kb.run] support pipeline failed: %s: %s",
+            type(e).__name__, e, exc_info=True,
+        )
 
 
 async def _run_kb_engineering_pipeline() -> None:
@@ -131,7 +136,10 @@ async def _run_kb_engineering_pipeline() -> None:
     try:
         await asyncio.to_thread(run_engineering_pipeline)
     except Exception as e:  # never let a pipeline run crash the scheduler
-        logger.error("[kb.run] engineering pipeline failed: %s: %s", type(e).__name__, e)
+        logger.error(
+            "[kb.run] engineering pipeline failed: %s: %s",
+            type(e).__name__, e, exc_info=True,
+        )
 
 
 async def _run_tuning_cycle() -> None:
@@ -141,7 +149,10 @@ async def _run_tuning_cycle() -> None:
     try:
         await asyncio.to_thread(run_tuning_cycle)
     except Exception as e:  # never let a tuning run crash the scheduler
-        logger.error("[selftune] cycle failed: %s: %s", type(e).__name__, e)
+        logger.error(
+            "[selftune] cycle failed: %s: %s",
+            type(e).__name__, e, exc_info=True,
+        )
 
 
 async def _run_tracker_triage() -> None:

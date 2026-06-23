@@ -116,7 +116,12 @@ async def get_memory_store():
             _store_pool = AsyncConnectionPool(
                 conninfo=conninfo,
                 min_size=1,
-                max_size=5,
+                # 10 (not higher): Cloud SQL samurai-db (db-g1-small) caps
+                # max_connections=50 (~47 usable). With the checkpoint pool also
+                # at 10, that's 20/instance — safe for 1-2 instances; min_size=1
+                # keeps idle instances cheap. Raise the server flag before going
+                # higher.
+                max_size=10,
                 open=False,
                 kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
             )
@@ -263,7 +268,9 @@ async def get_checkpointer():
             _checkpoint_pool = AsyncConnectionPool(
                 conninfo=conninfo,
                 min_size=1,
-                max_size=5,
+                # 10: pairs with the store pool (20/instance) under the
+                # max_connections=50 Cloud SQL cap. See note on the store pool.
+                max_size=10,
                 open=False,
                 kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
             )

@@ -1,13 +1,16 @@
 """LangGraph agent wired to Gemini with GCP, GitHub, VirtualDojo CRM, and memory tools."""
 
+import asyncio
 import logging
 import os
+import random
 import time
 
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, trim_messages
 
 from memory import (
     get_checkpointer,
@@ -946,6 +949,58 @@ async def _retrieve_memories_cached(user_id: str, last_human) -> str:
     return result
 
 
+# gemini-3.5-flash has a 1,048,576-token context window. Long, tool-heavy
+# conversations (history + tool traces + memory injections + checkpoint state)
+# can blow past it, hard-crashing the turn with GoogleContextOverflowError.
+# Trim oldest history down to this budget before each call; the headroom under
+# 1M leaves room for the system prompt, memory context, and the response.
+_MAX_INPUT_TOKENS = 700_000
+
+
+def _approx_tokens(msg_or_msgs) -> int:
+    """Cheap, dependency-free token estimate (~4 chars/token) for trim_messages.
+
+    trim_messages may call this with a single message OR a list of messages
+    (e.g. when measuring the system message separately), so handle both. Counts
+    content (str or multimodal parts) plus any tool-call args, with a small
+    per-message overhead. Deliberately an overestimate-friendly heuristic — we
+    only need it to keep us safely under the hard 1M limit, not be exact.
+    """
+    if isinstance(msg_or_msgs, (list, tuple)):
+        return sum(_approx_tokens(m) for m in msg_or_msgs)
+    content = msg_or_msgs.content
+    n = len(content) if isinstance(content, str) else len(str(content))
+    tool_calls = getattr(msg_or_msgs, "tool_calls", None)
+    if tool_calls:
+        n += len(str(tool_calls))
+    return n // 4 + 8
+
+
+async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 4):
+    """Invoke the model, retrying on Gemini 429 RESOURCE_EXHAUSTED with backoff.
+
+    The agent call path has no quota guard, so a saturated per-minute quota
+    surfaces to the user as a dead turn. Exponential backoff (1s, 2s, 4s, +jitter)
+    rides out short QPM spikes; non-quota errors propagate immediately.
+    """
+    delay = 1.0
+    for attempt in range(max_attempts):
+        try:
+            return await llm_with_tools.ainvoke(messages)
+        except ChatGoogleGenerativeAIError as e:
+            msg = str(e)
+            is_quota = "RESOURCE_EXHAUSTED" in msg or "429" in msg
+            if not is_quota or attempt == max_attempts - 1:
+                raise
+            sleep_s = delay + random.uniform(0, 0.5)
+            logger.warning(
+                "Gemini quota (429); retry %d/%d after %.1fs",
+                attempt + 1, max_attempts - 1, sleep_s,
+            )
+            await asyncio.sleep(sleep_s)
+            delay *= 2
+
+
 async def _build_graph(user_id: str = "default"):
     """Build a LangGraph agent with user-specific CRM and memory tools."""
     llm_flash = ChatGoogleGenerativeAI(model="gemini-3.5-flash", **_GCP_KWARGS)
@@ -1022,7 +1077,26 @@ async def _build_graph(user_id: str = "default"):
         if not any(isinstance(m, SystemMessage) for m in messages):
             messages = [SystemMessage(content=system_content)] + messages
 
-        return {"messages": [await llm_with_tools.ainvoke(messages)]}
+        # Guard the 1M-token context limit: trim oldest history (keeping the
+        # system message and a valid human-led tail) when a long conversation
+        # would otherwise overflow. No-op for normal-length turns.
+        before = len(messages)
+        messages = trim_messages(
+            messages,
+            max_tokens=_MAX_INPUT_TOKENS,
+            token_counter=_approx_tokens,
+            strategy="last",
+            include_system=True,
+            start_on="human",
+        )
+        if len(messages) < before:
+            logger.warning(
+                "Trimmed conversation history %d -> %d messages to stay under "
+                "the %d-token context budget",
+                before, len(messages), _MAX_INPUT_TOKENS,
+            )
+
+        return {"messages": [await _ainvoke_with_backoff(llm_with_tools, messages)]}
 
     def should_continue(state: MessagesState):
         """Route after the agent node.
