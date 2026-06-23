@@ -340,8 +340,10 @@ bodies via the core tools `read_knowledge` / `search_wiki` (+ `get_skill`).
 
 ### IAM (runtime SA `samurai-bot@…`)
 Conditioned `objectViewer` (read) on `engineering/`+`support/`+
-`customers/onboarding/`; conditioned `objectAdmin` (write) on `support/`+
-`customers/onboarding/`; **plus an unconditional list-only custom role
+`customers/onboarding/`; conditioned `objectAdmin` (write) on `engineering/`+
+`support/`+`customers/onboarding/` (write scope is symmetric with read — the
+engineering KB pipeline writes `engineering/{wiki,troubleshooting}/` + its
+`.pipeline.lock`); **plus an unconditional list-only custom role
 `kbLister` (`storage.objects.list`)** — because GCS `objects.list` is bucket-level
 and cannot be prefix-conditioned, so a list-only blanket grant is required while
 content reads stay scope-conditioned.
