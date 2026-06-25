@@ -115,13 +115,18 @@ async def get_memory_store():
             conninfo = database_url.replace("postgresql+asyncpg://", "postgresql://")
             _store_pool = AsyncConnectionPool(
                 conninfo=conninfo,
-                min_size=1,
-                # 10 (not higher): Cloud SQL samurai-db (db-g1-small) caps
-                # max_connections=50 (~47 usable). With the checkpoint pool also
-                # at 10, that's 20/instance — safe for 1-2 instances; min_size=1
-                # keeps idle instances cheap. Raise the server flag before going
-                # higher.
+                min_size=0,
+                # max_size 10 pairs with the checkpoint pool (10) for a ~20-conn
+                # per-instance ceiling under Cloud SQL samurai-db's
+                # max_connections=50 (tier default, db-g1-small — verified live).
+                # min_size=0 + max_idle is deliberate: a Teams bot is idle most of
+                # the time, and min_size>0 made warm-but-idle instances squat one
+                # connection per pool indefinitely (observed: candidate revisions
+                # holding connections idle for 3+ hours). With min_size=0 an idle
+                # instance drains to ZERO connections; the first request after a
+                # lull pays a ~50ms reconnect, which is fine here.
                 max_size=10,
+                max_idle=180.0,
                 open=False,
                 kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
             )
@@ -267,10 +272,12 @@ async def get_checkpointer():
             conninfo = database_url.replace("postgresql+asyncpg://", "postgresql://")
             _checkpoint_pool = AsyncConnectionPool(
                 conninfo=conninfo,
-                min_size=1,
-                # 10: pairs with the store pool (20/instance) under the
-                # max_connections=50 Cloud SQL cap. See note on the store pool.
+                min_size=0,
+                # Mirrors the store pool: max_size 10 (~20-conn/instance ceiling),
+                # min_size=0 + max_idle so an idle instance releases all of its
+                # connections instead of squatting them. See note on the store pool.
                 max_size=10,
+                max_idle=180.0,
                 open=False,
                 kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
             )
