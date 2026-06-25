@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
@@ -37,8 +38,14 @@ def init_engine(database_url: str | None = None) -> AsyncEngine:
     global _engine, _sessionmaker
     if _engine is not None:
         return _engine
+    # NullPool: this engine backs only low-frequency callers (the /admin
+    # endpoint, the one-shot data migration, the code sandbox's CodeRun
+    # writes). A persistent pool here held connections open idle for hours
+    # (SQLAlchemy's default pool never recycles idle connections), eating into
+    # samurai-db's 50-connection budget for no benefit. NullPool opens a
+    # connection per use and closes it on release — zero idle connections.
     _engine = create_async_engine(
-        database_url or _database_url(), pool_pre_ping=True, future=True
+        database_url or _database_url(), poolclass=NullPool, future=True
     )
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     return _engine
