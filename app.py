@@ -233,6 +233,17 @@ async def on_message(turn_context: TurnContext):
     file_context = ""
     image_parts: list[dict] = []  # screenshots/images for the model to view (gated)
     attachments = turn_context.activity.attachments or []
+    if attachments:
+        print(
+            "[on_message] attachments: "
+            + "; ".join(
+                f"ct={a.content_type!r} name={a.name!r} "
+                f"has_content_url={bool(getattr(a, 'content_url', None))} "
+                f"content_keys={list(a.content.keys()) if isinstance(a.content, dict) else type(a.content).__name__}"
+                for a in attachments
+            ),
+            flush=True,
+        )
     for att in attachments:
         if _vision_enabled() and (att.content_type or "").startswith("image/"):
             file_context += await _ingest_image_attachment(att, image_parts)
