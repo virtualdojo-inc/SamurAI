@@ -107,13 +107,54 @@ def _vision_enabled() -> bool:
 # Image intake limits + Gemini-supported formats (screenshots are png/jpeg; webp common).
 _MAX_IMAGES = 4
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024
-_SUPPORTED_IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp")
+_SUPPORTED_IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """Resolve the real image type from magic bytes. Teams delivers pasted/inline
+    images with the wildcard content-type "image/*", so the declared type can't be
+    trusted — we sniff. Returns a Gemini-supported mime or None if unrecognized."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return None
+
+
+async def _get_bot_token() -> str:
+    """Bearer token for the bot's own identity, used to authenticate downloads of
+    Teams inline-image contentUrls (which sit behind the Bot Framework /v3/attachments
+    API and require auth). Best-effort: returns "" when no app credentials are
+    configured (e.g. tests) or on any failure so download can still try unauthenticated."""
+    app_id = settings.app_id
+    if not app_id:
+        return ""
+    try:
+        from botframework.connector.auth import MicrosoftAppCredentials
+
+        creds = MicrosoftAppCredentials(
+            app_id, settings.app_password, channel_auth_tenant=settings.channel_auth_tenant
+        )
+        # get_access_token is a blocking (network) call — keep it off the event loop.
+        return await asyncio.to_thread(creds.get_access_token) or ""
+    except Exception as e:
+        print(f"[on_message] bot token fetch failed: {e}", flush=True)
+        return ""
 
 
 async def _ingest_image_attachment(att, image_parts: list) -> str:
     """Download a Teams image attachment into image_parts (base64) for the model
     to view. Returns a short user-facing note for skipped/failed images, else "".
-    Never raises — a bad image must not break message handling."""
+    Never raises — a bad image must not break message handling.
+
+    Teams inline/pasted images arrive with content_type "image/*" (wildcard) and a
+    contentUrl behind the Bot Framework attachments API that requires the bot's
+    bearer token; we authenticate the download and sniff the real type from the bytes.
+    Attachments that declare a specific supported type are trusted directly."""
     import base64
     import httpx
 
@@ -121,8 +162,9 @@ async def _ingest_image_attachment(att, image_parts: list) -> str:
     ctype = att.content_type or ""
     if len(image_parts) >= _MAX_IMAGES:
         return f"\n\n[Image {name} skipped — only the first {_MAX_IMAGES} images are processed.]"
-    if ctype not in _SUPPORTED_IMAGE_TYPES:
-        return f"\n\n[Image {name} ({ctype}) — unsupported format, skipped (PNG/JPEG/WebP only).]"
+    is_wildcard = ctype == "image/*"
+    if not is_wildcard and ctype not in _SUPPORTED_IMAGE_TYPES:
+        return f"\n\n[Image {name} ({ctype}) — unsupported format, skipped (PNG/JPEG/WebP/GIF only).]"
     url = (
         getattr(att, "content_url", None)
         or (att.content or {}).get("contentUrl")
@@ -130,9 +172,13 @@ async def _ingest_image_attachment(att, image_parts: list) -> str:
     )
     if not url:
         return f"\n\n[Image {name} — no downloadable URL found, skipped.]"
+    headers = {}
+    token = await _get_bot_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url)
+            resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.content
     except Exception as e:
@@ -141,8 +187,12 @@ async def _ingest_image_attachment(att, image_parts: list) -> str:
     if len(data) > _MAX_IMAGE_BYTES:
         mb = _MAX_IMAGE_BYTES // (1024 * 1024)
         return f"\n\n[Image {name} — too large ({len(data) // 1024} KB > {mb} MB), skipped.]"
-    image_parts.append({"mime_type": ctype, "data": base64.b64encode(data).decode()})
-    print(f"[on_message] image received: {name} ({ctype}, {len(data)} bytes)", flush=True)
+    # Trust a declared specific type; for the "image/*" wildcard, sniff the bytes.
+    mime = ctype if not is_wildcard else _sniff_image_mime(data)
+    if not mime or mime not in _SUPPORTED_IMAGE_TYPES:
+        return f"\n\n[Image {name} — unsupported image format, skipped (PNG/JPEG/WebP/GIF only).]"
+    image_parts.append({"mime_type": mime, "data": base64.b64encode(data).decode()})
+    print(f"[on_message] image received: {name} ({mime}, {len(data)} bytes)", flush=True)
     return ""
 
 

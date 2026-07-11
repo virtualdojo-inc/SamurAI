@@ -220,7 +220,7 @@ class _FakeClient:
     async def __aexit__(self, *a):
         return False
 
-    async def get(self, url):
+    async def get(self, url, headers=None):
         if isinstance(self._r, Exception):
             raise self._r
         return self._r
@@ -245,6 +245,30 @@ async def test_ingest_image_success(patched_app, monkeypatch):
     assert len(parts) == 1
     assert parts[0]["mime_type"] == "image/png"
     assert base64.b64decode(parts[0]["data"]) == b"PNGBYTES"
+
+
+@pytest.mark.asyncio
+async def test_ingest_image_wildcard_sniffs_png(patched_app, monkeypatch):
+    """Teams pasted/inline images arrive as content_type 'image/*'; the real type
+    is sniffed from the bytes. Regression test for the paste-a-screenshot bug."""
+    import base64
+    png = b"\x89PNG\r\n\x1a\n" + b"rest-of-the-file"
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: _FakeClient(_FakeResp(png)))
+    parts = []
+    note = await patched_app._ingest_image_attachment(_img_att(content_type="image/*"), parts)
+    assert note == ""
+    assert len(parts) == 1
+    assert parts[0]["mime_type"] == "image/png"
+    assert base64.b64decode(parts[0]["data"]) == png
+
+
+@pytest.mark.asyncio
+async def test_ingest_image_wildcard_unrecognized_bytes_skipped(patched_app, monkeypatch):
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: _FakeClient(_FakeResp(b"not-an-image")))
+    parts = []
+    note = await patched_app._ingest_image_attachment(_img_att(content_type="image/*"), parts)
+    assert "unsupported" in note.lower()
+    assert parts == []
 
 
 @pytest.mark.asyncio
