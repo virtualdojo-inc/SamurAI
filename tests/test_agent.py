@@ -442,6 +442,25 @@ def test_needs_pro_model_for_oscal(mock_llm):
     assert agent._needs_pro_model([HumanMessage(content="look up control AC-2")])
 
 
+def test_needs_pro_model_handles_multimodal_content(mock_llm):
+    """Image turns give HumanMessage a list content (text + image blocks). The
+    keyword check must read the text block, not crash on `.lower()` of a list.
+    Regression for the paste-a-screenshot AttributeError."""
+    _, agent = mock_llm
+    from langchain_core.messages import HumanMessage
+
+    multimodal = [
+        {"type": "text", "text": "review code in main.py"},
+        {"type": "image", "base64": "AAAA", "mime_type": "image/png"},
+    ]
+    assert agent._needs_pro_model([HumanMessage(content=multimodal)]) is True
+    plain_img = [{"type": "image", "base64": "AAAA", "mime_type": "image/png"}]
+    assert agent._needs_pro_model([HumanMessage(content=plain_img)]) is False
+    # _text_of extracts the text block(s) and ignores images
+    assert agent._text_of(multimodal) == "review code in main.py"
+    assert agent._text_of("plain string") == "plain string"
+
+
 def test_needs_pro_model_for_fix_issue(mock_llm):
     """Controlled issue-fix phrasings should route to the Pro model."""
     _, agent = mock_llm

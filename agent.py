@@ -905,6 +905,23 @@ PRO_MODEL_KEYWORDS = [
 ]
 
 
+def _text_of(content) -> str:
+    """Plain text of a message whose content may be a string or a multimodal list
+    (text + image blocks, when images are attached — see _build_human_content).
+    Everything that keyword-matches or caches on the user's text must go through
+    this, or it hits `'list' object has no attribute 'lower'` on image turns."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "") if isinstance(b, dict) and b.get("type") == "text"
+            else b if isinstance(b, str) else ""
+            for b in content
+        ]
+        return " ".join(p for p in parts if p)
+    return str(content or "")
+
+
 def _needs_pro_model(messages) -> bool:
     """Check if the conversation needs the Pro model for complex reasoning."""
     last_human = next(
@@ -912,7 +929,7 @@ def _needs_pro_model(messages) -> bool:
     )
     if not last_human:
         return False
-    content = last_human.content.lower()
+    content = _text_of(last_human.content).lower()
     return any(kw in content for kw in PRO_MODEL_KEYWORDS)
 
 
@@ -966,11 +983,12 @@ def _spawn_background(fn, /, **kwargs) -> None:
 
 
 async def _retrieve_memories_cached(user_id: str, last_human) -> str:
-    key = (user_id, last_human.content)
+    text = _text_of(last_human.content)
+    key = (user_id, text)
     cached = _memory_cache.get(key)
     if cached is not None:
         return cached
-    result = await retrieve_relevant_memories(user_id, last_human.content) or ""
+    result = await retrieve_relevant_memories(user_id, text) or ""
     if len(_memory_cache) >= _MEMORY_CACHE_MAX:
         _memory_cache.clear()
     _memory_cache[key] = result
@@ -1122,9 +1140,10 @@ async def _build_graph(user_id: str = "default"):
         last_human = next(
             (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
         )
+        last_human_text = _text_of(last_human.content) if last_human else ""
         if last_human:
             selected_tools = _select_tool_groups(
-                last_human.content, memory_tools=memory_tools
+                last_human_text, memory_tools=memory_tools
             ) + always_user_tools
         else:
             selected_tools = all_tools
@@ -1135,7 +1154,7 @@ async def _build_graph(user_id: str = "default"):
         # _select_tool_groups). Core is always-on; other sections load on
         # keyword match. Cuts active context 60-80% on the common case.
         if last_human:
-            system_content = _select_prompt_sections(last_human.content)
+            system_content = _select_prompt_sections(last_human_text)
             memory_context = await _retrieve_memories_cached(
                 user_id, last_human
             )
