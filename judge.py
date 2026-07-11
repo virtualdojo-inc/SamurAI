@@ -186,7 +186,7 @@ _GCP_KWARGS = dict(
 )
 
 # Lazy-initialized model singletons. Mirror the pattern used in
-# agent.py for _ack_llm, llm_flash, llm_pro.
+# agent.py for llm_flash, llm_pro.
 _stage1_llm = None
 _stage2_llm = None
 

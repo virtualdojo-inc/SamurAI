@@ -834,6 +834,14 @@ def _select_prompt_sections(message: str, hints_override: str | None = None) -> 
     Core section is always included. Other sections load when their keywords
     appear in the user's message. Mirrors _select_tool_groups.
     """
+    # Cache per message (production path only — hints_override is the selftune
+    # eval harness and must see a fresh assembly). The loaders below are TTL-
+    # cached individually, but this also skips re-running them on every hop.
+    if hints_override is None:
+        hit = _prompt_cache.get(message)
+        if hit is not None and (time.time() - hit[0]) < _PROMPT_CACHE_TTL:
+            return hit[1]
+
     msg_lower = message.lower()
     parts = [PROMPT_SECTIONS["core"]["content"]]
     for name, section in PROMPT_SECTIONS.items():
@@ -860,7 +868,12 @@ def _select_prompt_sections(message: str, hints_override: str | None = None) -> 
     hints = wrap_hints(hints_override) if hints_override is not None else learned_hints_text()
     if hints:
         parts.append(hints)
-    return "\n\n".join(parts)
+    assembled = "\n\n".join(parts)
+    if hints_override is None:
+        if len(_prompt_cache) >= _PROMPT_CACHE_MAX:
+            _prompt_cache.clear()
+        _prompt_cache[message] = (time.time(), assembled)
+    return assembled
 
 
 # Joined for backward compatibility (tests reference SYSTEM_PROMPT as a string).
@@ -918,15 +931,13 @@ _GCP_KWARGS = dict(
     vertexai=True,
 )
 
-# Lightweight model for instant acknowledgments — no tools, tiny prompt
-_ack_llm = None
-
-
-def _get_ack_llm():
-    global _ack_llm
-    if _ack_llm is None:
-        _ack_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", **_GCP_KWARGS)
-    return _ack_llm
+# Per-message prompt-assembly cache. _select_prompt_sections runs on EVERY graph
+# hop (3-15 per turn) and its loaders (skills catalog, knowledge index, tracker
+# index, hints) are pure functions of the message within a turn. Same bounded
+# full-eviction pattern as _memory_cache below.
+_prompt_cache: dict[str, tuple[float, str]] = {}
+_PROMPT_CACHE_MAX = 100
+_PROMPT_CACHE_TTL = 60.0
 
 
 # Per-turn memory cache. retrieve_relevant_memories was running on every
@@ -935,6 +946,23 @@ def _get_ack_llm():
 # size with simple full-eviction on overflow — memory blobs are small.
 _memory_cache: dict[tuple[str, str], str] = {}
 _MEMORY_CACHE_MAX = 200
+
+
+# Fire-and-forget tasks (post-reply logging). Strong refs so tasks aren't GC'd
+# mid-flight; sync callables run in a worker thread to keep the loop free.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(fn, /, **kwargs) -> None:
+    async def _run():
+        try:
+            await asyncio.to_thread(fn, **kwargs)
+        except Exception as e:  # best-effort by contract — never surface
+            logger.warning("[background] %s failed: %s", getattr(fn, "__name__", fn), e)
+
+    task = asyncio.create_task(_run())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def _retrieve_memories_cached(user_id: str, last_human) -> str:
@@ -1015,12 +1043,15 @@ def _cap_message_content(messages):
     return out
 
 
-async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 4):
+async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 6):
     """Invoke the model, retrying on Gemini 429 RESOURCE_EXHAUSTED with backoff.
 
     The agent call path has no quota guard, so a saturated per-minute quota
-    surfaces to the user as a dead turn. Exponential backoff (1s, 2s, 4s, +jitter)
-    rides out short QPM spikes; non-quota errors propagate immediately.
+    surfaces to the user as a dead turn. Exponential backoff (1s, 2s, 4s, ...
+    capped at 30s, +jitter) rides out QPM spikes; non-quota errors propagate
+    immediately. 429 responses aren't billed, so extra attempts cost latency
+    only — and the 2026-07 logs showed background tasks dying after exhausting
+    the previous 3 retries during a quota storm.
     """
     delay = 1.0
     for attempt in range(max_attempts):
@@ -1031,7 +1062,7 @@ async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 4)
             is_quota = "RESOURCE_EXHAUSTED" in msg or "429" in msg
             if not is_quota or attempt == max_attempts - 1:
                 raise
-            sleep_s = delay + random.uniform(0, 0.5)
+            sleep_s = min(delay, 30.0) + random.uniform(0, 0.5)
             logger.warning(
                 "Gemini quota (429); retry %d/%d after %.1fs",
                 attempt + 1, max_attempts - 1, sleep_s,
@@ -1431,24 +1462,12 @@ async def run_agent(
     # plain string otherwise. See _build_human_content.
     human_content = _build_human_content(message, images)
 
-    # Fast acknowledgment via lightweight model (no tools, ~0.5s)
+    # Instant canned acknowledgment. This was an extra Vertex call (~0.5-1s of
+    # serial latency + one billed request per message) purchased for a one-line
+    # nicety — a static ack plus the typing indicator reads the same and is free.
     if status_callback:
         try:
-            ack_llm = _get_ack_llm()
-            ack_response = await ack_llm.ainvoke([
-                SystemMessage(content=(
-                    "You are SamurAI, a DevOps assistant. The user just sent a message. "
-                    "Write a single brief sentence acknowledging what they asked and that you're working on it. "
-                    "Be natural and specific to their request. No emojis. No tool names. Examples: "
-                    "'Let me check the production logs for you.' "
-                    "'I\\'ll look into those GitHub issues.' "
-                    "'Pulling up the service status now.'"
-                )),
-                HumanMessage(content=user_message),
-            ])
-            ack_text = _extract_text(ack_response.content).strip()
-            if ack_text:
-                await status_callback(ack_text)
+            await status_callback("On it — working on that now.")
         except Exception:
             pass  # Don't block the main agent if ack fails
 
@@ -1777,8 +1796,11 @@ async def run_agent(
     user_config = {"configurable": {"user_id": user_id}}
 
     # Durable raw-conversation capture (the wiki's nightly ingest). Best-effort:
-    # log_turn swallows its own errors so it can never break the turn.
-    log_turn(
+    # log_turn swallows its own errors so it can never break the turn. Runs in
+    # the background — it writes to the GCS FUSE mount, and the reply must not
+    # wait on a network filesystem.
+    _spawn_background(
+        log_turn,
         conversation_id=conversation_id,
         user_id=user_id,
         user_name=user_name,
@@ -1800,7 +1822,10 @@ async def run_agent(
         for k in ("support", "ticket", "troubleshoot", "bug", "not working", "error", "issue")
     )
     if _is_support:
-        log_support_chat(
+        # Background: a synchronous GCS upload that fires on most troubleshooting
+        # turns — must not sit between the agent finishing and the reply sending.
+        _spawn_background(
+            log_support_chat,
             conversation_id=conversation_id,
             user_id=user_id,
             user_name=user_name,
@@ -1833,25 +1858,6 @@ async def run_agent(
                 f"{type(e).__name__}: {e}",
                 flush=True,
             )
-
-    # 3. Print store counts per namespace so we see whether writes ever land.
-    # Uses query='x' (non-empty) because LangMem's semantic store may reject
-    # empty queries. Counts are bounded at 1000 — accurate enough to spot
-    # the core=0 case.
-    try:
-        from memory import CORE_NAMESPACE, TEAM_NAMESPACE, get_memory_store
-        store = await get_memory_store()
-        core_count = len(await store.asearch(CORE_NAMESPACE, query="x", limit=1000))
-        team_count = len(await store.asearch(TEAM_NAMESPACE, query="x", limit=1000))
-        print(
-            f"[memory.store] core={core_count} team={team_count}",
-            flush=True,
-        )
-    except Exception as e:
-        print(
-            f"[memory.store] count FAILED: {type(e).__name__}: {e}",
-            flush=True,
-        )
 
     # Periodic persistence — flush memories to SQLite every call
     # (lightweight no-op if nothing changed)

@@ -334,9 +334,16 @@ A Cloud Run deploy/drain will cancel in-flight background work, so the compile i
 `wiki.py` reads `<scope>/{wiki,playbooks,troubleshooting}/*.md` via the
 google-cloud-storage **client** (NOT gcsfuse — gcsfuse needs blanket bucket list
 which violates scope isolation) for scopes `engineering`, `support`,
-`customers/onboarding`. TTL-cached (300s) so nightly updates appear without a
-redeploy. Title/summary injected into the prompt (`knowledge_index_text`); full
-bodies via the core tools `read_knowledge` / `search_wiki` (+ `get_skill`).
+`customers/onboarding`. TTL-cached (300s, **stale-while-revalidate**: a stale
+cache is served immediately and refreshed in a background thread — the sync GCS
+client must never run on the event loop) so nightly updates appear without a
+redeploy. `support/playbooks/` is the **lazy tier** (`wiki.LAZY_PREFIXES`): it
+grows unbounded (one playbook per area, hundreds of files), so it is listed by
+NAME only — never bulk-downloaded, never given per-article index lines (which
+once bloated every model call by ~45k tokens). Curated scopes get title/summary
+index lines (`knowledge_index_text`); playbooks get one summary line, with
+bodies fetched one blob at a time by `read_knowledge` / `search_wiki`
+(+ `get_skill`). Caches are warmed at startup (`app.py on_startup`).
 
 ### IAM (runtime SA `samurai-bot@…`)
 Conditioned `objectViewer` (read) on `engineering/`+`support/`+

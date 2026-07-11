@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -155,17 +156,52 @@ def _load_bucket_skills() -> list[dict]:
     return out
 
 
+_refresh_lock = threading.Lock()
+_refreshing = False
+
+
+def _refresh_in_background() -> None:
+    """Single-flight daemon-thread refresh; callers keep serving the stale cache.
+
+    The bucket list is a synchronous GCS call — refreshing on the request path
+    (load_skill_catalog is called during prompt assembly, on the event loop)
+    would block the loop for the duration.
+    """
+    global _refreshing
+
+    def _run():
+        global _refreshing
+        try:
+            _load_catalog()
+        except Exception as e:
+            logger.warning("[skills] background refresh failed: %s", e)
+        finally:
+            _refreshing = False
+
+    with _refresh_lock:
+        if _refreshing:
+            return
+        _refreshing = True
+    threading.Thread(target=_run, name="skills-refresh", daemon=True).start()
+
+
 def load_skill_catalog(force: bool = False) -> list[dict]:
     """Load + cache skills: repo skills, with bucket skills overriding by name.
 
     A bucket skill wins on a name clash so a chat-time edit (authored to
-    ``support/skills/``) takes effect without a redeploy. TTL-cached so bucket
-    edits are picked up within ``_CACHE_TTL`` seconds.
+    ``support/skills/``) takes effect without a redeploy. TTL-cached; a stale
+    cache is served as-is and refreshed in a background thread.
     """
-    global _catalog_cache, _cache_ts
-    fresh = _catalog_cache is not None and (time.time() - _cache_ts) < _CACHE_TTL
-    if fresh and not force:
+    if not force and _catalog_cache is not None:
+        if (time.time() - _cache_ts) >= _CACHE_TTL:
+            _refresh_in_background()
         return _catalog_cache
+    return _load_catalog()
+
+
+def _load_catalog() -> list[dict]:
+    """Synchronous full load — bucket I/O when enabled; call off the event loop."""
+    global _catalog_cache, _cache_ts
 
     # Repo first (dedup keep-first among repo files), then bucket overrides by name.
     by_name: dict[str, dict] = {}

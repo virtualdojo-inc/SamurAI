@@ -10,9 +10,14 @@ def _temp_db(tmp_path, monkeypatch):
     """Point the store + sync index at a throwaway DB; reset the singleton."""
     db = str(tmp_path / "tasks.sqlite")
     monkeypatch.setattr(td, "TASK_DB_PATH", db)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     td._store = None
+    td._ready_count_cache = None
+    td._ready_count_ts = 0.0
     yield
     td._store = None
+    td._ready_count_cache = None
+    td._ready_count_ts = 0.0
 
 
 # ── row_content_hash ────────────────────────────────────────────────────
@@ -130,3 +135,55 @@ async def test_tool_list_and_detail():
 async def test_tool_unknown_issue():
     out = await td.get_tracker_diagnostics.ainvoke({"github_issue_no": "404"})
     assert "No prepared diagnosis for GitHub #404" in out
+
+
+# ── prompt-index count cache (no per-hop I/O) ─────────────────────────────
+
+
+async def test_index_count_cache_refreshed_on_writes():
+    store = await td.get_diagnostics_store()
+    await store.upsert_diagnosis(row_id="1", sheet_id="s", row_hash="h", diagnosis="d")
+    assert td._ready_count_cache == 1
+    await store.mark_stale("1")
+    assert td._ready_count_cache == 0
+
+
+def test_index_never_queries_sqlite_under_database_url(monkeypatch):
+    """On the Postgres backbone, prompt assembly must serve the cache — never a
+    blocking sync query (the old per-hop sqlite-over-GCS-FUSE read)."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x/y")
+    monkeypatch.setattr(
+        td, "_ready_count_sync",
+        lambda: pytest.fail("sync sqlite query issued despite DATABASE_URL"),
+    )
+    td._ready_count_cache = None
+    assert td.tracker_diagnostics_index_text() == ""  # no cache yet -> 0
+    td._ready_count_cache = 3
+    td._ready_count_ts = 0.0  # stale is fine — cache still wins over sync I/O
+    assert "3 tracker item" in td.tracker_diagnostics_index_text()
+
+
+def test_index_sqlite_fallback_result_is_cached(monkeypatch):
+    calls = []
+
+    def _count():
+        calls.append(1)
+        return 2
+
+    monkeypatch.setattr(td, "_ready_count_sync", _count)
+    assert "2 tracker item" in td.tracker_diagnostics_index_text()
+    assert "2 tracker item" in td.tracker_diagnostics_index_text()
+    assert len(calls) == 1  # second call served from the TTL cache
+
+
+# ── store runs on the shared SQLAlchemy backbone ─────────────────────────
+
+
+async def test_store_accepts_sqlalchemy_url(tmp_path):
+    """The store takes a URL (prod passes DATABASE_URL) or a bare file path."""
+    url_store = td.DiagnosticsStore(f"sqlite+aiosqlite:///{tmp_path}/via_url.sqlite")
+    await url_store.initialize()
+    await url_store.upsert_diagnosis(row_id="9", sheet_id="s", row_hash="h", diagnosis="d")
+    rec = await url_store.get("9")
+    assert rec["diagnosis"] == "d"
+    assert rec["status"] == "diagnosed"

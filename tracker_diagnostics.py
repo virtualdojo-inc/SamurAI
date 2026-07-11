@@ -21,12 +21,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import time
 
-import aiosqlite
 from langchain_core.tools import tool
+from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from db.models import Base, TRACKER_DIAGNOSTICS_TABLES, TrackerDiagnostic
 from task_store import TASK_DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -60,49 +63,61 @@ def row_content_hash(row: dict) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def _row_to_dict(obj: TrackerDiagnostic) -> dict:
+    return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+
+
 class DiagnosticsStore:
-    """SQLite persistence for parked tracker diagnostics (on the task DB)."""
+    """Persistence for parked tracker diagnostics (async SQLAlchemy).
+
+    Runs on the Postgres backbone in prod (DATABASE_URL) and on a SQLite file
+    for tests/local — the same dual-backend pattern as ``task_store.TaskStore``.
+    The previous raw-aiosqlite table on the GCS-FUSE file corrupted under
+    concurrent writers ("database disk image is malformed", 2026-07).
+    """
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._url = db_path if "://" in db_path else f"sqlite+aiosqlite:///{db_path}"
+        self._engine = None
+        self._sessionmaker: async_sessionmaker | None = None
 
     async def initialize(self) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """CREATE TABLE IF NOT EXISTS tracker_diagnostics (
-                    row_id TEXT PRIMARY KEY,
-                    sheet_id TEXT NOT NULL,
-                    row_hash TEXT NOT NULL,
-                    github_issue_no TEXT,
-                    summary TEXT NOT NULL DEFAULT '',
-                    category TEXT NOT NULL DEFAULT 'unknown',
-                    suggested_type TEXT,
-                    suggested_priority TEXT,
-                    diagnosis TEXT NOT NULL,
-                    model TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'diagnosed',
-                    computed_at REAL NOT NULL
-                )"""
+        """Create the engine + the diagnostics table. Idempotent."""
+        if self._engine is None:
+            self._engine = create_async_engine(self._url, future=True)
+            self._sessionmaker = async_sessionmaker(self._engine, expire_on_commit=False)
+        async with self._engine.begin() as conn:
+            await conn.run_sync(
+                lambda c: Base.metadata.create_all(
+                    c, tables=TRACKER_DIAGNOSTICS_TABLES, checkfirst=True
+                )
             )
-            await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_diag_status "
-                "ON tracker_diagnostics(status)"
-            )
-            await db.commit()
         logger.info("Tracker diagnostics store initialized: %s", self.db_path)
+        await self._refresh_ready_count()
+
+    async def _refresh_ready_count(self) -> None:
+        """Keep the sync prompt-index count cache warm (see tracker_diagnostics_index_text)."""
+        global _ready_count_cache, _ready_count_ts
+        try:
+            async with self._sessionmaker() as session:
+                result = await session.execute(
+                    select(func.count())
+                    .select_from(TrackerDiagnostic)
+                    .where(TrackerDiagnostic.status == "diagnosed")
+                )
+                _ready_count_cache = int(result.scalar_one())
+                _ready_count_ts = time.time()
+        except Exception as e:  # cache only — never break a write path
+            logger.warning("[tracker.diag] ready-count refresh failed: %s", e)
 
     async def needs_diagnosis(self, row_id: str, row_hash: str) -> bool:
         """True if this row has no stored diagnosis, or its content changed."""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT row_hash, status FROM tracker_diagnostics WHERE row_id = ?",
-                (str(row_id),),
-            )
-            existing = await cursor.fetchone()
-        if existing is None:
+        async with self._sessionmaker() as session:
+            obj = await session.get(TrackerDiagnostic, str(row_id))
+        if obj is None:
             return True
-        stored_hash, status = existing
-        return stored_hash != row_hash or status == "stale"
+        return obj.row_hash != row_hash or obj.status == "stale"
 
     async def upsert_diagnosis(
         self,
@@ -118,50 +133,33 @@ class DiagnosticsStore:
         suggested_priority: str | None = None,
         model: str = "",
     ) -> None:
-        now = time.time()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """INSERT INTO tracker_diagnostics
-                   (row_id, sheet_id, row_hash, github_issue_no, summary,
-                    category, suggested_type, suggested_priority, diagnosis,
-                    model, status, computed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'diagnosed', ?)
-                   ON CONFLICT(row_id) DO UPDATE SET
-                       sheet_id = excluded.sheet_id,
-                       row_hash = excluded.row_hash,
-                       github_issue_no = excluded.github_issue_no,
-                       summary = excluded.summary,
-                       category = excluded.category,
-                       suggested_type = excluded.suggested_type,
-                       suggested_priority = excluded.suggested_priority,
-                       diagnosis = excluded.diagnosis,
-                       model = excluded.model,
-                       status = 'diagnosed',
-                       computed_at = excluded.computed_at""",
-                (
-                    str(row_id),
-                    str(sheet_id),
-                    row_hash,
-                    github_issue_no,
-                    summary,
-                    category,
-                    suggested_type,
-                    suggested_priority,
-                    diagnosis,
-                    model,
-                    now,
-                ),
-            )
-            await db.commit()
+        fields = dict(
+            sheet_id=str(sheet_id),
+            row_hash=row_hash,
+            github_issue_no=github_issue_no,
+            summary=summary,
+            category=category,
+            suggested_type=suggested_type,
+            suggested_priority=suggested_priority,
+            diagnosis=diagnosis,
+            model=model,
+            status="diagnosed",
+            computed_at=time.time(),
+        )
+        async with self._sessionmaker() as session:
+            obj = await session.get(TrackerDiagnostic, str(row_id))
+            if obj is None:
+                session.add(TrackerDiagnostic(row_id=str(row_id), **fields))
+            else:
+                for k, v in fields.items():
+                    setattr(obj, k, v)
+            await session.commit()
+        await self._refresh_ready_count()
 
     async def get(self, row_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM tracker_diagnostics WHERE row_id = ?", (str(row_id),)
-            )
-            row = await cursor.fetchone()
-            return dict(row) if row else None
+        async with self._sessionmaker() as session:
+            obj = await session.get(TrackerDiagnostic, str(row_id))
+            return _row_to_dict(obj) if obj else None
 
     async def list_ready(
         self,
@@ -169,46 +167,56 @@ class DiagnosticsStore:
         github_issue_no: str | None = None,
         limit: int = 50,
     ) -> list[dict]:
-        query = "SELECT * FROM tracker_diagnostics WHERE status = 'diagnosed'"
-        params: list = []
+        stmt = select(TrackerDiagnostic).where(TrackerDiagnostic.status == "diagnosed")
         if category:
-            query += " AND category = ?"
-            params.append(category)
+            stmt = stmt.where(TrackerDiagnostic.category == category)
         if github_issue_no:
-            query += " AND github_issue_no = ?"
-            params.append(str(github_issue_no))
-        query += " ORDER BY computed_at DESC LIMIT ?"
-        params.append(limit)
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(query, params)
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            stmt = stmt.where(TrackerDiagnostic.github_issue_no == str(github_issue_no))
+        stmt = stmt.order_by(TrackerDiagnostic.computed_at.desc()).limit(limit)
+        async with self._sessionmaker() as session:
+            result = await session.execute(stmt)
+            return [_row_to_dict(o) for o in result.scalars().all()]
 
     async def mark_stale(self, row_id: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE tracker_diagnostics SET status = 'stale' WHERE row_id = ?",
-                (str(row_id),),
+        async with self._sessionmaker() as session:
+            await session.execute(
+                update(TrackerDiagnostic)
+                .where(TrackerDiagnostic.row_id == str(row_id))
+                .values(status="stale")
             )
-            await db.commit()
+            await session.commit()
+        await self._refresh_ready_count()
 
 
 async def get_diagnostics_store() -> DiagnosticsStore:
-    """Get or create the singleton diagnostics store."""
+    """Get or create the singleton diagnostics store.
+
+    Uses DATABASE_URL (Postgres) in prod; falls back to the SQLite file when
+    DATABASE_URL is unset (tests/local) — mirrors ``task_store.get_task_store``.
+    """
     global _store
     if _store is None:
-        _store = DiagnosticsStore(TASK_DB_PATH)
+        url = os.environ.get("DATABASE_URL")
+        _store = DiagnosticsStore(url or TASK_DB_PATH)
         await _store.initialize()
     return _store
+
+
+# Prompt-index count cache. ``_select_prompt_sections`` is sync and runs on
+# every graph hop, so it must not do per-hop I/O (the old version ran a
+# sqlite3 query against the GCS-FUSE file on every hop). The cache is refreshed
+# by the store on initialize and after every write.
+_ready_count_cache: int | None = None
+_ready_count_ts: float = 0.0
+_READY_COUNT_TTL = 300  # sqlite fallback re-query interval
 
 
 def _ready_count_sync() -> int:
     """Synchronous count of ready diagnoses for the prompt index.
 
-    ``_select_prompt_sections`` is sync, so this does a guarded read-only
-    sqlite3 query. Any error (DB missing, table not yet created) yields 0 so it
-    can never break prompt assembly.
+    Guarded read-only sqlite3 query — the no-DATABASE_URL fallback only. Any
+    error (DB missing, table not yet created) yields 0 so it can never break
+    prompt assembly.
     """
     try:
         conn = sqlite3.connect(TASK_DB_PATH, timeout=1.0)
@@ -223,9 +231,23 @@ def _ready_count_sync() -> int:
         return 0
 
 
+def _ready_count() -> int:
+    global _ready_count_cache, _ready_count_ts
+    fresh = _ready_count_cache is not None and (time.time() - _ready_count_ts) < _READY_COUNT_TTL
+    if fresh:
+        return _ready_count_cache
+    if os.environ.get("DATABASE_URL"):
+        # Postgres: never issue a blocking sync query from prompt assembly.
+        # Serve the (possibly stale) cache; the store refreshes it on writes.
+        return _ready_count_cache or 0
+    _ready_count_cache = _ready_count_sync()
+    _ready_count_ts = time.time()
+    return _ready_count_cache
+
+
 def tracker_diagnostics_index_text() -> str:
     """One-line prompt index (level-1 disclosure), mirrors knowledge_index_text."""
-    count = _ready_count_sync()
+    count = _ready_count()
     if count <= 0:
         return ""
     return (

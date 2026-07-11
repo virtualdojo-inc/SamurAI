@@ -317,3 +317,71 @@ async def test_on_error_sends_apology(patched_app):
     ctx.send_activity.assert_called_once()
     msg = ctx.send_activity.call_args[0][0]
     assert "something went wrong" in msg.lower() or "something went wrong" in str(msg).lower()
+
+
+# --- Error-handler resilience + turn timeout (2026-07 log fixes) ---
+
+
+@pytest.mark.asyncio
+async def test_on_error_survives_dead_connection(patched_app):
+    """If the gateway already canceled the request, the fallback reply itself
+    throws — on_error must swallow that instead of turning it into a 500."""
+    ctx = MagicMock()
+    ctx.send_activity = AsyncMock(side_effect=Exception("A task was canceled."))
+    await patched_app.on_error(ctx, Exception("boom"))  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_on_message_times_out_gracefully(patched_app, monkeypatch):
+    import asyncio
+
+    ctx, member = _make_turn_context("investigate everything")
+    monkeypatch.setattr(patched_app, "_TURN_TIMEOUT_S", 0.05)
+
+    async def never_finishes(*args, **kwargs):
+        await asyncio.sleep(5)
+        return "too late"
+
+    with (
+        patch.object(patched_app, "run_agent", side_effect=never_finishes),
+        patch("botbuilder.core.teams.TeamsInfo.get_member", new_callable=AsyncMock, return_value=member),
+        patch("task_store.get_task_store", new_callable=AsyncMock),
+    ):
+        await patched_app.on_message(ctx)
+
+    # The timeout path sends a plain string (not an Activity).
+    sent_texts = [
+        str(getattr(call[0][0], "text", None) or call[0][0])
+        for call in ctx.send_activity.call_args_list
+    ]
+    assert any("taking longer" in t for t in sent_texts)
+    assert not any("too late" in t for t in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_roster_persist_does_not_block_reply(patched_app):
+    """The conversation-ref/roster persistence runs as a background task; a
+    hanging store must not delay (or fail) the user's reply."""
+    import asyncio
+
+    ctx, member = _make_turn_context("hello")
+    store_started = asyncio.Event()
+
+    async def _hanging_store(*args, **kwargs):
+        store_started.set()
+        await asyncio.sleep(30)
+
+    with (
+        patch.object(patched_app, "run_agent", new_callable=AsyncMock, return_value="done"),
+        patch("botbuilder.core.teams.TeamsInfo.get_member", new_callable=AsyncMock, return_value=member),
+        patch("task_store.get_task_store", side_effect=_hanging_store),
+    ):
+        await asyncio.wait_for(patched_app.on_message(ctx), timeout=5)
+
+    sent_texts = [
+        str(call[0][0].text) if hasattr(call[0][0], "text") else ""
+        for call in ctx.send_activity.call_args_list
+    ]
+    assert any("done" in t for t in sent_texts)  # reply arrived despite hung store
+    for t in list(patched_app._background_tasks):
+        t.cancel()

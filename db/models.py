@@ -157,13 +157,42 @@ class TeamRoster(Base):
     updated_at: Mapped[float] = mapped_column(Float, nullable=False, default=time.time)
 
 
+class TrackerDiagnostic(Base):
+    """Parked DH Tech Issue Tracker diagnoses (see tracker_diagnostics.py).
+
+    Migrated off the raw-aiosqlite table on the GCS-FUSE file, which corrupted
+    ("database disk image is malformed") under concurrent writers — same failure
+    class that moved the task store to Postgres. Generic types so the model runs
+    on SQLite (tests/local) and Postgres (prod).
+    """
+
+    __tablename__ = "tracker_diagnostics"
+
+    row_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    sheet_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    row_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    github_issue_no: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    category: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
+    suggested_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    suggested_priority: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    diagnosis: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="diagnosed")
+    computed_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (Index("idx_diag_status", "status"),)
+
+
 # Tables migrated from the old SQLite task store — created via create_all on the
 # store's own engine (works on SQLite + Postgres). The pgvector table (code_runs)
 # is intentionally excluded so the SQLite fallback path never sees a Vector column.
 TASK_STORE_TABLES = [Task.__table__, ConversationRef.__table__, TeamRoster.__table__]
+TRACKER_DIAGNOSTICS_TABLES = [TrackerDiagnostic.__table__]
 
 
 __all__ = [
     "Base", "PendingApproval", "CodeRun", "EMBED_DIM",
     "Task", "ConversationRef", "TeamRoster", "TASK_STORE_TABLES",
+    "TrackerDiagnostic", "TRACKER_DIAGNOSTICS_TABLES",
 ]

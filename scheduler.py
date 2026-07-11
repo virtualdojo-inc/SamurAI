@@ -114,12 +114,22 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
     return _scheduler
 
 
+# Serialize the heavyweight background pipelines. They all call Gemini, and the
+# 2026-07 log review showed the KB compile (*/5), the engineering sync, the
+# tracker-triage batch (*/10), and proactive tasks landing on the same minutes —
+# saturating the model quota (429 RESOURCE_EXHAUSTED storms) and pinning the
+# single warm instance long enough for live Teams requests to hit Cloud Run's
+# 600s timeout. One pipeline at a time is plenty; they're all periodic caches.
+_BG_PIPELINE_LOCK = asyncio.Lock()
+
+
 async def _run_kb_pipeline() -> None:
     """Run the in-boundary KB pipeline off the event loop (it does blocking I/O)."""
     from kb.run import run_support_pipeline
 
     try:
-        await asyncio.to_thread(run_support_pipeline)
+        async with _BG_PIPELINE_LOCK:
+            await asyncio.to_thread(run_support_pipeline)
     except Exception as e:  # never let a pipeline run crash the scheduler
         # exc_info=True so the FULL traceback lands in Cloud Logging — without
         # it we only get "<Type>: <msg>" and the real failure stays hidden.
@@ -134,7 +144,8 @@ async def _run_kb_engineering_pipeline() -> None:
     from kb.run import run_engineering_pipeline
 
     try:
-        await asyncio.to_thread(run_engineering_pipeline)
+        async with _BG_PIPELINE_LOCK:
+            await asyncio.to_thread(run_engineering_pipeline)
     except Exception as e:  # never let a pipeline run crash the scheduler
         logger.error(
             "[kb.run] engineering pipeline failed: %s: %s",
@@ -147,7 +158,8 @@ async def _run_tuning_cycle() -> None:
     from selftune.loop import run_tuning_cycle
 
     try:
-        await asyncio.to_thread(run_tuning_cycle)
+        async with _BG_PIPELINE_LOCK:
+            await asyncio.to_thread(run_tuning_cycle)
     except Exception as e:  # never let a tuning run crash the scheduler
         logger.error(
             "[selftune] cycle failed: %s: %s",
@@ -160,9 +172,13 @@ async def _run_tracker_triage() -> None:
     from tracker_triage import run_triage_batch
 
     try:
-        await run_triage_batch()
+        async with _BG_PIPELINE_LOCK:
+            await run_triage_batch()
     except Exception as e:  # never let a triage run crash the scheduler
-        logger.error("[tracker.triage] batch failed: %s: %s", type(e).__name__, e)
+        logger.error(
+            "[tracker.triage] batch failed: %s: %s",
+            type(e).__name__, e, exc_info=True,
+        )
 
 
 def _register_job(task: dict) -> None:
@@ -183,6 +199,16 @@ def _register_job(task: dict) -> None:
             run_date = datetime.fromisoformat(task["run_at"])
         except ValueError as e:
             logger.error("Invalid run_at for task %s: %s", task["id"], e)
+            return
+        # A restart rebuilds jobs from the store, which can resurface one-shots
+        # whose run time is long past (observed: a job "missed by 82 days" firing
+        # a misfire warning after a deploy). Don't register ancient one-shots.
+        now = datetime.now(run_date.tzinfo) if run_date.tzinfo else datetime.now()
+        if (now - run_date).total_seconds() > 3600:
+            logger.warning(
+                "Skipping stale one-shot task %s (run_at=%s is >1h past)",
+                task["id"], task["run_at"],
+            )
             return
         trigger = DateTrigger(run_date=run_date)
     else:

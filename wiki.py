@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -34,6 +35,11 @@ logger = logging.getLogger(__name__)
 # served — they're a searchable log, not knowledge.
 SERVE_SCOPES = ["engineering", "support", "customers/onboarding"]
 SERVE_SUBDIRS = ["wiki", "playbooks", "troubleshooting"]
+# Prefixes with unbounded article counts (kb/compile.py emits one playbook per
+# area — hundreds of files). These are listed by NAME only: never bulk-downloaded,
+# never given per-article index lines in the prompt. Bodies are fetched one at a
+# time on demand by read_knowledge / search_wiki.
+LAZY_PREFIXES = ["support/playbooks/"]
 # Repo skills stay repo-local; only knowledge moved to the bucket.
 SKILLS_DIR = Path(__file__).parent / "skills"
 # Transition fallback to repo knowledge/ until it is retired.
@@ -43,6 +49,12 @@ _CACHE_TTL = 300  # seconds — balance freshness (nightly updates) vs per-turn 
 
 _catalog_cache: list[dict] | None = None
 _cache_ts: float = 0.0
+# stem -> full object path for lazily-served articles (refreshed with the catalog)
+_lazy_names_cache: dict[str, str] = {}
+# stem -> parsed article, populated one blob at a time as tools request them
+_lazy_body_cache: dict[str, dict] = {}
+_refresh_lock = threading.Lock()
+_refreshing = False
 
 
 def _derive_summary(body: str, title: str) -> str:
@@ -73,16 +85,35 @@ def _parse(path_name: str, text: str) -> dict | None:
     return {"name": Path(path_name).stem, "title": title, "summary": summary[:_MAX_SUMMARY], "body": body}
 
 
-def _load_from_bucket() -> list[dict]:
-    """Read curated knowledge (<scope>/<subdir>/*.md) via the in-boundary client."""
+def _load_from_bucket() -> tuple[list[dict], dict[str, str]]:
+    """Read curated knowledge (<scope>/<subdir>/*.md) via the in-boundary client.
+
+    Returns ``(articles, lazy_names)``: small curated prefixes are downloaded in
+    full; :data:`LAZY_PREFIXES` are listed by name only (one paged list call, no
+    body downloads) and returned as a ``stem -> object path`` map.
+    """
     from kb import storage  # lazy: avoids hard dep at import / in tests
 
     articles: list[dict] = []
+    lazy_names: dict[str, str] = {}
     seen: set[str] = set()
     for scope in SERVE_SCOPES:
         for sub in SERVE_SUBDIRS:
+            prefix = f"{scope}/{sub}/"
+            if prefix in LAZY_PREFIXES:
+                try:
+                    for path_name in storage.list_paths(prefix):
+                        base = path_name.rsplit("/", 1)[-1].lower()
+                        if base in ("index.md", ".keep") or not base.endswith(".md"):
+                            continue
+                        stem = Path(path_name).stem
+                        if stem not in seen:
+                            lazy_names[stem] = path_name
+                except Exception as e:
+                    logger.warning("[wiki] %s list failed: %s", prefix, e)
+                continue
             try:
-                items = storage.list_text(f"{scope}/{sub}/")
+                items = storage.list_text(prefix)
             except Exception as e:
                 logger.warning("[wiki] %s/%s read failed: %s", scope, sub, e)
                 continue
@@ -94,7 +125,7 @@ def _load_from_bucket() -> list[dict]:
                 if parsed and parsed["name"] not in seen:
                     seen.add(parsed["name"])
                     articles.append(parsed)
-    return articles
+    return articles, lazy_names
 
 
 def _load_from_repo_fallback() -> list[dict]:
@@ -110,26 +141,65 @@ def _load_from_repo_fallback() -> list[dict]:
     return out
 
 
-def load_knowledge_catalog(force: bool = False) -> list[dict]:
-    global _catalog_cache, _cache_ts
-    fresh = _catalog_cache is not None and (time.time() - _cache_ts) < _CACHE_TTL
-    if fresh and not force:
-        return _catalog_cache
-    articles = _load_from_bucket()
-    if not articles:
+def _refresh_catalog() -> list[dict]:
+    """Synchronous full refresh — network I/O; call off the event loop."""
+    global _catalog_cache, _cache_ts, _lazy_names_cache
+    articles, lazy_names = _load_from_bucket()
+    if not articles and not lazy_names:
         articles = _load_from_repo_fallback()  # transition safety
     _catalog_cache = articles
+    _lazy_names_cache = lazy_names
     _cache_ts = time.time()
     logger.info(
-        "[wiki] loaded %d knowledge articles from bucket: %s",
-        len(articles), [a["name"] for a in articles],
+        "[wiki] loaded %d knowledge articles (+%d lazy) from bucket: %s",
+        len(articles), len(lazy_names), [a["name"] for a in articles],
     )
     return articles
 
 
+def _refresh_in_background() -> None:
+    """Kick a single-flight daemon-thread refresh; callers keep the stale cache.
+
+    The GCS client is synchronous — a refresh on the request path would freeze
+    the event loop (and the typing indicator) for the duration.
+    """
+    global _refreshing
+
+    def _run():
+        global _refreshing
+        try:
+            _refresh_catalog()
+        except Exception as e:
+            logger.warning("[wiki] background refresh failed: %s", e)
+        finally:
+            _refreshing = False
+
+    with _refresh_lock:
+        if _refreshing:
+            return
+        _refreshing = True
+    threading.Thread(target=_run, name="wiki-refresh", daemon=True).start()
+
+
+def load_knowledge_catalog(force: bool = False) -> list[dict]:
+    """Return the curated-article catalog, serving stale while revalidating.
+
+    A cold cache (first call on a new instance) loads synchronously — cheap now
+    that lazy prefixes are name-listed, not downloaded. A stale cache is served
+    as-is and refreshed in a background thread.
+    """
+    if force:
+        return _refresh_catalog()
+    if _catalog_cache is None:
+        return _refresh_catalog()
+    if (time.time() - _cache_ts) >= _CACHE_TTL:
+        _refresh_in_background()
+    return _catalog_cache
+
+
 def knowledge_index_text() -> str:
     articles = load_knowledge_catalog()
-    if not articles:
+    if not articles and not _lazy_names_cache:
         return ""
     lines = [
         "## Knowledge base",
@@ -141,7 +211,36 @@ def knowledge_index_text() -> str:
     ]
     for a in articles:
         lines.append(f"- **{a['name']}** ({a['title']}) — {a['summary']}")
+    if _lazy_names_cache:
+        lines.append(
+            f"- Plus {len(_lazy_names_cache)} support troubleshooting playbooks "
+            "(not listed individually). Find one with `search_wiki(query)`, then "
+            "read it with `read_knowledge(name)`."
+        )
     return "\n".join(lines)
+
+
+def _fetch_lazy_article(name: str) -> dict | None:
+    """Fetch a single lazily-served article body on demand (one blob GET)."""
+    cached = _lazy_body_cache.get(name)
+    if cached is not None:
+        return cached
+    path = _lazy_names_cache.get(name)
+    if not path:
+        return None
+    try:
+        from kb import storage
+
+        text = storage.read_text(path)
+    except Exception as e:
+        logger.warning("[wiki] lazy fetch of %s failed: %s", path, e)
+        return None
+    if text is None:
+        return None
+    parsed = _parse(path, text)
+    if parsed:
+        _lazy_body_cache[name] = parsed
+    return parsed
 
 
 @tool
@@ -156,6 +255,9 @@ def read_knowledge(name: str) -> str:
     for a in load_knowledge_catalog():
         if a["name"] == name:
             return a["body"]
+    lazy = _fetch_lazy_article(name)
+    if lazy:
+        return lazy["body"]
     available = ", ".join(a["name"] for a in load_knowledge_catalog()) or "(none)"
     return f"No knowledge article named '{name}'. Available: {available}"
 
@@ -195,6 +297,25 @@ def search_wiki(query: str, limit: int = 8) -> str:
             hits.append(f"- {a['name']}: …{blob[max(0,i-120):i+len(q)+120].replace(chr(10),' ').strip()}…")
             if len(hits) >= limit:
                 break
+    # Lazily-served playbooks: match by name (playbooks are named per area/topic),
+    # fetching at most a handful of bodies for snippets. Bodies are never bulk-
+    # downloaded — that's the whole point of the lazy tier.
+    if len(hits) < limit and _lazy_names_cache:
+        tokens = [t for t in re.split(r"[^a-z0-9]+", q) if len(t) >= 3]
+        matched = [
+            n for n in sorted(_lazy_names_cache)
+            if q in n.lower() or any(t in n.lower() for t in tokens)
+        ]
+        for n in matched[: max(0, limit - len(hits))]:
+            a = _fetch_lazy_article(n)
+            if not a:
+                continue
+            blob = f"{a['title']}\n{a['body']}"
+            i = blob.lower().find(q)
+            snippet = (
+                blob[max(0, i - 120):i + len(q) + 120] if i >= 0 else a["summary"]
+            )
+            hits.append(f"- {n}: …{snippet.replace(chr(10), ' ').strip()}…")
     return "Wiki matches:\n" + "\n".join(hits) if hits else f"No wiki matches for '{query}'."
 
 

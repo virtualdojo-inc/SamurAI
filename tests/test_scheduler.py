@@ -104,16 +104,31 @@ class TestRegisterJob:
         assert call_kwargs.kwargs["args"] == ["abc123"]
 
     def test_registers_one_shot_job_with_run_at(self, mock_scheduler):
+        from datetime import datetime, timedelta
+
         task = _make_task(
             task_type="one_shot",
             cron_expression=None,
-            run_at="2026-06-15T14:00:00",
+            run_at=(datetime.now() + timedelta(hours=2)).isoformat(),
         )
         scheduler_module._register_job(task)
 
         mock_scheduler.add_job.assert_called_once()
         call_kwargs = mock_scheduler.add_job.call_args
         assert call_kwargs.kwargs["id"] == "task_abc123"
+
+    def test_skips_stale_one_shot_job(self, mock_scheduler):
+        """A one-shot whose run time is long past (restart resurrection) is not
+        registered — it would only fire a misfire warning or run months late."""
+        from datetime import datetime, timedelta
+
+        task = _make_task(
+            task_type="one_shot",
+            cron_expression=None,
+            run_at=(datetime.now() - timedelta(days=82)).isoformat(),
+        )
+        scheduler_module._register_job(task)
+        mock_scheduler.add_job.assert_not_called()
 
     def test_invalid_cron_does_not_raise(self, mock_scheduler):
         task = _make_task(task_type="recurring", cron_expression="bad cron")
@@ -691,3 +706,42 @@ class TestResolveConversationRef:
 
         # Should have sent the proactive message using the resolved ref
         mock_adapter.continue_conversation.assert_called_once()
+
+
+# ── background-pipeline serialization (2026-07 429-storm fix) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_background_pipelines_are_serialized(monkeypatch):
+    """The KB compile and the tracker triage must not run concurrently — both
+    call Gemini, and overlapping runs saturated the model quota (429 storms)
+    and starved live requests into Cloud Run 504s."""
+    import asyncio
+    import time as _time
+
+    import kb.run as kb_run
+    import tracker_triage
+
+    intervals: list[tuple[str, float, float]] = []
+
+    def fake_support_pipeline():
+        t0 = _time.monotonic()
+        _time.sleep(0.1)
+        intervals.append(("kb", t0, _time.monotonic()))
+
+    async def fake_triage_batch():
+        t0 = _time.monotonic()
+        await asyncio.sleep(0.1)
+        intervals.append(("triage", t0, _time.monotonic()))
+
+    monkeypatch.setattr(kb_run, "run_support_pipeline", fake_support_pipeline)
+    monkeypatch.setattr(tracker_triage, "run_triage_batch", fake_triage_batch)
+
+    await asyncio.gather(
+        scheduler_module._run_kb_pipeline(),
+        scheduler_module._run_tracker_triage(),
+    )
+
+    assert len(intervals) == 2
+    first, second = sorted(intervals, key=lambda x: x[1])
+    assert first[2] <= second[1], f"pipelines overlapped: {intervals}"

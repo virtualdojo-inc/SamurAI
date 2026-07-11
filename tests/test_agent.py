@@ -637,3 +637,95 @@ def test_extract_text_from_content_blocks(mock_llm):
         {"type": "text", "text": "line 2"},
     ]
     assert agent._extract_text(blocks) == "line 1\nline 2"
+
+
+# ── per-message prompt-assembly cache ─────────────────────────────────────
+
+
+def test_select_prompt_sections_cached_per_message(mock_llm, monkeypatch):
+    _, agent = mock_llm
+    agent._prompt_cache.clear()
+    calls = []
+
+    def _catalog():
+        calls.append(1)
+        return "## Available skills\n- **x** — y"
+
+    monkeypatch.setattr(agent, "skills_catalog_text", _catalog)
+    first = agent._select_prompt_sections("show me the logs")
+    second = agent._select_prompt_sections("show me the logs")
+    assert first == second
+    assert len(calls) == 1  # loaders ran once; second hop hit the cache
+
+
+def test_select_prompt_sections_hints_override_bypasses_cache(mock_llm, monkeypatch):
+    """The selftune eval passes hints_override and must always see a fresh
+    assembly — never a cached production prompt."""
+    _, agent = mock_llm
+    agent._prompt_cache.clear()
+    out_a = agent._select_prompt_sections("hello", hints_override="CANDIDATE-A")
+    out_b = agent._select_prompt_sections("hello", hints_override="CANDIDATE-B")
+    assert "CANDIDATE-A" in out_a
+    assert "CANDIDATE-B" in out_b
+    assert "hello" not in agent._prompt_cache  # override runs are not cached
+
+
+# ── 429 backoff ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_backoff_survives_extended_quota_storm(mock_llm, monkeypatch):
+    """5 consecutive 429s then success — the July quota storms exhausted the
+    previous 3-retry budget and killed background tasks outright."""
+    _, agent = mock_llm
+    monkeypatch.setattr(agent.asyncio, "sleep", AsyncMock())
+    attempts = []
+
+    class _LLM:
+        async def ainvoke(self, messages):
+            attempts.append(1)
+            if len(attempts) <= 5:
+                raise agent.ChatGoogleGenerativeAIError("429 RESOURCE_EXHAUSTED: quota")
+            return "ok"
+
+    assert await agent._ainvoke_with_backoff(_LLM(), []) == "ok"
+    assert len(attempts) == 6
+
+
+@pytest.mark.asyncio
+async def test_backoff_propagates_non_quota_errors(mock_llm, monkeypatch):
+    _, agent = mock_llm
+    monkeypatch.setattr(agent.asyncio, "sleep", AsyncMock())
+
+    class _LLM:
+        async def ainvoke(self, messages):
+            raise agent.ChatGoogleGenerativeAIError("400 INVALID_ARGUMENT")
+
+    with pytest.raises(agent.ChatGoogleGenerativeAIError):
+        await agent._ainvoke_with_backoff(_LLM(), [])
+
+
+# ── fire-and-forget background helper ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_background_runs_and_swallows_errors(mock_llm):
+    import asyncio as aio
+
+    _, agent = mock_llm
+    ran = []
+
+    def _ok(**kwargs):
+        ran.append(kwargs)
+
+    def _boom(**kwargs):
+        raise RuntimeError("boom")
+
+    agent._spawn_background(_ok, a=1)
+    agent._spawn_background(_boom)  # must not surface
+    for _ in range(50):
+        if ran and not agent._background_tasks:
+            break
+        await aio.sleep(0.01)
+    assert ran == [{"a": 1}]
+    assert not agent._background_tasks  # done tasks are discarded

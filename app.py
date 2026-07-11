@@ -49,10 +49,24 @@ async def on_error(context: TurnContext, error: Exception):
     import traceback
     traceback.print_exc()
     print(f"[on_turn_error] {error}", flush=True)
-    await context.send_activity("Sorry, something went wrong. Please try again.")
+    # The fallback reply itself can fail — e.g. the Bot Framework gateway already
+    # canceled the inbound request after a long turn ("A task was canceled."),
+    # which turned handled errors into 500s (observed 2026-07-07). Best-effort.
+    try:
+        await context.send_activity("Sorry, something went wrong. Please try again.")
+    except Exception as send_err:
+        print(f"[on_turn_error] fallback reply failed: {send_err}", flush=True)
 
 
 adapter.on_turn_error = on_error
+
+
+# Strong refs to fire-and-forget tasks so they aren't GC'd mid-flight.
+_background_tasks: set = set()
+
+# Hard cap for one interactive turn, safely under Cloud Run's 600s request
+# timeout so the user gets a graceful message instead of a gateway 504.
+_TURN_TIMEOUT_S = float(os.environ.get("SAMURAI_TURN_TIMEOUT", "540"))
 
 
 async def _keep_typing(turn_context: TurnContext, stop_event: asyncio.Event):
@@ -272,48 +286,56 @@ async def on_message(turn_context: TurnContext):
         return
 
     # Persist conversation reference for proactive messaging (background tasks)
-    try:
-        from task_store import get_task_store
-
-        _store = await get_task_store()
-        conv_ref = TurnContext.get_conversation_reference(turn_context.activity)
-        await _store.save_conversation_ref(
-            conversation_id=conversation_id,
-            user_id=user_id,
-            ref_json=json.dumps(conv_ref.serialize()),
-        )
-        # Auto-populate team roster with current user
-        if user_email:
-            service_url = turn_context.activity.service_url or ""
-            tenant_id = ""
-            if hasattr(turn_context.activity, "channel_data") and turn_context.activity.channel_data:
-                tenant_id = turn_context.activity.channel_data.get("tenant", {}).get("id", "")
-            await _store.save_team_member(
-                email=user_email,
-                teams_id=user_id,
-                display_name=user_name,
-                service_url=service_url,
-                tenant_id=tenant_id,
-            )
-        # Discover other team members if in a team context
+    # + auto-populate the team roster. Runs as a background task: none of it is
+    # needed to answer THIS message, and the get_members roster fetch plus the
+    # per-member store writes were serial network I/O ahead of the agent.
+    async def _persist_refs_and_roster():
         try:
-            from botbuilder.core.teams import TeamsInfo as _TeamsInfo
+            from task_store import get_task_store
 
-            members = await _TeamsInfo.get_members(turn_context)
-            for m in members:
-                m_email = m.email or m.user_principal_name or ""
-                if m_email:
-                    await _store.save_team_member(
-                        email=m_email,
-                        teams_id=m.id,
-                        display_name=m.name or "",
-                        service_url=turn_context.activity.service_url or "",
-                        tenant_id=tenant_id,
-                    )
-        except Exception:
-            pass  # Not in a team context or roster fetch failed
-    except Exception as e:
-        print(f"[on_message] persist conversation ref failed: {e}", flush=True)
+            _store = await get_task_store()
+            conv_ref = TurnContext.get_conversation_reference(turn_context.activity)
+            await _store.save_conversation_ref(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                ref_json=json.dumps(conv_ref.serialize()),
+            )
+            # Auto-populate team roster with current user
+            tenant_id = ""
+            if user_email:
+                service_url = turn_context.activity.service_url or ""
+                if hasattr(turn_context.activity, "channel_data") and turn_context.activity.channel_data:
+                    tenant_id = turn_context.activity.channel_data.get("tenant", {}).get("id", "")
+                await _store.save_team_member(
+                    email=user_email,
+                    teams_id=user_id,
+                    display_name=user_name,
+                    service_url=service_url,
+                    tenant_id=tenant_id,
+                )
+            # Discover other team members if in a team context
+            try:
+                from botbuilder.core.teams import TeamsInfo as _TeamsInfo
+
+                members = await _TeamsInfo.get_members(turn_context)
+                for m in members:
+                    m_email = m.email or m.user_principal_name or ""
+                    if m_email:
+                        await _store.save_team_member(
+                            email=m_email,
+                            teams_id=m.id,
+                            display_name=m.name or "",
+                            service_url=turn_context.activity.service_url or "",
+                            tenant_id=tenant_id,
+                        )
+            except Exception:
+                pass  # Not in a team context or roster fetch failed
+        except Exception as e:
+            print(f"[on_message] persist conversation ref failed: {e}", flush=True)
+
+    persist_task = asyncio.create_task(_persist_refs_and_roster())
+    _background_tasks.add(persist_task)
+    persist_task.add_done_callback(_background_tasks.discard)
 
     try:
         # Check if user is asking to connect to VirtualDojo CRM
@@ -383,7 +405,18 @@ async def on_message(turn_context: TurnContext):
         ))
         _running_tasks[conversation_id] = agent_task
         try:
-            response = await agent_task
+            # Cap the turn under Cloud Run's 600s request timeout. Without this,
+            # a turn that runs past the gateway limit dies as a bare 504 and the
+            # user gets nothing (observed 2026-07-08, 2x).
+            response = await asyncio.wait_for(agent_task, timeout=_TURN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            await turn_context.send_activity(
+                "This one is taking longer than I can hold the connection open, "
+                "so I've stopped here. Try narrowing the request, or ask me to "
+                "run it as a background task."
+            )
+            print(f"[on_message] turn timed out after {_TURN_TIMEOUT_S}s for {user_name}", flush=True)
+            return
         except asyncio.CancelledError:
             return  # User said "stop" — already handled
         except Exception as e:
@@ -834,6 +867,26 @@ async def on_startup(app_instance):
 
     await init_scheduler(adapter, settings.app_id)
     print("[startup] Background task scheduler started", flush=True)
+
+    # Warm the prompt-assembly caches off the request path. Without this, the
+    # first message after a cold start pays the synchronous GCS catalog load
+    # (and it runs on the event loop, freezing the typing indicator).
+    async def _warm_caches():
+        try:
+            from skills import load_skill_catalog
+            from tracker_diagnostics import get_diagnostics_store
+            from wiki import load_knowledge_catalog
+
+            await asyncio.to_thread(load_knowledge_catalog)
+            await asyncio.to_thread(load_skill_catalog)
+            await get_diagnostics_store()  # also warms the prompt-index count
+            print("[startup] prompt caches warmed", flush=True)
+        except Exception as e:
+            print(f"[startup] cache warm failed (non-fatal): {e}", flush=True)
+
+    warm_task = asyncio.create_task(_warm_caches())
+    _background_tasks.add(warm_task)
+    warm_task.add_done_callback(_background_tasks.discard)
 
 
 async def on_cleanup(app_instance):

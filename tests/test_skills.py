@@ -242,3 +242,34 @@ def test_skills_bucket_prefix_is_never_harvested_or_served():
     # Inside a writable IAM scope (support/ or customers/onboarding/), so the
     # runtime SA can read+write it without an IAM change.
     assert prefix.startswith("support/") or prefix.startswith("customers/onboarding/")
+
+
+# ── Stale-while-revalidate cache (mirrors wiki.py) ────────────────────────
+
+
+def test_stale_skill_cache_served_not_reloaded_inline(monkeypatch):
+    calls = []
+    skills_mod._catalog_cache = [{"name": "old-skill", "description": "d", "body": "b", "dir": "x"}]
+    skills_mod._cache_ts = 0.0  # far past the TTL
+    monkeypatch.setattr(skills_mod, "_refresh_in_background", lambda: calls.append(1))
+    got = skills_mod.load_skill_catalog()
+    assert [s["name"] for s in got] == ["old-skill"]
+    assert calls == [1]
+
+
+def test_fresh_skill_cache_skips_refresh(monkeypatch):
+    import time as _time
+
+    skills_mod._catalog_cache = [{"name": "cur", "description": "d", "body": "b", "dir": "x"}]
+    skills_mod._cache_ts = _time.time()
+    monkeypatch.setattr(
+        skills_mod, "_refresh_in_background",
+        lambda: pytest.fail("fresh cache must not refresh"),
+    )
+    assert [s["name"] for s in skills_mod.load_skill_catalog()] == ["cur"]
+
+
+def test_force_reloads_synchronously():
+    skills_mod._catalog_cache = None
+    out = skills_mod.load_skill_catalog(force=True)
+    assert isinstance(out, list)  # repo skills load inline on force/cold
