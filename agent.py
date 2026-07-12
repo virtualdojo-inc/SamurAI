@@ -1062,33 +1062,70 @@ def _cap_message_content(messages):
     return out
 
 
+def _content_has_parts(content, has_tool_calls: bool) -> bool:
+    """True if a message would serialize to at least one non-empty Gemini part.
+
+    Handles every content shape LangChain can carry, not just strings:
+      - tool_calls present            -> function_call part(s) -> True
+      - str                           -> True iff non-whitespace
+      - list (multimodal)             -> True iff any part is a non-text part
+                                         (image_url/media/…) OR a text part with
+                                         non-empty text; [] or all-empty-text -> False
+      - None                          -> False
+      - anything else                 -> True (unknown; keep to be safe)
+    """
+    if has_tool_calls:
+        return True
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                if part.strip():
+                    return True
+            elif isinstance(part, dict):
+                ptype = part.get("type")
+                if ptype in (None, "text"):
+                    if str(part.get("text", "")).strip():
+                        return True
+                else:
+                    return True  # image_url / media / other non-text part
+            else:
+                return True  # unknown part object; assume renderable
+        return False
+    if content is None:
+        return False
+    return True
+
+
 def _drop_empty_messages(messages):
     """Drop messages that would serialize to a Gemini request Content with ZERO
-    parts — i.e. a Human/AI message whose string content is empty/whitespace-only
-    and which carries no tool_calls. Gemini rejects such a request with
-    400 INVALID_ARGUMENT ("must include at least one parts field"), killing the
-    whole turn ("Sorry, something went wrong").
+    parts. Gemini rejects such a request with 400 INVALID_ARGUMENT ("must include
+    at least one parts field"), killing the whole turn ("Sorry, something went
+    wrong").
 
-    These accumulate in long histories (e.g. a persisted empty AIMessage) and then
-    poison EVERY subsequent turn once they fall inside the trimmed window, so this
-    runs right before the model call. Kept even when content is empty:
-      - ToolMessage       -> always yields a function_response part
-      - AIMessage w/ tool_calls -> yields function_call parts
-      - SystemMessage     -> handled separately; never dropped
-    Multimodal (non-string) content is left as-is.
+    Zero-parts messages accumulate in long histories — a persisted empty AIMessage,
+    or a multimodal turn whose image parts went missing leaving ``content=[]`` /
+    ``[{"type":"text","text":""}]`` — and then poison EVERY subsequent turn once
+    they fall inside the trimmed window, so this runs right before the model call.
+    Always kept (they carry their own parts): SystemMessage, ToolMessage
+    (function_response), and any AIMessage with tool_calls (function_call).
     """
     out = []
+    dropped = []
     for m in messages:
-        content = m.content
-        is_empty_str = isinstance(content, str) and not content.strip()
         has_tool_calls = bool(getattr(m, "tool_calls", None))
-        if (
-            is_empty_str
-            and not has_tool_calls
-            and not isinstance(m, (SystemMessage, ToolMessage))
+        if isinstance(m, (SystemMessage, ToolMessage)) or _content_has_parts(
+            m.content, has_tool_calls
         ):
-            continue
-        out.append(m)
+            out.append(m)
+        else:
+            dropped.append(f"{type(m).__name__}({type(m.content).__name__})")
+    if dropped:
+        logger.warning(
+            "[drop_empty] removed %d zero-parts message(s) before model call: %s",
+            len(dropped), dropped,
+        )
     return out
 
 
@@ -1108,6 +1145,18 @@ async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 6)
             return await llm_with_tools.ainvoke(messages)
         except ChatGoogleGenerativeAIError as e:
             msg = str(e)
+            # Definitive telemetry for the empty-parts 400: if a zero-parts message
+            # still slips past _drop_empty_messages, name each message's shape so we
+            # can see exactly what produced it (instead of guessing).
+            if "parts field" in msg or "INVALID_ARGUMENT" in msg:
+                shapes = []
+                for i, m in enumerate(messages):
+                    c = m.content
+                    desc = (f"len{len(c)}" if isinstance(c, (str, list)) else "None"
+                            if c is None else type(c).__name__)
+                    tc = "+tc" if getattr(m, "tool_calls", None) else ""
+                    shapes.append(f"{i}:{type(m).__name__}[{type(c).__name__}:{desc}]{tc}")
+                logger.error("[invoke.invalid_argument] %d msgs -> %s", len(messages), shapes)
             is_quota = "RESOURCE_EXHAUSTED" in msg or "429" in msg
             if not is_quota or attempt == max_attempts - 1:
                 raise

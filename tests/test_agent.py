@@ -527,8 +527,13 @@ def test_drop_empty_messages_strips_zero_parts_only():
     msgs = [
         SystemMessage(content=""),                        # keep (system, handled separately)
         HumanMessage(content="hello"),                    # keep
-        AIMessage(content=""),                            # DROP (empty, no tool_calls)
+        AIMessage(content=""),                            # DROP (empty str, no tool_calls)
         HumanMessage(content="   \n "),                   # DROP (whitespace-only)
+        AIMessage(content=[]),                            # DROP (empty list / multimodal)
+        HumanMessage(content=[{"type": "text", "text": ""}]),  # DROP (all-empty-text list)
+        HumanMessage(content=[                            # keep (has an image part)
+            {"type": "text", "text": ""},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]),
         AIMessage(content="", tool_calls=[
             {"name": "t", "args": {}, "id": "1"}]),       # keep (function_call parts)
         ToolMessage(content="", tool_call_id="1"),        # keep (function_response part)
@@ -536,17 +541,28 @@ def test_drop_empty_messages_strips_zero_parts_only():
     ]
     out = agent._drop_empty_messages(msgs)
 
-    assert len(out) == 5
-    # the two zero-parts messages are gone
-    assert not any(
-        isinstance(m, (AIMessage, HumanMessage))
-        and isinstance(m.content, str) and not m.content.strip()
-        and not getattr(m, "tool_calls", None)
-        for m in out
-    )
-    # the tool-call AIMessage and the ToolMessage survived despite empty content
+    kept = {(type(m).__name__, str(m.content)[:20]) for m in out}
+    assert len(out) == 6  # 5 dropped (empty str/ws/[]/empty-text-list/None)
+    # every surviving message has at least one renderable part
+    for m in out:
+        assert isinstance(m, (SystemMessage, ToolMessage)) or agent._content_has_parts(
+            m.content, bool(getattr(m, "tool_calls", None))
+        )
+    # the multimodal message with a real image part survived
+    assert any(isinstance(m.content, list) and len(m.content) == 2 for m in out)
     assert any(getattr(m, "tool_calls", None) for m in out)
     assert any(isinstance(m, ToolMessage) for m in out)
+
+
+def test_content_has_parts_shapes():
+    import agent
+    assert agent._content_has_parts("hi", False) is True
+    assert agent._content_has_parts("  ", False) is False
+    assert agent._content_has_parts("", True) is True                       # tool_calls win
+    assert agent._content_has_parts([], False) is False
+    assert agent._content_has_parts([{"type": "text", "text": ""}], False) is False
+    assert agent._content_has_parts([{"type": "image_url", "image_url": {}}], False) is True
+    assert agent._content_has_parts(None, False) is False
 
 
 @pytest.mark.asyncio
