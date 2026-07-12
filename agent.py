@@ -942,11 +942,12 @@ SOFT_TOOL_LIMIT = 15  # Send a "still working" notice after this many unique too
 # Keyed by conversation_id; consumers should .pop() after reading.
 _last_run_metadata: dict[str, dict] = {}
 
-_GCP_KWARGS = dict(
-    project=os.environ.get("GCP_PROJECT_ID"),
-    location="global",
-    vertexai=True,
-)
+# Vertex endpoint/region + serve/lite model ids — single source of truth in
+# vertex_config (defaults to the US data-residency REP endpoint; env-overridable
+# back to global). Kept as a module-level dict so `**agent._GCP_KWARGS` spreads
+# (e.g. selftune/loop.py) keep working.
+import vertex_config
+_GCP_KWARGS = vertex_config.vertex_kwargs()
 
 # Per-message prompt-assembly cache. _select_prompt_sections runs on EVERY graph
 # hop (3-15 per turn) and its loaders (skills catalog, knowledge index, tracker
@@ -1091,12 +1092,12 @@ async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 6)
 
 async def _build_graph(user_id: str = "default"):
     """Build a LangGraph agent with user-specific CRM and memory tools."""
-    llm_flash = ChatGoogleGenerativeAI(model="gemini-3.5-flash", **_GCP_KWARGS)
-    llm_pro = ChatGoogleGenerativeAI(model="gemini-3.5-flash", **_GCP_KWARGS)
+    llm_flash = ChatGoogleGenerativeAI(model=vertex_config.SERVE_MODEL, **_GCP_KWARGS)
+    llm_pro = ChatGoogleGenerativeAI(model=vertex_config.SERVE_MODEL, **_GCP_KWARGS)
     # Fast synthesis model — used for the final-draft hop (tool results in,
     # producing prose out). Reasoning load is low; the bottleneck is just
     # generating text over a fat context. Env-gated for safe rollback.
-    llm_synth = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", **_GCP_KWARGS)
+    llm_synth = ChatGoogleGenerativeAI(model=vertex_config.LITE_MODEL, **_GCP_KWARGS)
 
     # User-specific tools
     memory_tools = await create_memory_tools(user_id)
@@ -1336,7 +1337,7 @@ async def _synthesize_partial_findings(
     claims; this one synthesizes ungenerated ones.
     """
     synth_llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite", **_GCP_KWARGS
+        model=vertex_config.LITE_MODEL, **_GCP_KWARGS
     )
 
     log_tail = "\n".join(tool_log[-30:]) if tool_log else "(no tools called)"

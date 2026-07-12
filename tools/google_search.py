@@ -18,14 +18,16 @@ def google_search(query: str) -> str:
     Args:
         query: The search query string.
     """
+    import vertex_config
     client = genai.Client(
         vertexai=True,
         project=os.environ.get("GCP_PROJECT_ID"),
-        location="global",
+        location=vertex_config.VERTEX_LOCATION,
+        http_options=vertex_config.genai_http_options(),
     )
 
     response = client.models.generate_content(
-        model="gemini-3.5-flash",
+        model=vertex_config.SERVE_MODEL,
         contents=query,
         config=GenerateContentConfig(
             tools=[GenaiTool(google_search=GoogleSearch())],

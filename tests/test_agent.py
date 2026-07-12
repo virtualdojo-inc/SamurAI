@@ -526,8 +526,12 @@ async def test_build_graph_creates_two_llms(mock_llm):
     assert ChatGoogleGenerativeAI.call_count >= 3
     calls = ChatGoogleGenerativeAI.call_args_list
     models = [c.kwargs.get("model") for c in calls]
-    assert "gemini-3.5-flash" in models
-    assert "gemini-2.5-flash-lite" in models
+    # Model ids come from vertex_config (serve + lite tiers), which are env-driven
+    # so they can point at the US REP endpoint or global — assert against the
+    # config, not hardcoded ids.
+    import vertex_config
+    assert vertex_config.SERVE_MODEL in models  # flash + pro (tool-deciding / reasoning)
+    assert vertex_config.LITE_MODEL in models   # synth (fast final draft)
 
 
 def _mock_astream(final_content="ok"):

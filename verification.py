@@ -178,12 +178,11 @@ def _get_verifier_llm():
     if _verifier_llm is None:
         # Use Flash — this is a discriminative task, not a reasoning one.
         # A cheaper model is fine and keeps the overhead low.
+        import vertex_config
         _verifier_llm = ChatGoogleGenerativeAI(
-            model="gemini-3.5-flash",
-            project=os.environ.get("GCP_PROJECT_ID"),
-            location="global",
-            vertexai=True,
-            temperature=0.0,  # verifier is the one place low temp is probably fine
+            model=vertex_config.SERVE_MODEL,
+            # verifier is the one place low temp is probably fine
+            **vertex_config.vertex_kwargs(temperature=0.0),
         )
     return _verifier_llm
 
