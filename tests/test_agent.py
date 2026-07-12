@@ -514,6 +514,41 @@ def test_pro_model_keywords_defined(mock_llm):
     assert "oscal" in agent.PRO_MODEL_KEYWORDS
 
 
+def test_drop_empty_messages_strips_zero_parts_only():
+    """A persisted empty AIMessage (or whitespace human) 400s the whole turn
+    (Gemini: 'must include at least one parts field'). _drop_empty_messages must
+    remove exactly those, while keeping tool-call / tool-result / system / real
+    messages — even when their string content is empty."""
+    import agent
+    from langchain_core.messages import (
+        AIMessage, HumanMessage, SystemMessage, ToolMessage,
+    )
+
+    msgs = [
+        SystemMessage(content=""),                        # keep (system, handled separately)
+        HumanMessage(content="hello"),                    # keep
+        AIMessage(content=""),                            # DROP (empty, no tool_calls)
+        HumanMessage(content="   \n "),                   # DROP (whitespace-only)
+        AIMessage(content="", tool_calls=[
+            {"name": "t", "args": {}, "id": "1"}]),       # keep (function_call parts)
+        ToolMessage(content="", tool_call_id="1"),        # keep (function_response part)
+        AIMessage(content="done"),                        # keep
+    ]
+    out = agent._drop_empty_messages(msgs)
+
+    assert len(out) == 5
+    # the two zero-parts messages are gone
+    assert not any(
+        isinstance(m, (AIMessage, HumanMessage))
+        and isinstance(m.content, str) and not m.content.strip()
+        and not getattr(m, "tool_calls", None)
+        for m in out
+    )
+    # the tool-call AIMessage and the ToolMessage survived despite empty content
+    assert any(getattr(m, "tool_calls", None) for m in out)
+    assert any(isinstance(m, ToolMessage) for m in out)
+
+
 @pytest.mark.asyncio
 async def test_build_graph_creates_two_llms(mock_llm):
     mock_cls_instance, agent = mock_llm
