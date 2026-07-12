@@ -423,6 +423,8 @@ def fedramp_daily_log_review(
     """
     from google.cloud import logging as cloud_logging
 
+    from tools.gcp_logging import _message
+
     pid = project_id or os.environ.get("GCP_PROJECT_ID", FEDRAMP_PROJECT)
     client = cloud_logging.Client(project=pid)
 
@@ -444,15 +446,19 @@ def fedramp_daily_log_review(
 
     for label, filter_str in queries:
         try:
-            entries = list(client.list_entries(filter_=filter_str, max_results=50))
+            entries = list(client.list_entries(
+                filter_=filter_str, order_by=cloud_logging.DESCENDING, max_results=50
+            ))
             count = len(entries)
             total_events += count
             lines.append(f"\n--- {label}: {count} event(s) ---")
 
+            # Compliance evidence: show the 3 most-recent events with a compact
+            # one-line message (no noise stripping — audit signal is preserved).
             for entry in entries[:3]:
                 ts = entry.timestamp.isoformat() if entry.timestamp else "?"
-                payload = str(entry.payload)[:200] if entry.payload else "(empty)"
-                lines.append(f"  [{ts}] {entry.severity}: {payload}")
+                msg = _message(entry.payload).replace("\n", " ").strip() if entry.payload else "(empty)"
+                lines.append(f"  [{ts}] {entry.severity}: {msg[:200]}")
 
             if count > 3:
                 lines.append(f"  ... and {count - 3} more")
