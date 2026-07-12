@@ -63,14 +63,17 @@ def test_explicit_project_id_overrides_env(mock_client_cls):
 
 @patch("google.cloud.logging.Client")
 def test_filter_query_passed_through(mock_client_cls):
+    from google.cloud import logging as gcl
+
     from tools.gcp_logging import query_cloud_logs
 
     mock_client_cls.return_value.list_entries.return_value = []
     filter_str = 'resource.type="cloud_run_revision" severity>=ERROR'
 
     query_cloud_logs.invoke({"filter_query": filter_str})
+    # Now also requests newest-first ordering (the recent-errors fix).
     mock_client_cls.return_value.list_entries.assert_called_once_with(
-        filter_=filter_str, max_results=50
+        filter_=filter_str, order_by=gcl.DESCENDING, max_results=50
     )
 
 
