@@ -175,13 +175,6 @@ async def _ensure_client_registered() -> dict:
         raise
 
 
-def get_login_url(user_id: str) -> str | None:
-    """Build the OAuth authorize URL for a user. Returns URL or None if already authed."""
-    if user_id in _token_store and _is_token_valid(user_id):
-        return None
-    return f"_pending:{user_id}"
-
-
 async def start_oauth_flow(user_id: str) -> tuple[str, str]:
     """Start the OAuth flow and return (authorize_url, state)."""
     creds = await _ensure_client_registered()
