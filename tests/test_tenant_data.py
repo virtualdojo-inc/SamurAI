@@ -44,7 +44,8 @@ async def test_disabled_by_default():
 async def test_not_signed_in_returns_sso_link(monkeypatch):
     monkeypatch.setenv("SAMURAI_TENANT_DATA_ENABLED", "on")
     monkeypatch.setattr("tools.virtualdojo_mcp.is_user_authenticated", lambda uid: False)
-    monkeypatch.setattr("tools.virtualdojo_mcp.get_login_url", lambda uid: "https://sso.vdj/login")
+    monkeypatch.setattr("tools.virtualdojo_mcp.start_oauth_flow",
+                        AsyncMock(return_value=("https://sso.vdj/login", "state123")))
     out = await _tool().ainvoke({})
     assert "sign in" in out.lower() and "https://sso.vdj/login" in out
 
@@ -90,7 +91,8 @@ async def test_records_not_signed_in_is_barred(monkeypatch):
     monkeypatch.setenv("SAMURAI_TENANT_DATA_ENABLED", "on")
     monkeypatch.setenv("SAMURAI_TENANT_RECORDS_ENABLED", "on")
     monkeypatch.setattr("tools.virtualdojo_mcp.is_user_authenticated", lambda uid: False)
-    monkeypatch.setattr("tools.virtualdojo_mcp.get_login_url", lambda uid: "https://sso.vdj/login")
+    monkeypatch.setattr("tools.virtualdojo_mcp.start_oauth_flow",
+                        AsyncMock(return_value=("https://sso.vdj/login", "state123")))
     start = AsyncMock()
     monkeypatch.setattr(td, "_start_impersonation", start)
     out = await _by_name("read_tenant_records").ainvoke({"grant_id": "g1", "object_name": "accounts"})
@@ -182,6 +184,28 @@ async def test_vdj_get_uses_user_bearer_token(monkeypatch):
     assert out["data"] == {"items": []}
     assert captured["headers"]["Authorization"] == "Bearer user-jwt"  # the user's SSO JWT
     assert captured["headers"]["X-Tenant-ID"] == "t1"
+
+
+async def test_end_impersonation_sends_session_id(monkeypatch):
+    # The backend /end requires session_id in the body; without it the call 422s.
+    post = AsyncMock(return_value={"data": {}})
+    monkeypatch.setattr(td, "_vdj_post", post)
+    await td._end_impersonation("imp-jwt", "sess-42")
+    post.assert_awaited_once_with("imp-jwt", "/api/v1/impersonation/end", {"session_id": "sess-42"})
+
+
+async def test_read_records_ends_session_with_id(monkeypatch):
+    # session_id from the start response is threaded through to the end call.
+    _sign_in(monkeypatch)
+    monkeypatch.setattr(td, "_start_impersonation", AsyncMock(return_value={
+        "data": {"access_token": "imp-jwt", "target_user_email": "x@acme.com",
+                 "session_id": "sess-99"}}))
+    post = AsyncMock(return_value={"data": {}})
+    monkeypatch.setattr(td, "_vdj_post", post)
+    monkeypatch.setattr(td, "_vdj_get", AsyncMock(return_value={
+        "data": {"records": [{"id": "1"}], "total_count": 1}}))
+    await _by_name("read_tenant_records").ainvoke({"grant_id": "g1", "object_name": "accounts"})
+    post.assert_awaited_once_with("imp-jwt", "/api/v1/impersonation/end", {"session_id": "sess-99"})
 
 
 async def test_vdj_post_is_impersonation_only(monkeypatch):

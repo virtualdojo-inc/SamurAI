@@ -1,7 +1,7 @@
 """Read-only tenant-data tools via VirtualDojo support grants.
 
 AUTH: reuses SamurAI's EXISTING per-user VirtualDojo SSO sign-in (tools/virtualdojo_mcp:
-get_login_url / token store). Reads run AS the signed-in user — their identity and their
+start_oauth_flow / token store). Reads run AS the signed-in user — their identity and their
 ``system_administrator`` rights in the support tenant. No service account, no API key.
 The SSO token is a standard VirtualDojo JWT (``create_access_token`` -> ``get_current_user``
 just decodes it with SECRET_KEY), so the SAME token authenticates ``/api/v1`` REST. That
@@ -112,11 +112,12 @@ async def _vdj_get(token: str, path: str, params: dict | None = None,
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-async def _vdj_post(token: str, path: str) -> dict:
-    """POST for impersonation SESSION LIFECYCLE ONLY (start/end). Sends no body and never a
+async def _vdj_post(token: str, path: str, json_body: dict | None = None) -> dict:
+    """POST for impersonation SESSION LIFECYCLE ONLY (start/end). Never sends a
     ``confirm_write`` flag — it mints/ends a read token and mutates no customer data. This is
     the sole non-GET verb in the module; it must never be pointed at a data endpoint.
-    Returns {"data": <json>} or {"error": "..."}. Never raises."""
+    ``json_body`` carries only session-lifecycle fields (e.g. the ``session_id`` /end requires);
+    it is None for start. Returns {"data": <json>} or {"error": "..."}. Never raises."""
     base = _api_base()
     if not base:
         return {"error": "VIRTUALDOJO_API_URL is not configured"}
@@ -125,7 +126,8 @@ async def _vdj_post(token: str, path: str) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(f"{base}{path}", headers={"Authorization": f"Bearer {token}"})
+            resp = await client.post(f"{base}{path}", headers={"Authorization": f"Bearer {token}"},
+                                     json=json_body)
         if resp.status_code not in (200, 201):
             return {"error": f"HTTP {resp.status_code}: {resp.text[:300]}"}
         return {"data": resp.json() if resp.text else {}}
@@ -148,10 +150,13 @@ async def _start_impersonation(token: str, grant_id: str) -> dict:
     return {"data": data}
 
 
-async def _end_impersonation(imp_token: str) -> None:
-    """Best-effort session close. Failure is non-fatal (the token self-expires in 15 min)."""
+async def _end_impersonation(imp_token: str, session_id: str | None = None) -> None:
+    """Best-effort session close. The backend's /end requires the ``session_id`` from the start
+    response; without it the call 422s. Failure is non-fatal (the token self-expires in 15 min),
+    but passing session_id lets the session close immediately instead of lingering to TTL."""
     try:
-        await _vdj_post(imp_token, "/api/v1/impersonation/end")
+        await _vdj_post(imp_token, "/api/v1/impersonation/end",
+                        {"session_id": session_id} if session_id else None)
     except Exception:
         pass
 
@@ -244,18 +249,27 @@ def create_tenant_data_tools(user_id: str) -> list:
     # Imported lazily to avoid a heavy import at module load + circulars.
     from tools.virtualdojo_mcp import (
         _get_access_token,
-        get_login_url,
         is_user_authenticated,
+        start_oauth_flow,
     )
 
     async def _signed_in_token() -> tuple[str | None, str | None]:
-        """Return (token, prompt). On success token is set; otherwise prompt explains
-        the SSO sign-in the user must complete first. A background task has no signed-in
-        user here, so it gets the prompt and never reaches the backend."""
+        """Return (token, prompt). On success token is set; otherwise prompt carries a real,
+        clickable SSO sign-in link (built by start_oauth_flow, which also registers the PKCE
+        state the OAuth callback needs). A background task has no signed-in user here, so it
+        gets the prompt and never reaches the backend."""
         if not is_user_authenticated(user_id):
-            url = get_login_url(user_id)
-            return None, (f"You need to sign in to VirtualDojo (SSO) first: {url}" if url
-                          else "Please sign in to VirtualDojo (SSO) first.")
+            try:
+                login_url, _state = await start_oauth_flow(user_id)
+            except Exception as e:
+                logger.warning("[tenant_data] could not start SSO flow: %s", e)
+                return None, ("Please sign in to VirtualDojo (SSO) first — I couldn't build a "
+                              "sign-in link just now; try again in a moment.")
+            return None, (
+                f"You need to sign in to VirtualDojo first. "
+                f"[Sign in to VirtualDojo CRM]({login_url})\n\n"
+                f"After you sign in, ask me again and I'll pull the data."
+            )
         token = await _get_access_token(user_id)
         if not token:
             return None, "Your VirtualDojo session expired — please sign in again."
@@ -288,12 +302,13 @@ def create_tenant_data_tools(user_id: str) -> list:
             return f"Could not start a read session for that grant: {started['error']}"
         info = started["data"]
         imp_token, target = info["access_token"], info.get("target_user_email")
+        session_id = info.get("session_id")
         try:
             path = (f"/api/v1/schema/objects/{object_name}/schema" if object_name
                     else "/api/v1/schema/objects")
             out = await _vdj_get(imp_token, path)
         finally:
-            await _end_impersonation(imp_token)
+            await _end_impersonation(imp_token, session_id)
         if "error" in out:
             return f"Could not read schema: {out['error']}"
         text = _format_schema(out.get("data"), object_name)
@@ -318,11 +333,12 @@ def create_tenant_data_tools(user_id: str) -> list:
             return f"Could not start a read session for that grant: {started['error']}"
         info = started["data"]
         imp_token, target = info["access_token"], info.get("target_user_email")
+        session_id = info.get("session_id")
         try:
             out = await _vdj_get(imp_token, f"/api/v1/objects/{object_name}/records",
                                  {"skip": skip, "limit": limit})
         finally:
-            await _end_impersonation(imp_token)
+            await _end_impersonation(imp_token, session_id)
         if "error" in out:
             return f"Could not read records: {out['error']}"
         text, n = _format_records(out.get("data") or {}, object_name)
