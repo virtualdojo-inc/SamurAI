@@ -1062,6 +1062,36 @@ def _cap_message_content(messages):
     return out
 
 
+def _drop_empty_messages(messages):
+    """Drop messages that would serialize to a Gemini request Content with ZERO
+    parts — i.e. a Human/AI message whose string content is empty/whitespace-only
+    and which carries no tool_calls. Gemini rejects such a request with
+    400 INVALID_ARGUMENT ("must include at least one parts field"), killing the
+    whole turn ("Sorry, something went wrong").
+
+    These accumulate in long histories (e.g. a persisted empty AIMessage) and then
+    poison EVERY subsequent turn once they fall inside the trimmed window, so this
+    runs right before the model call. Kept even when content is empty:
+      - ToolMessage       -> always yields a function_response part
+      - AIMessage w/ tool_calls -> yields function_call parts
+      - SystemMessage     -> handled separately; never dropped
+    Multimodal (non-string) content is left as-is.
+    """
+    out = []
+    for m in messages:
+        content = m.content
+        is_empty_str = isinstance(content, str) and not content.strip()
+        has_tool_calls = bool(getattr(m, "tool_calls", None))
+        if (
+            is_empty_str
+            and not has_tool_calls
+            and not isinstance(m, (SystemMessage, ToolMessage))
+        ):
+            continue
+        out.append(m)
+    return out
+
+
 async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 6):
     """Invoke the model, retrying on Gemini 429 RESOURCE_EXHAUSTED with backoff.
 
@@ -1189,6 +1219,10 @@ async def _build_graph(user_id: str = "default"):
                 before, len(messages), est_before, _approx_tokens(messages),
                 _MAX_INPUT_TOKENS,
             )
+
+        # Final guard: strip any zero-parts message (e.g. a persisted empty
+        # AIMessage surfaced by trimming) that would 400 the whole turn.
+        messages = _drop_empty_messages(messages)
 
         return {"messages": [await _ainvoke_with_backoff(llm_with_tools, messages)]}
 
