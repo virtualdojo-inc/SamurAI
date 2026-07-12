@@ -179,11 +179,10 @@ _BLOCK_TOOL_NAME = "_judge_block"
 _MAX_CONSECUTIVE_DENIALS = 3
 _MAX_TOTAL_DENIALS = 20
 
-_GCP_KWARGS = dict(
-    project=os.environ.get("GCP_PROJECT_ID"),
-    location="global",
-    vertexai=True,
-)
+# Shared Vertex endpoint/region config (US data-residency REP by default,
+# env-overridable back to global) — see vertex_config.
+import vertex_config
+_GCP_KWARGS = vertex_config.vertex_kwargs()
 
 # Lazy-initialized model singletons. Mirror the pattern used in
 # agent.py for llm_flash, llm_pro.
@@ -195,7 +194,7 @@ def _get_stage1_llm():
     global _stage1_llm
     if _stage1_llm is None:
         _stage1_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash-lite", **_GCP_KWARGS
+            model=vertex_config.LITE_MODEL, **_GCP_KWARGS
         )
     return _stage1_llm
 
@@ -224,7 +223,7 @@ def _get_stage2_llm():
     global _stage2_llm
     if _stage2_llm is None:
         _stage2_llm = ChatGoogleGenerativeAI(
-            model="gemini-3.5-flash",
+            model=vertex_config.SERVE_MODEL,
             response_mime_type="application/json",
             response_schema=_STAGE_2_RESPONSE_SCHEMA,
             **_GCP_KWARGS,

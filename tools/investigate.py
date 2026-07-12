@@ -83,11 +83,10 @@ _investigator_graph = None
 
 def _build_investigator_graph():
     """Build a mini LangGraph with Flash and the investigator tool set."""
+    import vertex_config
     llm = ChatGoogleGenerativeAI(
-        model="gemini-3.5-flash",
-        project=os.environ.get("GCP_PROJECT_ID"),
-        location="global",
-        vertexai=True,
+        model=vertex_config.SERVE_MODEL,
+        **vertex_config.vertex_kwargs(),
     )
     llm_with_tools = llm.bind_tools(INVESTIGATOR_TOOLS)
     tool_node = ToolNode(INVESTIGATOR_TOOLS, handle_tool_errors=True)
