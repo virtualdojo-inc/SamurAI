@@ -196,11 +196,54 @@ def test_token_exchange_logs_error_body(monkeypatch, caplog):
 
     with caplog.at_level(logging.ERROR):
         with pytest.raises(requests.exceptions.HTTPError):
-            sf_mod._create_sf_connection()
+            sf_mod._exchange_refresh_token()
 
     assert "HTTP 400" in caplog.text
     assert "invalid_grant" in caplog.text  # the OAuth error code is now visible
     assert "REQ-123" in caplog.text         # Salesforce request id for support
+
+
+def test_connection_is_cached_across_calls(monkeypatch):
+    """The access token is exchanged once and reused — a burst of tool calls
+    must NOT re-exchange the refresh token per call (that caused the 400s)."""
+    import tools.salesforce as sf_mod
+
+    monkeypatch.setattr(sf_mod, "_cached_conn", None)
+    monkeypatch.setattr(sf_mod, "_cached_conn_expiry", 0.0)
+    calls = {"n": 0}
+
+    def fake_exchange():
+        calls["n"] += 1
+        return object()
+
+    monkeypatch.setattr(sf_mod, "_exchange_refresh_token", fake_exchange)
+
+    c1 = sf_mod._create_sf_connection()
+    c2 = sf_mod._create_sf_connection()
+    c3 = sf_mod._create_sf_connection()
+
+    assert c1 is c2 is c3
+    assert calls["n"] == 1  # exchanged once, reused across the burst
+
+
+def test_session_expiry_invalidates_cache(monkeypatch):
+    """A SalesforceExpiredSession during a call clears the cached connection so
+    the next call re-exchanges (cache can't get stuck on a dead session)."""
+    from simple_salesforce.exceptions import SalesforceExpiredSession
+    import tools.salesforce as sf_mod
+
+    monkeypatch.setattr(sf_mod, "_cached_conn", object())      # primed cache
+    monkeypatch.setattr(sf_mod, "_cached_conn_expiry", 1e18)
+
+    class FakeSF:
+        def query(self, soql):
+            raise SalesforceExpiredSession("https://x", 401, "Case", [{"message": "expired"}])
+
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+
+    out = sf_mod.query_cases.invoke({})
+    assert sf_mod._cached_conn is None          # invalidated
+    assert "Error querying cases" in out
 
 
 def test_query_cases_escapes_soql_injection(monkeypatch):

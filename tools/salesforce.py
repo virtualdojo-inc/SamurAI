@@ -9,16 +9,34 @@ Tools:
 
 import os
 import logging
+import threading
+import time
 
 import requests
 from langchain_core.tools import tool
 
 from simple_salesforce import Salesforce, format_soql
+from simple_salesforce.exceptions import SalesforceExpiredSession
 
 logger = logging.getLogger(__name__)
 
 SF_INSTANCE_URL = "https://quotely.my.salesforce.com"
 SF_API_VERSION = "67.0"
+
+# Cached Salesforce connection. Salesforce blocks *simultaneous* refresh-token
+# exchanges of the same token ("Token request is already being processed") and
+# caps concurrent access/refresh token pairs per user, so minting a fresh token
+# on every tool call made bursts (e.g. closing 18 cases) fail intermittently
+# with 400s. We exchange once, cache the access token, and reuse it; a lock
+# single-flights the refresh so concurrent tool calls don't storm the endpoint.
+# Ref: Salesforce "OAuth 2.0 Refresh Token Flow" — cache and reuse tokens.
+_conn_lock = threading.Lock()
+_cached_conn: "Salesforce | None" = None
+_cached_conn_expiry: float = 0.0
+# Conservative TTL — comfortably shorter than a typical SF session timeout, and
+# the burst we care about happens within seconds either way. On a mid-TTL
+# session expiry, tools invalidate the cache and the next call re-exchanges.
+_TOKEN_TTL_SECONDS = 10 * 60
 
 
 def _get_refresh_token() -> str:
@@ -40,12 +58,11 @@ def _get_refresh_token() -> str:
     return token
 
 
-def _create_sf_connection() -> Salesforce:
-    """Create a Salesforce connection using the refresh token."""
+def _exchange_refresh_token() -> Salesforce:
+    """Exchange the refresh token for a fresh access token + connection."""
     refresh_token = _get_refresh_token()
     client_id = "PlatformCLI"
 
-    # Exchange refresh token for access token
     token_url = f"{SF_INSTANCE_URL}/services/oauth2/token"
     response = requests.post(token_url, data={
         'grant_type': 'refresh_token',
@@ -73,6 +90,39 @@ def _create_sf_connection() -> Salesforce:
         session_id=token_data['access_token'],
         version=SF_API_VERSION,
     )
+
+
+def _create_sf_connection() -> Salesforce:
+    """Return a cached Salesforce connection, refreshing at most once per TTL.
+
+    Reuses one access token across tool calls (incl. a burst of case closes)
+    instead of exchanging the refresh token every call. A threading lock
+    single-flights the refresh so concurrent calls (tools run in a thread pool)
+    don't send simultaneous same-refresh-token requests, which Salesforce
+    rejects. Call _invalidate_sf_connection() when a session-expiry error is
+    seen so the next call re-exchanges.
+    """
+    global _cached_conn, _cached_conn_expiry
+    if _cached_conn is not None and time.monotonic() < _cached_conn_expiry:
+        return _cached_conn
+    with _conn_lock:
+        # Re-check inside the lock: another thread may have refreshed while we
+        # waited, so we don't pile on a second exchange.
+        if _cached_conn is not None and time.monotonic() < _cached_conn_expiry:
+            return _cached_conn
+        conn = _exchange_refresh_token()
+        _cached_conn = conn
+        _cached_conn_expiry = time.monotonic() + _TOKEN_TTL_SECONDS
+        return conn
+
+
+def _invalidate_sf_connection() -> None:
+    """Drop the cached connection so the next call re-exchanges (call on a
+    session-expiry / auth error)."""
+    global _cached_conn, _cached_conn_expiry
+    with _conn_lock:
+        _cached_conn = None
+        _cached_conn_expiry = 0.0
 
 
 @tool
@@ -156,7 +206,9 @@ def query_cases(
 
         return "\n".join(lines)
 
-    except Exception:
+    except Exception as e:
+        if isinstance(e, SalesforceExpiredSession):
+            _invalidate_sf_connection()
         logger.exception("[salesforce] query_cases error")
         return "Error querying cases. The failure was logged for the team to review."
 
@@ -242,7 +294,9 @@ def get_case_details(case_id: str) -> str:
 
         return "\n".join(lines)
 
-    except Exception:
+    except Exception as e:
+        if isinstance(e, SalesforceExpiredSession):
+            _invalidate_sf_connection()
         logger.exception("[salesforce] get_case_details error")
         return "Error retrieving case details. The failure was logged for the team to review."
 
@@ -303,7 +357,9 @@ def add_case_comment(
         errors = result.get('errors', ['Unknown error'])
         return f"Error adding comment to case {case_id}: {errors}"
 
-    except Exception:
+    except Exception as e:
+        if isinstance(e, SalesforceExpiredSession):
+            _invalidate_sf_connection()
         logger.exception("[salesforce] add_case_comment error")
         return "Error adding comment. The failure was logged for the team to review."
 
@@ -359,7 +415,9 @@ def update_case_status(
             return f"Case {case_id} updated to status: {update_data['Status']}"
         return f"Error updating case {case_id}: Salesforce returned HTTP {status_code}"
 
-    except Exception:
+    except Exception as e:
+        if isinstance(e, SalesforceExpiredSession):
+            _invalidate_sf_connection()
         logger.exception("[salesforce] update_case_status error")
         return "Error updating case status. The failure was logged for the team to review."
 
