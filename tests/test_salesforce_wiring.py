@@ -117,14 +117,7 @@ def test_update_case_status_passes_id_and_data_separately(monkeypatch):
     assert "updated to status: Closed" in out          # int 204 handled as success
 
 
-def test_add_case_comment_uses_casecomment_object(monkeypatch):
-    """Regression: a case comment must use the CaseComment object
-    (ParentId/CommentBody/IsPublished), not the legacy Note object, and
-    is_internal must drive IsPublished (internal => not published)."""
-    import tools.salesforce as sf_mod
-
-    captured = {}
-
+def _fake_sf_capturing_comment(captured):
     class FakeCaseComment:
         def create(self, data):
             captured["data"] = data
@@ -138,19 +131,94 @@ def test_add_case_comment_uses_casecomment_object(monkeypatch):
         CaseComment = FakeCaseComment()
         Note = FakeNote()
 
-    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+    return FakeSF()
+
+
+def test_add_case_comment_uses_casecomment_object_and_is_internal_by_default(monkeypatch):
+    """A case comment must use CaseComment (not the legacy Note object) and be
+    INTERNAL by default — customer-visible only when explicitly requested."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: _fake_sf_capturing_comment(captured))
 
     out = add_case_comment.invoke({
         "case_id": "500XX0000000abc",
         "comment": "Closing per customer request.",
-        "is_internal": True,
-    })
+    })  # publish_to_customer omitted -> defaults to internal
 
     assert captured["data"]["ParentId"] == "500XX0000000abc"
     assert captured["data"]["CommentBody"] == "Closing per customer request."
-    assert captured["data"]["IsPublished"] is False  # internal => not published
+    assert captured["data"]["IsPublished"] is False  # internal by default
     assert "internal comment" in out
     assert "CaseComment ID: 00aXX0000001" in out
+
+
+def test_add_case_comment_publishes_only_when_asked(monkeypatch):
+    """publish_to_customer=True must set IsPublished=True (customer-visible)."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: _fake_sf_capturing_comment(captured))
+
+    out = add_case_comment.invoke({
+        "case_id": "500XX0000000abc",
+        "comment": "Here's the resolution.",
+        "publish_to_customer": True,
+    })
+
+    assert captured["data"]["IsPublished"] is True
+    assert "customer-visible comment" in out
+
+
+def test_query_cases_escapes_soql_injection(monkeypatch):
+    """Untrusted status/subject must be bound/escaped, not concatenated raw."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+
+    class FakeSF:
+        def query(self, soql):
+            captured["soql"] = soql
+            return {"records": []}
+
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+
+    query_cases.invoke({"status": "New' OR IsClosed=true--", "subject_keyword": "O'Brien"})
+    soql = captured["soql"]
+    assert "New' OR IsClosed=true" not in soql   # injection is NOT present unescaped
+    assert "\\'" in soql                          # quotes were escaped
+
+
+def test_update_case_status_escapes_case_number_soql(monkeypatch):
+    """A malicious CaseNumber must not break out of the resolution query and
+    resolve/close the wrong case."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+
+    class FakeCase:
+        def update(self, record_id, data):
+            captured["record_id"] = record_id
+            return 204
+
+    class FakeSF:
+        Case = FakeCase()
+
+        def query(self, soql):
+            captured["soql"] = soql
+            return {"records": [{"Id": "500RESOLVED"}]}
+
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+
+    update_case_status.invoke({
+        "case_id": "0001' OR Id != ''",
+        "new_status": "Closed",
+        "close_case": True,
+    })
+    assert "0001' OR Id" not in captured["soql"]  # not injected unescaped
+    assert "\\'" in captured["soql"]              # escaped
+    assert captured["record_id"] == "500RESOLVED"
 
 
 def test_query_cases_description_owns_case_routing():

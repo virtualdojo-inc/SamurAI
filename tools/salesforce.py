@@ -13,7 +13,7 @@ import logging
 import requests
 from langchain_core.tools import tool
 
-from simple_salesforce import Salesforce
+from simple_salesforce import Salesforce, format_soql
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,7 @@ def query_cases(
     subject_keyword: str = "",
     status: str = "",
     limit: int = 20,
+    include_closed: bool = False,
 ) -> str:
     """List / search Salesforce support cases. THE tool for any case request.
 
@@ -81,22 +82,39 @@ def query_cases(
 
     Args:
         subject_keyword: Search keyword to match against case subjects (fuzzy).
-        status: Filter by case status (e.g. 'New', 'Waiting for Customer').
+        status: Filter by case status (e.g. 'New', 'Waiting for Customer', 'Closed').
         limit: Max number of results to return (default 20, max 200).
+        include_closed: If True, include closed cases. Ignored when a specific
+            `status` is given (that status governs). Default lists open cases only.
     """
     try:
         sf = _create_sf_connection()
 
-        # Build query
-        where_clauses = ["IsClosed = false"]
+        # Parameterized SOQL — values are bound via format_soql (escapes quotes /
+        # LIKE wildcards) so a case subject/status with an apostrophe can't break
+        # the query and untrusted input can't inject SOQL.
+        where_clauses: list[str] = []
+        params: list = []
+        # Only force "open" when the caller neither asked for a specific status
+        # nor opted into closed cases — otherwise the old hard IsClosed=false
+        # silently contradicted status='Closed' and returned nothing.
+        if not include_closed and not status:
+            where_clauses.append("IsClosed = false")
         if subject_keyword:
-            where_clauses.append(f"Subject LIKE '%{subject_keyword}%'")
+            where_clauses.append("Subject LIKE '%{:like}%'")
+            params.append(subject_keyword)
         if status:
-            where_clauses.append(f"Status = '{status}'")
+            where_clauses.append("Status = {}")
+            params.append(status)
 
-        query = f"SELECT CaseNumber, Subject, Status, Priority, CreatedDate, Owner.Username "
-        query += f"FROM Case WHERE {' AND '.join(where_clauses)} "
-        query += f"ORDER BY CreatedDate DESC LIMIT {min(limit, 200)}"
+        capped = min(max(int(limit), 1), 200)
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        query = format_soql(
+            "SELECT CaseNumber, Subject, Status, Priority, CreatedDate, Owner.Username "
+            "FROM Case" + where_sql + " ORDER BY CreatedDate DESC LIMIT {}",
+            *params,
+            capped,
+        )
 
         result = sf.query(query)
         records = result.get('records', [])
@@ -105,7 +123,7 @@ def query_cases(
             return "No cases found matching the criteria."
 
         # Format results
-        lines = [f"Found {len(records)} open case(s):\n"]
+        lines = [f"Found {len(records)} case(s):\n"]
         for rec in records:
             owner = rec.get('Owner', {})
             username = owner.get('Username', 'N/A') if isinstance(owner, dict) else owner
@@ -119,15 +137,15 @@ def query_cases(
                 f"Created: {created_date}, Owner: {username})"
             )
 
-        # If there are more results, show a note
-        if len(records) >= 200:
-            lines.append("\n... and more results. Try narrowing your search criteria.")
+        # We hit the row cap — there may be more. Note it accurately.
+        if len(records) >= capped:
+            lines.append(f"\n... showing the first {capped}. Narrow the search or raise `limit` for more.")
 
         return "\n".join(lines)
 
-    except Exception as e:
+    except Exception:
         logger.exception("[salesforce] query_cases error")
-        return f"Error querying cases: {type(e).__name__}: {e}"
+        return "Error querying cases. The failure was logged for the team to review."
 
 
 @tool
@@ -151,14 +169,17 @@ def get_case_details(case_id: str) -> str:
             "Contact.Phone", "IsClosed"
         ]
 
-        query = f"SELECT {', '.join(case_fields)} FROM Case WHERE Id = '{case_id}' LIMIT 1"
+        fields_sql = ', '.join(case_fields)  # fixed identifier list, not user input
 
         try:
-            result = sf.query(query)
+            result = sf.query(
+                format_soql(f"SELECT {fields_sql} FROM Case WHERE Id = {{}} LIMIT 1", case_id)
+            )
         except Exception:
             # If direct ID lookup fails, try querying by CaseNumber
-            query = f"SELECT {', '.join(case_fields)} FROM Case WHERE CaseNumber = '{case_id}' LIMIT 1"
-            result = sf.query(query)
+            result = sf.query(
+                format_soql(f"SELECT {fields_sql} FROM Case WHERE CaseNumber = {{}} LIMIT 1", case_id)
+            )
 
         records = result.get('records', [])
 
@@ -208,31 +229,42 @@ def get_case_details(case_id: str) -> str:
 
         return "\n".join(lines)
 
-    except Exception as e:
+    except Exception:
         logger.exception("[salesforce] get_case_details error")
-        return f"Error retrieving case details: {type(e).__name__}: {e}"
+        return "Error retrieving case details. The failure was logged for the team to review."
 
 
 @tool
-def add_case_comment(case_id: str, comment: str, is_internal: bool = False) -> str:
-    """Add a comment to a Salesforce case.
+def add_case_comment(
+    case_id: str,
+    comment: str,
+    publish_to_customer: bool = False,
+) -> str:
+    """Add a comment to a Salesforce case. Internal-only by default.
 
     IMPORTANT: This is a judge-gated action. All write operations to Salesforce
     require approval through the safety judge before execution.
 
+    By default the comment is INTERNAL (staff-only). Only set
+    publish_to_customer=True when the user has EXPLICITLY asked to share/send the
+    comment to the customer — publishing exposes the text to the customer via the
+    portal and cannot be un-sent. If the user did not clearly ask to publish
+    externally, leave it False.
+
     Args:
         case_id: The Salesforce Case ID or Case Number (e.g. '500XXXXXXXXXXXX' or '00001009').
         comment: The comment text to add. Keep it professional and specific.
-        is_internal: If True, the comment will be marked as internal only (not visible to customers).
+        publish_to_customer: If True, the comment is published to the customer
+            (customer-visible). Default False = internal/staff-only. Set True ONLY
+            when the user explicitly requested sharing the comment with the customer.
     """
     try:
         sf = _create_sf_connection()
 
-        # Resolve case_id to internal ID
+        # Resolve case number -> internal Id (parameterized to prevent SOQL injection).
         if not case_id.startswith('500'):
-            # Query to get the actual ID
             result = sf.query(
-                f"SELECT Id FROM Case WHERE CaseNumber = '{case_id}' LIMIT 1"
+                format_soql("SELECT Id FROM Case WHERE CaseNumber = {} LIMIT 1", case_id)
             )
             records = result.get('records', [])
             if not records:
@@ -241,16 +273,16 @@ def add_case_comment(case_id: str, comment: str, is_internal: bool = False) -> s
 
         # CaseComment is the correct object for a case comment. (The legacy Note
         # object does not attach as a case comment and has no public/internal
-        # flag.) IsPublished=True makes the comment visible to the customer;
-        # internal comments set it False. create() returns a dict with id/success.
+        # flag.) IsPublished=True makes the comment customer-visible; default is
+        # internal. create() returns a dict with id/success.
         result = sf.CaseComment.create({
             'ParentId': case_id,
             'CommentBody': comment,
-            'IsPublished': not is_internal,
+            'IsPublished': publish_to_customer,
         })
 
         if result.get('success'):
-            visibility = 'internal' if is_internal else 'public'
+            visibility = 'customer-visible' if publish_to_customer else 'internal'
             return (
                 f"Added {visibility} comment to case {case_id} "
                 f"(CaseComment ID: {result.get('id')})."
@@ -258,9 +290,9 @@ def add_case_comment(case_id: str, comment: str, is_internal: bool = False) -> s
         errors = result.get('errors', ['Unknown error'])
         return f"Error adding comment to case {case_id}: {errors}"
 
-    except Exception as e:
+    except Exception:
         logger.exception("[salesforce] add_case_comment error")
-        return f"Error adding comment: {type(e).__name__}: {e}"
+        return "Error adding comment. The failure was logged for the team to review."
 
 
 @tool
@@ -284,10 +316,12 @@ def update_case_status(
     try:
         sf = _create_sf_connection()
 
-        # Resolve case_id to internal ID
+        # Resolve case number -> internal Id (parameterized to prevent SOQL
+        # injection — an unescaped case_id here could otherwise resolve and
+        # then CLOSE the wrong case).
         if not case_id.startswith('500'):
             result = sf.query(
-                f"SELECT Id FROM Case WHERE CaseNumber = '{case_id}' LIMIT 1"
+                format_soql("SELECT Id FROM Case WHERE CaseNumber = {} LIMIT 1", case_id)
             )
             records = result.get('records', [])
             if not records:
@@ -312,9 +346,9 @@ def update_case_status(
             return f"Case {case_id} updated to status: {update_data['Status']}"
         return f"Error updating case {case_id}: Salesforce returned HTTP {status_code}"
 
-    except Exception as e:
+    except Exception:
         logger.exception("[salesforce] update_case_status error")
-        return f"Error updating status: {type(e).__name__}: {e}"
+        return "Error updating case status. The failure was logged for the team to review."
 
 
 # Exported tool list (mirrors the other tools/ modules). query_cases and
