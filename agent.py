@@ -57,6 +57,7 @@ from tools.self_improve import SELF_IMPROVE_TOOLS
 from tools.skill_authoring import SKILL_AUTHORING_TOOLS
 from tools.code_sandbox import CODE_SANDBOX_TOOLS
 from tools.loom import LOOM_TOOLS
+from tools.salesforce import SALESFORCE_TOOLS
 from tools.tenant_data import create_tenant_data_tools
 from tools.progress import (
     PROGRESS_TOOLS,
@@ -213,6 +214,17 @@ TOOL_GROUPS = {
         "keywords": [
             "smartsheet", "smart sheet", "sheet id", "issue tracker",
             "project tracker", "support tickets",
+        ],
+    },
+    "salesforce": {
+        # Salesforce (Quotely org) case management. query_cases /
+        # get_case_details are read-only; add_case_comment / update_case_status
+        # are judge-gated writes (see judge.py).
+        "tools": SALESFORCE_TOOLS,
+        "keywords": [
+            "salesforce", "sfdc", "case", "cases", "case number",
+            "support case", "customer case", "close the case", "case status",
+            "case comment", "escalate the case", "quotely org",
         ],
     },
     "self_improve": {
@@ -1689,6 +1701,11 @@ async def run_agent(
         "smartsheet_list_sheets": "Listing Smartsheets",
         "smartsheet_get_sheet": "Reading Smartsheet rows",
         "smartsheet_update_row": "Updating Smartsheet row",
+        # Salesforce case management
+        "query_cases": "Querying Salesforce cases",
+        "get_case_details": "Reading Salesforce case details",
+        "add_case_comment": "Adding a case comment",
+        "update_case_status": "Updating case status",
         # Knowledge base & skills
         "get_skill": "Looking up a skill",
         "read_knowledge": "Reading knowledge article",

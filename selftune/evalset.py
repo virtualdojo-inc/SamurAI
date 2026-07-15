@@ -57,6 +57,8 @@ WRITE_TOOLS = {
     "github_create_draft_issue", "github_add_item_to_project", "github_update_item_field",
     # other data writes
     "smartsheet_update_row",
+    # Salesforce (Quotely org) case writes — judge-gated (matches judge.WRITE_TOOL_NAMES)
+    "add_case_comment", "update_case_status",
     # background-task control
     "create_background_task", "cancel_background_task",
     "pause_background_task", "resume_background_task",

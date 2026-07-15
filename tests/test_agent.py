@@ -45,7 +45,7 @@ def mock_llm():
 def test_static_tools_list(mock_llm):
     _, agent = mock_llm
     assert len(agent.STATIC_TOOLS) == len(agent.ALL_TOOLS)
-    assert len(agent.ALL_TOOLS) == 97  # Static tools (CRM/memory/tenant-data added per-user)
+    assert len(agent.ALL_TOOLS) == 101  # Static tools (CRM/memory/tenant-data added per-user)
     tool_names = {t.name for t in agent.STATIC_TOOLS}
     assert "query_cloud_logs" in tool_names
     assert "run_code" in tool_names
