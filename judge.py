@@ -104,6 +104,9 @@ READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
     # Social reads
     "social_list_scheduled",
     "social_get_post",
+    # Salesforce reads
+    "query_cases",
+    "get_case_details",
     # File reads
     "get_uploaded_file_content",
     "get_spreadsheet_info",
@@ -167,6 +170,9 @@ WRITE_TOOL_NAMES: frozenset[str] = frozenset({
     # Skill authoring (writes to the in-boundary bucket support/skills/)
     "save_skill",
     "delete_skill",
+    # Salesforce writes
+    "add_case_comment",
+    "update_case_status",
     # Code sandbox: the judge reviews the script before it executes in the
     # isolated (no-network, no-credential) sandbox. See tools/code_sandbox.py.
     "run_code",
