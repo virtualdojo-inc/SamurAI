@@ -117,6 +117,42 @@ def test_update_case_status_passes_id_and_data_separately(monkeypatch):
     assert "updated to status: Closed" in out          # int 204 handled as success
 
 
+def test_add_case_comment_uses_casecomment_object(monkeypatch):
+    """Regression: a case comment must use the CaseComment object
+    (ParentId/CommentBody/IsPublished), not the legacy Note object, and
+    is_internal must drive IsPublished (internal => not published)."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+
+    class FakeCaseComment:
+        def create(self, data):
+            captured["data"] = data
+            return {"id": "00aXX0000001", "success": True, "errors": []}
+
+    class FakeNote:
+        def create(self, *a, **k):
+            raise AssertionError("must not use Note for case comments")
+
+    class FakeSF:
+        CaseComment = FakeCaseComment()
+        Note = FakeNote()
+
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+
+    out = add_case_comment.invoke({
+        "case_id": "500XX0000000abc",
+        "comment": "Closing per customer request.",
+        "is_internal": True,
+    })
+
+    assert captured["data"]["ParentId"] == "500XX0000000abc"
+    assert captured["data"]["CommentBody"] == "Closing per customer request."
+    assert captured["data"]["IsPublished"] is False  # internal => not published
+    assert "internal comment" in out
+    assert "CaseComment ID: 00aXX0000001" in out
+
+
 def test_query_cases_description_owns_case_routing():
     """query_cases must clearly own 'Salesforce case' requests. Prod misrouted
     'list the quotely cases from salesforce' to list_tenant_support_grants (the

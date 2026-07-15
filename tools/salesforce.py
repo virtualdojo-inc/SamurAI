@@ -239,20 +239,24 @@ def add_case_comment(case_id: str, comment: str, is_internal: bool = False) -> s
                 return f"Error: Case not found: {case_id}"
             case_id = records[0]['Id']
 
-        # Create Note as a comment
-        note = sf.Note.create({
+        # CaseComment is the correct object for a case comment. (The legacy Note
+        # object does not attach as a case comment and has no public/internal
+        # flag.) IsPublished=True makes the comment visible to the customer;
+        # internal comments set it False. create() returns a dict with id/success.
+        result = sf.CaseComment.create({
             'ParentId': case_id,
-            'Title': f'Comment on {case_id}',
-            'IsPrivacyProtected': True,  # Salesforce privacy setting
-            'Body': comment,
+            'CommentBody': comment,
+            'IsPublished': not is_internal,
         })
 
-        result_msg = f"Comment added to case {case_id} (Note ID: {note['id']})."
-        if is_internal:
-            # Notes don't have an internal flag directly, but we can add context in the title
-            pass  # The comment is still visible in the case feed
-
-        return result_msg
+        if result.get('success'):
+            visibility = 'internal' if is_internal else 'public'
+            return (
+                f"Added {visibility} comment to case {case_id} "
+                f"(CaseComment ID: {result.get('id')})."
+            )
+        errors = result.get('errors', ['Unknown error'])
+        return f"Error adding comment to case {case_id}: {errors}"
 
     except Exception as e:
         logger.exception("[salesforce] add_case_comment error")
