@@ -57,3 +57,12 @@ def test_write_tools_are_judge_gated():
     for name in _WRITE_TOOLS:
         assert name in judge.WRITE_TOOL_NAMES
         assert name not in judge.READ_ONLY_TOOL_NAMES
+
+
+def test_lazy_runtime_deps_are_installed():
+    """salesforce.py imports these LAZILY (inside functions), so a missing
+    requirement only ImportErrors at runtime in the container, not at module
+    import. In CI (which pip-installs requirements.txt) this test fails if the
+    dep is undeclared — the gap that broke query_cases in prod once."""
+    import simple_salesforce  # noqa: F401
+    from google.cloud import secretmanager  # noqa: F401
