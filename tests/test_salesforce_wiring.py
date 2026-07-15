@@ -171,6 +171,81 @@ def test_add_case_comment_publishes_only_when_asked(monkeypatch):
     assert "customer-visible comment" in out
 
 
+def test_token_exchange_logs_error_body(monkeypatch, caplog):
+    """On a token-endpoint 4xx, the OAuth error body (error/error_description)
+    must be logged before raise_for_status — otherwise only a bare '400 Bad
+    Request' reaches the logs, which is what made the burst-close 400s opaque."""
+    import logging
+    import requests
+    import tools.salesforce as sf_mod
+
+    class FakeResp:
+        ok = False
+        status_code = 400
+        headers = {"Sfdc-Request-Id": "REQ-123"}
+        text = '{"error":"invalid_grant","error_description":"expired access/refresh token"}'
+
+        def raise_for_status(self):
+            raise requests.exceptions.HTTPError("400 Client Error")
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(sf_mod, "_get_refresh_token", lambda: "tok")
+    monkeypatch.setattr(sf_mod.requests, "post", lambda *a, **k: FakeResp())
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(requests.exceptions.HTTPError):
+            sf_mod._exchange_refresh_token()
+
+    assert "HTTP 400" in caplog.text
+    assert "invalid_grant" in caplog.text  # the OAuth error code is now visible
+    assert "REQ-123" in caplog.text         # Salesforce request id for support
+
+
+def test_connection_is_cached_across_calls(monkeypatch):
+    """The access token is exchanged once and reused — a burst of tool calls
+    must NOT re-exchange the refresh token per call (that caused the 400s)."""
+    import tools.salesforce as sf_mod
+
+    monkeypatch.setattr(sf_mod, "_cached_conn", None)
+    monkeypatch.setattr(sf_mod, "_cached_conn_expiry", 0.0)
+    calls = {"n": 0}
+
+    def fake_exchange():
+        calls["n"] += 1
+        return object()
+
+    monkeypatch.setattr(sf_mod, "_exchange_refresh_token", fake_exchange)
+
+    c1 = sf_mod._create_sf_connection()
+    c2 = sf_mod._create_sf_connection()
+    c3 = sf_mod._create_sf_connection()
+
+    assert c1 is c2 is c3
+    assert calls["n"] == 1  # exchanged once, reused across the burst
+
+
+def test_session_expiry_invalidates_cache(monkeypatch):
+    """A SalesforceExpiredSession during a call clears the cached connection so
+    the next call re-exchanges (cache can't get stuck on a dead session)."""
+    from simple_salesforce.exceptions import SalesforceExpiredSession
+    import tools.salesforce as sf_mod
+
+    monkeypatch.setattr(sf_mod, "_cached_conn", object())      # primed cache
+    monkeypatch.setattr(sf_mod, "_cached_conn_expiry", 1e18)
+
+    class FakeSF:
+        def query(self, soql):
+            raise SalesforceExpiredSession("https://x", 401, "Case", [{"message": "expired"}])
+
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+
+    out = sf_mod.query_cases.invoke({})
+    assert sf_mod._cached_conn is None          # invalidated
+    assert "Error querying cases" in out
+
+
 def test_query_cases_escapes_soql_injection(monkeypatch):
     """Untrusted status/subject must be bound/escaped, not concatenated raw."""
     import tools.salesforce as sf_mod
