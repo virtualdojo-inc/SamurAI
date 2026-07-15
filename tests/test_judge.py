@@ -843,3 +843,15 @@ async def test_stage2_retries_once_on_empty_response(monkeypatch):
 
     assert llm.ainvoke.await_count == 2
     assert result == {"messages": []}
+
+
+def test_judge_prompts_guard_external_case_comment_publishing():
+    """The judge must be primed to catch add_case_comment publishing externally
+    (publish_to_customer=true) when the user did not explicitly ask — so a
+    customer-visible comment can't slip through unrequested."""
+    import judge
+
+    assert "publish_to_customer" in judge._STAGE_1_PROMPT
+    assert "publish_to_customer" in judge._STAGE_2_PROMPT
+    # Stage 2 must instruct a block when publishing was not requested.
+    assert "block" in judge._STAGE_2_PROMPT.lower()

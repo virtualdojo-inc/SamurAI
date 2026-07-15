@@ -83,6 +83,144 @@ def test_refresh_token_missing_raises_clear_error(monkeypatch):
         sf._get_refresh_token()
 
 
+def test_update_case_status_passes_id_and_data_separately(monkeypatch):
+    """Regression: simple_salesforce's SFType.update needs (record_id, data).
+    Passing only the dict raised 'missing 1 required positional argument: data'
+    in prod when the user tried to close cases. Also: update returns an int HTTP
+    status code (not a dict), and the Id belongs in the URL, not the body."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+
+    class FakeCase:
+        def update(self, record_id, data):
+            captured["record_id"] = record_id
+            captured["data"] = data
+            return 204  # simple_salesforce returns the HTTP status code
+
+    class FakeSF:
+        Case = FakeCase()
+
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+
+    out = update_case_status.invoke({
+        "case_id": "500XX0000000abc",  # starts with 500 -> skips CaseNumber lookup
+        "new_status": "Closed",
+        "close_case": True,
+        "closure_notes": "resolved",
+    })
+
+    assert captured["record_id"] == "500XX0000000abc"  # Id in the URL
+    assert "Id" not in captured["data"]                # not duplicated in the body
+    assert captured["data"]["Status"] == "Closed"
+    assert captured["data"]["ClosureNotes"] == "resolved"
+    assert "updated to status: Closed" in out          # int 204 handled as success
+
+
+def _fake_sf_capturing_comment(captured):
+    class FakeCaseComment:
+        def create(self, data):
+            captured["data"] = data
+            return {"id": "00aXX0000001", "success": True, "errors": []}
+
+    class FakeNote:
+        def create(self, *a, **k):
+            raise AssertionError("must not use Note for case comments")
+
+    class FakeSF:
+        CaseComment = FakeCaseComment()
+        Note = FakeNote()
+
+    return FakeSF()
+
+
+def test_add_case_comment_uses_casecomment_object_and_is_internal_by_default(monkeypatch):
+    """A case comment must use CaseComment (not the legacy Note object) and be
+    INTERNAL by default — customer-visible only when explicitly requested."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: _fake_sf_capturing_comment(captured))
+
+    out = add_case_comment.invoke({
+        "case_id": "500XX0000000abc",
+        "comment": "Closing per customer request.",
+    })  # publish_to_customer omitted -> defaults to internal
+
+    assert captured["data"]["ParentId"] == "500XX0000000abc"
+    assert captured["data"]["CommentBody"] == "Closing per customer request."
+    assert captured["data"]["IsPublished"] is False  # internal by default
+    assert "internal comment" in out
+    assert "CaseComment ID: 00aXX0000001" in out
+
+
+def test_add_case_comment_publishes_only_when_asked(monkeypatch):
+    """publish_to_customer=True must set IsPublished=True (customer-visible)."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: _fake_sf_capturing_comment(captured))
+
+    out = add_case_comment.invoke({
+        "case_id": "500XX0000000abc",
+        "comment": "Here's the resolution.",
+        "publish_to_customer": True,
+    })
+
+    assert captured["data"]["IsPublished"] is True
+    assert "customer-visible comment" in out
+
+
+def test_query_cases_escapes_soql_injection(monkeypatch):
+    """Untrusted status/subject must be bound/escaped, not concatenated raw."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+
+    class FakeSF:
+        def query(self, soql):
+            captured["soql"] = soql
+            return {"records": []}
+
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+
+    query_cases.invoke({"status": "New' OR IsClosed=true--", "subject_keyword": "O'Brien"})
+    soql = captured["soql"]
+    assert "New' OR IsClosed=true" not in soql   # injection is NOT present unescaped
+    assert "\\'" in soql                          # quotes were escaped
+
+
+def test_update_case_status_escapes_case_number_soql(monkeypatch):
+    """A malicious CaseNumber must not break out of the resolution query and
+    resolve/close the wrong case."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+
+    class FakeCase:
+        def update(self, record_id, data):
+            captured["record_id"] = record_id
+            return 204
+
+    class FakeSF:
+        Case = FakeCase()
+
+        def query(self, soql):
+            captured["soql"] = soql
+            return {"records": [{"Id": "500RESOLVED"}]}
+
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+
+    update_case_status.invoke({
+        "case_id": "0001' OR Id != ''",
+        "new_status": "Closed",
+        "close_case": True,
+    })
+    assert "0001' OR Id" not in captured["soql"]  # not injected unescaped
+    assert "\\'" in captured["soql"]              # escaped
+    assert captured["record_id"] == "500RESOLVED"
+
+
 def test_query_cases_description_owns_case_routing():
     """query_cases must clearly own 'Salesforce case' requests. Prod misrouted
     'list the quotely cases from salesforce' to list_tenant_support_grants (the
