@@ -14,6 +14,16 @@ def _temp_db(tmp_path, monkeypatch):
     td._store = None
 
 
+@pytest.fixture(autouse=True)
+def _stub_clear_thread(monkeypatch):
+    """Batch runs now clear per-row checkpoints via memory.clear_thread; stub it
+    so tests that don't inject their own never touch the real checkpointer."""
+    import memory
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(memory, "clear_thread", AsyncMock(return_value=True))
+
+
 # ── trailer parsing ───────────────────────────────────────────────────────
 
 def test_parse_full_trailer():
@@ -136,6 +146,62 @@ async def test_row_without_id_is_ignored():
     res = await tt.run_triage_batch(run_agent=agent, fetch_rows=fetch)
     assert res["diagnosed"] == 0
     assert len(calls) == 0
+
+
+async def test_each_row_uses_isolated_thread_and_purges_legacy():
+    """Regression: triage must NOT reuse one shared conversation_id (that grew
+    the checkpoint to thousands of messages). Each row gets its own thread which
+    is cleared, and the legacy shared thread is purged once."""
+    rows = [
+        {"Symptom": "a", "_row_id": "111"},
+        {"Symptom": "b", "_row_id": "222"},
+    ]
+
+    async def fetch():
+        return _sheet(rows)
+
+    convs = []
+
+    async def agent(*, user_message, conversation_id, is_background_task):
+        convs.append(conversation_id)
+        return "CATEGORY: A\nSUGGESTED_TYPE: none\nSUGGESTED_PRIORITY: none\nSUMMARY: ok"
+
+    cleared = []
+
+    async def clear(cid):
+        cleared.append(cid)
+        return True
+
+    await tt.run_triage_batch(run_agent=agent, fetch_rows=fetch, clear_thread=clear)
+
+    # Each row diagnosed in its OWN thread — never the bare shared id.
+    assert convs == ["tracker_triage:111", "tracker_triage:222"]
+    # Legacy shared thread purged once, and every per-row thread cleared.
+    assert "tracker_triage" in cleared          # one-time legacy cleanup
+    assert "tracker_triage:111" in cleared
+    assert "tracker_triage:222" in cleared
+
+
+async def test_failed_row_still_clears_its_thread():
+    """Even a row whose agent call raises must have its ephemeral thread cleared
+    (the clear runs in a finally)."""
+    rows = [{"Symptom": "bad", "_row_id": "9"}]
+
+    async def fetch():
+        return _sheet(rows)
+
+    async def boom(*, user_message, conversation_id, is_background_task):
+        raise RuntimeError("model blew up")
+
+    cleared = []
+
+    async def clear(cid):
+        cleared.append(cid)
+        return True
+
+    res = await tt.run_triage_batch(run_agent=boom, fetch_rows=fetch, clear_thread=clear)
+    assert res["diagnosed"] == 0
+    assert "tracker_triage:9" in cleared  # cleared despite the failure
 
 
 async def test_one_failing_row_does_not_stall_batch():
