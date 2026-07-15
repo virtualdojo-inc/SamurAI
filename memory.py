@@ -309,6 +309,25 @@ async def get_checkpointer():
     return _checkpointer
 
 
+async def clear_thread(conversation_id: str) -> bool:
+    """Delete a conversation's checkpoint history (the thread keyed by
+    conversation_id). Wipes the running chat context — tool traces, prior
+    messages, injected memories for that turn — so the next message starts fresh.
+    Does NOT touch long-term LangMem memories (those persist by design).
+
+    Returns True if a delete was issued, False if the checkpointer can't delete.
+    """
+    checkpointer = await get_checkpointer()
+    adelete = getattr(checkpointer, "adelete_thread", None)
+    if adelete is None:
+        logger.warning("checkpointer %s has no adelete_thread", type(checkpointer).__name__)
+        return False
+    await adelete(conversation_id)
+    logger.info("cleared thread checkpoint: %s", conversation_id)
+    print(f"[memory] cleared thread {conversation_id}", flush=True)
+    return True
+
+
 # ── LangMem Memory Tools ─────────────────────────────────────────────
 
 

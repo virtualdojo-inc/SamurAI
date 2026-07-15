@@ -145,6 +145,44 @@ async def test_on_message_blocks_non_virtualdojo_user(patched_app):
     assert any("VirtualDojo" in t for t in sent_texts)
 
 
+@pytest.mark.asyncio
+async def test_reset_command_clears_thread_and_skips_agent(patched_app):
+    """'reset' must actually wipe the conversation checkpoint and NOT run the
+    agent (the bug was it only claimed to reset)."""
+    ctx, member = _make_turn_context("reset")
+
+    with (
+        patch.object(patched_app, "run_agent", new_callable=AsyncMock) as mock_agent,
+        patch("botbuilder.core.teams.TeamsInfo.get_member", new_callable=AsyncMock, return_value=member),
+        patch("task_store.get_task_store", new_callable=AsyncMock),
+        patch("memory.clear_thread", new_callable=AsyncMock, return_value=True) as mock_clear,
+    ):
+        await patched_app.on_message(ctx)
+
+    mock_clear.assert_awaited_once_with("conv-123")
+    mock_agent.assert_not_called()
+    sent_texts = [
+        str(call[0][0]) for call in ctx.send_activity.call_args_list
+    ]
+    assert any("cleared" in t.lower() for t in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_normal_message_does_not_trigger_reset(patched_app):
+    """A message that merely mentions reset must NOT wipe the thread."""
+    ctx, member = _make_turn_context("can you reset the staging database counter?")
+
+    with (
+        patch.object(patched_app, "run_agent", new_callable=AsyncMock, return_value="ok"),
+        patch("botbuilder.core.teams.TeamsInfo.get_member", new_callable=AsyncMock, return_value=member),
+        patch("task_store.get_task_store", new_callable=AsyncMock),
+        patch("memory.clear_thread", new_callable=AsyncMock) as mock_clear,
+    ):
+        await patched_app.on_message(ctx)
+
+    mock_clear.assert_not_called()
+
+
 # --- Group-chat support ---
 
 

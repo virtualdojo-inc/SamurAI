@@ -502,3 +502,27 @@ async def test_core_extractor_passes_store_to_reflection_executor():
 async def test_team_extractor_passes_store_to_reflection_executor():
     call, fake_store = await _capture_reflection_args("get_team_extractor")
     assert call.kwargs.get("store") is fake_store
+
+
+async def test_clear_thread_calls_adelete_thread():
+    """clear_thread must delete the checkpoint for the given conversation_id."""
+    import memory
+
+    fake_ckpt = MagicMock()
+    fake_ckpt.adelete_thread = AsyncMock()
+    with patch("memory.get_checkpointer", new_callable=AsyncMock, return_value=fake_ckpt):
+        ok = await memory.clear_thread("conv-xyz")
+
+    assert ok is True
+    fake_ckpt.adelete_thread.assert_awaited_once_with("conv-xyz")
+
+
+async def test_clear_thread_handles_checkpointer_without_delete():
+    """If the checkpointer can't delete, clear_thread returns False (no crash)."""
+    import memory
+
+    fake_ckpt = MagicMock(spec=[])  # no adelete_thread attribute
+    with patch("memory.get_checkpointer", new_callable=AsyncMock, return_value=fake_ckpt):
+        ok = await memory.clear_thread("conv-xyz")
+
+    assert ok is False

@@ -82,6 +82,13 @@ async def _keep_typing(turn_context: TurnContext, stop_event: asyncio.Event):
             pass
 
 
+# Exact (case-insensitive) messages that trigger a conversation-history wipe.
+_RESET_COMMANDS = {
+    "reset", "/reset", "clear", "/clear", "clear context", "clear history",
+    "clear thread", "new conversation", "new chat", "start over", "start fresh",
+}
+
+
 def _clean_user_text(activity) -> str:
     """Message text with the bot's own @mention removed (group chats / channels).
     In 1:1 there is no mention so the text is unchanged; defensive fallback for
@@ -344,6 +351,35 @@ async def on_message(turn_context: TurnContext):
                 )
             )
         print(f"[on_message] BLOCKED unauthorized user: {user_email or user_id} group={is_group}", flush=True)
+        return
+
+    # Reset command: actually clear THIS conversation's checkpoint history so the
+    # next message starts fresh. Previously the bot only *claimed* to reset (it
+    # can't wipe its own checkpoint from a normal turn), so a stale thread kept
+    # repeating earlier tool choices. Exact-match only, so we never nuke a thread
+    # on a message that merely mentions "reset". Gated behind the auth check above.
+    if user_message.strip().lower() in _RESET_COMMANDS:
+        stop_typing.set()
+        await typing_task
+        from memory import clear_thread
+        from tools.file_handler import _uploaded_files
+
+        ok = False
+        try:
+            ok = await clear_thread(conversation_id)
+        except Exception as e:
+            print(f"[on_message] reset failed: {type(e).__name__}: {e}", flush=True)
+        _uploaded_files.pop(conversation_id, None)
+        if ok:
+            await turn_context.send_activity(
+                "🧹 Done — this conversation's context and history are cleared. "
+                "The next message starts fresh. (Your saved long-term memories are kept.)"
+            )
+        else:
+            await turn_context.send_activity(
+                "I couldn't clear the history automatically. Please start a new chat "
+                "thread to get a fresh context."
+            )
         return
 
     # Persist conversation reference for proactive messaging (background tasks)
