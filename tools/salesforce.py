@@ -51,7 +51,20 @@ def _create_sf_connection() -> Salesforce:
         'grant_type': 'refresh_token',
         'client_id': client_id,
         'refresh_token': refresh_token,
-    })
+    }, timeout=30)
+    # On a 4xx/5xx, Salesforce returns a JSON OAuth error body such as
+    # {"error": "invalid_grant", "error_description": "..."}. raise_for_status()
+    # discards it, leaving only a bare "400 Bad Request" in the traceback — which
+    # is exactly what made the burst-close failures hard to diagnose. Log the
+    # status, Salesforce request id, and body first (the body carries the error
+    # code + description; it does NOT contain the refresh/access token).
+    if not response.ok:
+        logger.error(
+            "[salesforce] token exchange failed: HTTP %s sfdc_request_id=%s body=%s",
+            response.status_code,
+            response.headers.get("Sfdc-Request-Id") or response.headers.get("x-request-id"),
+            response.text[:1000],
+        )
     response.raise_for_status()
     token_data = response.json()
 

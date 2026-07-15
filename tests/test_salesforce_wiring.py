@@ -171,6 +171,38 @@ def test_add_case_comment_publishes_only_when_asked(monkeypatch):
     assert "customer-visible comment" in out
 
 
+def test_token_exchange_logs_error_body(monkeypatch, caplog):
+    """On a token-endpoint 4xx, the OAuth error body (error/error_description)
+    must be logged before raise_for_status — otherwise only a bare '400 Bad
+    Request' reaches the logs, which is what made the burst-close 400s opaque."""
+    import logging
+    import requests
+    import tools.salesforce as sf_mod
+
+    class FakeResp:
+        ok = False
+        status_code = 400
+        headers = {"Sfdc-Request-Id": "REQ-123"}
+        text = '{"error":"invalid_grant","error_description":"expired access/refresh token"}'
+
+        def raise_for_status(self):
+            raise requests.exceptions.HTTPError("400 Client Error")
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(sf_mod, "_get_refresh_token", lambda: "tok")
+    monkeypatch.setattr(sf_mod.requests, "post", lambda *a, **k: FakeResp())
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(requests.exceptions.HTTPError):
+            sf_mod._create_sf_connection()
+
+    assert "HTTP 400" in caplog.text
+    assert "invalid_grant" in caplog.text  # the OAuth error code is now visible
+    assert "REQ-123" in caplog.text         # Salesforce request id for support
+
+
 def test_query_cases_escapes_soql_injection(monkeypatch):
     """Untrusted status/subject must be bound/escaped, not concatenated raw."""
     import tools.salesforce as sf_mod
