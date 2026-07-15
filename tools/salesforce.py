@@ -22,15 +22,22 @@ SF_API_VERSION = "67.0"
 
 
 def _get_refresh_token() -> str:
-    """Get the refresh token from GCP Secret Manager."""
-    from google.cloud import secretmanager
+    """Read the Salesforce OAuth refresh token from the environment.
 
-    project_id = os.environ.get("GCP_PROJECT_ID", "virtualdojo-samurai")
-
-    client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/{project_id}/secrets/sf-cli-refresh-token/versions/latest"
-    response = client.access_secret_version(name=name)
-    return response.payload.data.decode("UTF-8")
+    Injected by Cloud Run from Secret Manager via
+    `--update-secrets=SF_CLI_REFRESH_TOKEN=sf-cli-refresh-token:latest`, matching
+    how every other secret in this service is provided (env-var injection — see
+    app.py, db/session.py). This avoids a runtime Secret Manager API round-trip,
+    the extra `secretmanager.versions.access` IAM grant, and the
+    google-cloud-secret-manager dependency.
+    """
+    token = os.environ.get("SF_CLI_REFRESH_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "SF_CLI_REFRESH_TOKEN is not set. Mount it on Cloud Run with "
+            "--update-secrets=SF_CLI_REFRESH_TOKEN=sf-cli-refresh-token:latest."
+        )
+    return token
 
 
 def _create_sf_connection() -> Salesforce:

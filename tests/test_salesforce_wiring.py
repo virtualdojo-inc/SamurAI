@@ -60,9 +60,24 @@ def test_write_tools_are_judge_gated():
 
 
 def test_lazy_runtime_deps_are_installed():
-    """salesforce.py imports these LAZILY (inside functions), so a missing
-    requirement only ImportErrors at runtime in the container, not at module
-    import. In CI (which pip-installs requirements.txt) this test fails if the
-    dep is undeclared — the gap that broke query_cases in prod once."""
+    """salesforce.py imports simple_salesforce at module load; guard that CI
+    (which pip-installs requirements.txt) has it declared — the gap that broke
+    query_cases in prod once."""
     import simple_salesforce  # noqa: F401
-    from google.cloud import secretmanager  # noqa: F401
+
+
+def test_refresh_token_read_from_env(monkeypatch):
+    """The token comes from the injected SF_CLI_REFRESH_TOKEN env var (matching
+    every other secret in this service), not a Secret Manager API call."""
+    import tools.salesforce as sf
+
+    monkeypatch.setenv("SF_CLI_REFRESH_TOKEN", "tok-abc123")
+    assert sf._get_refresh_token() == "tok-abc123"
+
+
+def test_refresh_token_missing_raises_clear_error(monkeypatch):
+    import tools.salesforce as sf
+
+    monkeypatch.delenv("SF_CLI_REFRESH_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="SF_CLI_REFRESH_TOKEN"):
+        sf._get_refresh_token()

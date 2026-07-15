@@ -38,9 +38,7 @@ psycopg[binary]>=3.1
 PyYAML>=6.0
 # Loom video ingestion (kb/ingest_loom). ffmpeg is installed via apt in the Dockerfile.
 yt-dlp>=2025.1.1
-# Salesforce case-management tools (tools/salesforce.py).
+# Salesforce case-management tools (tools/salesforce.py). The OAuth refresh
+# token is provided via Cloud Run env-var injection (SF_CLI_REFRESH_TOKEN), so
+# no Secret Manager client library is needed.
 simple-salesforce>=1.12
-# Salesforce tools read the OAuth refresh token from Secret Manager
-# (from google.cloud import secretmanager). Imported lazily, so it must be
-# declared explicitly or it ImportErrors only at runtime in the container.
-google-cloud-secret-manager>=2.0
