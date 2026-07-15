@@ -504,7 +504,21 @@ _CRM_SECTION = (
     "'create_record', 'update_record', 'get_record'. "
     "If the user asks about CRM data and is not signed in, tell them to say 'connect to VirtualDojo' to authenticate. "
     "NEVER generate or fabricate a login URL yourself. The bot will automatically provide the correct sign-in link "
-    "when the user says 'connect to VirtualDojo'."
+    "when the user says 'connect to VirtualDojo'. "
+    "This is DISTINCT from Salesforce support cases — see the Salesforce section; do NOT route case requests here."
+)
+
+_SALESFORCE_SECTION = (
+    "Salesforce support cases:\n"
+    "Salesforce support cases (the Quotely Salesforce org) are a SEPARATE system from "
+    "VirtualDojo CRM data. For ANY request to list, search, view, comment on, or update "
+    "SUPPORT CASES — e.g. 'list the cases', 'salesforce cases', 'quotely cases', 'open "
+    "support cases', or a case number like 00001673 — use the Salesforce tools: query_cases "
+    "and get_case_details (read), add_case_comment and update_case_status (judge-gated writes). "
+    "These require NO VirtualDojo sign-in and work immediately. Do NOT use the VirtualDojo CRM "
+    "or tenant tools (virtualdojo_crm, list_tenant_support_grants, read_tenant_records) for "
+    "support cases, and do NOT tell the user to 'connect to VirtualDojo' for a case request — "
+    "that is the wrong system and sends them through an SSO sign-in for no reason."
 )
 
 _DEPLOYMENT_SECTION = (
@@ -770,6 +784,14 @@ PROMPT_SECTIONS = {
         "keywords": [
             "crm", "contact", "account", "opportunity", "quote",
             "virtualdojo_crm", "connect to virtualdojo", "sign in", "signed in",
+        ],
+    },
+    "salesforce": {
+        "content": _SALESFORCE_SECTION,
+        "keywords": [
+            "salesforce", "sfdc", "case", "cases", "case number",
+            "support case", "customer case", "close the case", "case status",
+            "case comment", "escalate the case", "quotely org", "quotely case",
         ],
     },
     "deployment": {

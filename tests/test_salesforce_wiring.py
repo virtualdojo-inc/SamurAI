@@ -102,3 +102,20 @@ def test_tenant_grant_tool_disclaims_salesforce_cases():
     desc = grants.description.lower()
     assert "not for salesforce cases" in desc
     assert "query_cases" in desc
+
+
+def test_salesforce_prompt_section_loads_for_case_requests():
+    """The system prompt frames SamurAI as a 'CRM assistant' and told the model
+    to send un-signed-in users to 'connect to VirtualDojo' for data requests —
+    which is why 'list the cases from salesforce' emitted an SSO link instead of
+    calling query_cases. A dedicated Salesforce prompt section must load for case
+    requests and steer AWAY from the CRM/tenant path."""
+    import agent
+
+    prompt = agent._select_prompt_sections("list the cases from salesforce")
+    assert "Salesforce support cases" in prompt
+    assert "query_cases" in prompt
+    assert "connect to virtualdojo" in prompt.lower()  # explicitly tells it NOT to
+
+    # It should also load for a plain 'cases' request with no 'salesforce' word.
+    assert "Salesforce support cases" in agent._select_prompt_sections("please list the open cases")
