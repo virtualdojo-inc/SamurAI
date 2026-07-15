@@ -298,3 +298,14 @@ def update_case_status(
     except Exception as e:
         logger.exception("[salesforce] update_case_status error")
         return f"Error updating status: {type(e).__name__}: {e}"
+
+
+# Exported tool list (mirrors the other tools/ modules). query_cases and
+# get_case_details are read-only; add_case_comment and update_case_status are
+# judge-gated writes (registered in judge.py's write-tool list).
+SALESFORCE_TOOLS = [
+    query_cases,
+    get_case_details,
+    add_case_comment,
+    update_case_status,
+]

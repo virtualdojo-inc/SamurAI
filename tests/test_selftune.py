@@ -285,6 +285,7 @@ _READ_SAFE_TOOLS = {
     "oscal_catalog_lookup", "oscal_generate_assessment_results", "oscal_render_pdf",
     "oscal_validate_package",
     "smartsheet_get_sheet", "smartsheet_list_sheets",
+    "query_cases", "get_case_details",  # read-only: Salesforce case queries
     "get_tracker_diagnostics",  # read-only: serves pre-computed tracker diagnoses
     "find_prior_script",  # read-only: semantic search over the code_runs library
     "analyze_loom_video",  # read-only: download + in-boundary multimodal analysis of a Loom
