@@ -104,11 +104,13 @@ async def run_triage_batch(
     max_rows: int | None = None,
     run_agent=None,
     fetch_rows=None,
+    clear_thread=None,
 ) -> dict:
     """Diagnose up to ``max_rows`` new/changed tracker rows; park the results.
 
-    ``run_agent`` and ``fetch_rows`` are injectable for testing; in production
-    they default to the live agent and the live Smartsheet read.
+    ``run_agent``, ``fetch_rows``, and ``clear_thread`` are injectable for
+    testing; in production they default to the live agent, the live Smartsheet
+    read, and the live checkpoint cleaner.
 
     Returns ``{processed, diagnosed, skipped, candidates, remaining}``.
     """
@@ -124,6 +126,10 @@ async def run_triage_batch(
 
         async def fetch_rows():
             return await asyncio.to_thread(get_sheet, DH_TECH_TRACKER_SHEET_ID)
+    if clear_thread is None:
+        from memory import clear_thread as _live_clear_thread
+
+        clear_thread = _live_clear_thread
 
     store = await get_diagnostics_store()
     sheet = await fetch_rows()
@@ -139,19 +145,41 @@ async def run_triage_batch(
         if await store.needs_diagnosis(row_id, h):
             candidates.append((row, h))
 
+    # One-time cleanup of the legacy shared triage conversation. All rows across
+    # all runs used to share this single thread_id, so its checkpoint grew
+    # unbounded (thousands of messages -> multi-second history trims on every
+    # call + cross-row context bleed). Drop it; rows below now use isolated,
+    # ephemeral per-row threads. Idempotent — a no-op once it's gone.
+    try:
+        await clear_thread(_TRIAGE_CONVERSATION_ID)
+    except Exception:
+        logger.warning("[tracker.triage] legacy thread cleanup skipped", exc_info=True)
+
     batch = candidates[:max_rows]
     diagnosed = 0
     for row, h in batch:
         row_id = str(row["_row_id"])
+        # Diagnose each row in its OWN conversation, then clear it. Triage is
+        # per-row and self-contained (the prompt carries the full row), so
+        # history must neither accumulate across rows/runs nor leak between rows.
+        triage_conv_id = f"{_TRIAGE_CONVERSATION_ID}:{row_id}"
         try:
             reply = await run_agent(
                 user_message=_triage_prompt(row),
-                conversation_id=_TRIAGE_CONVERSATION_ID,
+                conversation_id=triage_conv_id,
                 is_background_task=True,
             )
         except Exception as e:  # one bad row must not stall the batch
             logger.error("[tracker.triage] row %s failed: %s: %s", row_id, type(e).__name__, e)
             continue
+        finally:
+            # Ephemeral: drop this row's checkpoint whether it succeeded or not.
+            try:
+                await clear_thread(triage_conv_id)
+            except Exception:
+                logger.warning(
+                    "[tracker.triage] could not clear thread %s", triage_conv_id, exc_info=True
+                )
 
         parsed = _parse_trailer(reply)
         issue_no = None
