@@ -81,3 +81,24 @@ def test_refresh_token_missing_raises_clear_error(monkeypatch):
     monkeypatch.delenv("SF_CLI_REFRESH_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="SF_CLI_REFRESH_TOKEN"):
         sf._get_refresh_token()
+
+
+def test_query_cases_description_owns_case_routing():
+    """query_cases must clearly own 'Salesforce case' requests. Prod misrouted
+    'list the quotely cases from salesforce' to list_tenant_support_grants (the
+    CRM SSO flow); the description now names those phrasings explicitly."""
+    desc = query_cases.description.lower()
+    assert "salesforce" in desc and "case" in desc
+    assert "quotely" in desc  # 'quotely cases' must route here, not to the CRM tool
+
+
+def test_tenant_grant_tool_disclaims_salesforce_cases():
+    """The tenant support-grant tool must steer case requests to query_cases so
+    the model stops sending users through SSO for a Salesforce query."""
+    from tools.tenant_data import create_tenant_data_tools
+
+    tools = create_tenant_data_tools("test-user")
+    grants = next(t for t in tools if t.name == "list_tenant_support_grants")
+    desc = grants.description.lower()
+    assert "not for salesforce cases" in desc
+    assert "query_cases" in desc

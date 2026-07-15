@@ -68,9 +68,15 @@ def query_cases(
     status: str = "",
     limit: int = 20,
 ) -> str:
-    """Query Salesforce cases from the Quotely org.
+    """List / search Salesforce support cases. THE tool for any case request.
 
-    Use this to search for cases by subject, status, or filter criteria.
+    Use this for ANY request to list, search, or find cases — including phrasings
+    like "list the cases", "show open cases", "salesforce cases", or "quotely
+    cases" (the cases live in Quotely's Salesforce org). This is the ONLY tool for
+    Salesforce Case records. Do NOT use the tenant/CRM support-grant tools
+    (list_tenant_support_grants, read_tenant_records) for cases — those are for
+    customer-tenant data access and will send the user through an SSO sign-in.
+
     Returns a summary of matching cases.
 
     Args:
@@ -126,9 +132,10 @@ def query_cases(
 
 @tool
 def get_case_details(case_id: str) -> str:
-    """Get detailed information about a specific Salesforce case.
+    """Get full details of one Salesforce support case (by ID or case number).
 
-    Use when you need to inspect a specific case's full details.
+    Use for any single Salesforce case lookup. Pairs with query_cases. Not related
+    to the tenant/CRM support-grant tools.
 
     Args:
         case_id: The Salesforce Case ID (e.g. '500XXXXXXXXXXXX' or case number like '00001009').
