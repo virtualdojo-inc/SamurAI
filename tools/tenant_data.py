@@ -349,10 +349,12 @@ def create_tenant_data_tools(user_id: str) -> list:
         coroutine=_list_tenant_support_grants,
         name="list_tenant_support_grants",
         description=(
-            "List the customer tenants that have authorized a support grant to us (read-only, "
-            "safe). Runs as YOU (the signed-in VirtualDojo user); if you're not signed in it "
-            "returns an SSO sign-in link. Does NOT read any tenant's data — use the grant_id it "
-            "returns with describe_tenant_schema / read_tenant_records to do that."
+            "List the customer tenants that have authorized a support grant to us in the "
+            "VirtualDojo/Quotely CRM (read-only, safe). NOT for Salesforce cases — for any "
+            "Salesforce support-case request (list/search/show cases) use query_cases instead. "
+            "Runs as YOU (the signed-in VirtualDojo user); if you're not signed in it returns an "
+            "SSO sign-in link. Does NOT read any tenant's data — use the grant_id it returns "
+            "with describe_tenant_schema / read_tenant_records to do that."
         ),
         args_schema=_ListGrantsInput,
     )
