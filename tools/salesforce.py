@@ -290,24 +290,23 @@ def update_case_status(
                 return f"Error: Case not found: {case_id}"
             case_id = records[0]['Id']
 
-        # Update the case
-        update_data = {
-            'Id': case_id,
-            'Status': new_status,
-        }
+        # Build the update payload. The record Id goes in the URL (passed as the
+        # first positional arg below), NOT in the body.
+        update_data = {'Status': new_status}
 
         if close_case:
             update_data['Status'] = 'Closed'
             if closure_notes:
                 update_data['ClosureNotes'] = closure_notes
 
-        result = sf.Case.update(update_data)
+        # simple_salesforce: SFType.update(record_id, data) -> int HTTP status
+        # code (204 on success), NOT a dict. Passing only the dict raises
+        # "SFType.update() missing 1 required positional argument: 'data'".
+        status_code = sf.Case.update(case_id, update_data)
 
-        if result.get('success', True):
-            return f"Case {case_id} updated to status: {new_status}"
-        else:
-            errors = result.get('errors', ['Unknown error'])
-            return f"Error updating case: {', '.join(errors)}"
+        if 200 <= int(status_code) < 300:
+            return f"Case {case_id} updated to status: {update_data['Status']}"
+        return f"Error updating case {case_id}: Salesforce returned HTTP {status_code}"
 
     except Exception as e:
         logger.exception("[salesforce] update_case_status error")

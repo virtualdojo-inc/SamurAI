@@ -83,6 +83,40 @@ def test_refresh_token_missing_raises_clear_error(monkeypatch):
         sf._get_refresh_token()
 
 
+def test_update_case_status_passes_id_and_data_separately(monkeypatch):
+    """Regression: simple_salesforce's SFType.update needs (record_id, data).
+    Passing only the dict raised 'missing 1 required positional argument: data'
+    in prod when the user tried to close cases. Also: update returns an int HTTP
+    status code (not a dict), and the Id belongs in the URL, not the body."""
+    import tools.salesforce as sf_mod
+
+    captured = {}
+
+    class FakeCase:
+        def update(self, record_id, data):
+            captured["record_id"] = record_id
+            captured["data"] = data
+            return 204  # simple_salesforce returns the HTTP status code
+
+    class FakeSF:
+        Case = FakeCase()
+
+    monkeypatch.setattr(sf_mod, "_create_sf_connection", lambda: FakeSF())
+
+    out = update_case_status.invoke({
+        "case_id": "500XX0000000abc",  # starts with 500 -> skips CaseNumber lookup
+        "new_status": "Closed",
+        "close_case": True,
+        "closure_notes": "resolved",
+    })
+
+    assert captured["record_id"] == "500XX0000000abc"  # Id in the URL
+    assert "Id" not in captured["data"]                # not duplicated in the body
+    assert captured["data"]["Status"] == "Closed"
+    assert captured["data"]["ClosureNotes"] == "resolved"
+    assert "updated to status: Closed" in out          # int 204 handled as success
+
+
 def test_query_cases_description_owns_case_routing():
     """query_cases must clearly own 'Salesforce case' requests. Prod misrouted
     'list the quotely cases from salesforce' to list_tenant_support_grants (the
