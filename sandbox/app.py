@@ -49,10 +49,39 @@ NPROC_LIMIT = int(os.environ.get("SANDBOX_NPROC", "128"))
 OUTPUT_CAP = int(os.environ.get("SANDBOX_OUTPUT_CAP", str(256 * 1024)))  # bytes
 SCRIPT_CAP = int(os.environ.get("SANDBOX_SCRIPT_CAP", str(256 * 1024)))
 
+# Curated pure-Python deps vendored into the image (sandbox/vendor/). Copied into
+# each run's workdir so the stdlib-only child (`python -I -B -S`, no site-packages)
+# can import them via sys.path[0] == workdir. Keep this set MINIMAL and pure-Python
+# (no C-extensions, no network/filesystem deps): adding a file here widens what
+# untrusted scripts may import. Vendored today: simpleeval (safe expression eval —
+# lets repro tests exercise the product's formula/pricing logic, which runs on it).
+_VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+
+
+def _copy_vendored(workdir: str) -> None:
+    """Copy vendored ``*.py`` into a run's workdir so the isolated child can import
+    them (its ``sys.path[0]`` is the workdir). Best-effort — a missing/empty vendor
+    dir is fine (the child then just has the stdlib). Never raises into the caller."""
+    try:
+        names = os.listdir(_VENDOR_DIR)
+    except FileNotFoundError:
+        return
+    for name in names:
+        if name.endswith(".py"):
+            try:
+                shutil.copy(os.path.join(_VENDOR_DIR, name), os.path.join(workdir, name))
+            except OSError:
+                pass
+
+
 # Preamble prepended to every script. Loads `inputs`, blocks the network as a
 # seatbelt (egress is also denied at the infra layer), and exposes $SANDBOX_RESULT.
 _HARNESS = r'''
-import os as _os, json as _json, socket as _socket
+import os as _os, json as _json, socket as _socket, sys as _sys
+# `-I` implies `-P`, so the interpreter does NOT prepend prog.py's directory to
+# sys.path. Add it back explicitly so vendored pure-Python deps copied beside
+# prog.py (see _copy_vendored) are importable by the user script.
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 # Seatbelt: neuter the network. Egress is denied at the infra layer too; this
 # turns an attempted connection into an immediate, legible error.
 def _no_net(*_a, **_k):
@@ -146,6 +175,7 @@ def _run_blocking(script: str, inputs, timeout_s: int) -> dict:
         json.dump(inputs, f, default=str)
     with open(prog_path, "w") as f:
         f.write(_HARNESS + "\n" + script)
+    _copy_vendored(workdir)  # make curated pure-Python deps importable in the child
 
     # Minimal, scrubbed environment — no inherited secrets. -I = isolated mode
     # (ignore PYTHON* env + user site), -B = no .pyc writes, -S = no site.
