@@ -51,7 +51,10 @@ SCRIPT_CAP = int(os.environ.get("SANDBOX_SCRIPT_CAP", str(256 * 1024)))
 
 # Curated pure-Python deps vendored into the image (sandbox/vendor/). Copied into
 # each run's workdir so the stdlib-only child (`python -I -B -S`, no site-packages)
-# can import them via sys.path[0] == workdir. Keep this set MINIMAL and pure-Python
+# can import them. NOTE: `-I` implies `-P`, so the child does NOT auto-add the
+# script's dir to sys.path — the harness re-adds it explicitly (see _HARNESS);
+# copying here is necessary but not sufficient without that insert. Keep this set
+# MINIMAL and pure-Python
 # (no C-extensions, no network/filesystem deps): adding a file here widens what
 # untrusted scripts may import. Vendored today: simpleeval (safe expression eval —
 # lets repro tests exercise the product's formula/pricing logic, which runs on it).
@@ -60,8 +63,10 @@ _VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
 
 def _copy_vendored(workdir: str) -> None:
     """Copy vendored ``*.py`` into a run's workdir so the isolated child can import
-    them (its ``sys.path[0]`` is the workdir). Best-effort — a missing/empty vendor
-    dir is fine (the child then just has the stdlib). Never raises into the caller."""
+    them. The child finds them because the harness inserts prog.py's dir on
+    ``sys.path`` (``-I`` suppresses the automatic script-dir entry). Best-effort —
+    a missing/empty vendor dir is fine (the child then just has the stdlib). Never
+    raises into the caller."""
     try:
         names = os.listdir(_VENDOR_DIR)
     except FileNotFoundError:
