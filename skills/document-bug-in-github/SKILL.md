@@ -1,6 +1,6 @@
 ---
 name: document-bug-in-github
-description: Turn a VERIFIED bug reproduction into a properly documented GitHub issue on virtualdojo-inc/virtualdojo — grounded root cause, the sandbox reproduction as evidence, code-vs-data classification, and the repo's issue conventions. Draft-and-confirm: never file or edit an issue without explicit human (Devin/Cyrus) approval. Use after reproduce-bug-in-sandbox produces a verdict.
+description: Turn a VERIFIED bug reproduction into a properly documented GitHub issue on virtualdojo-inc/virtualdojo — grounded root cause, the sandbox reproduction as evidence, code-vs-data classification, and the repo's issue conventions. Draft-and-confirm — never file or edit an issue without explicit human (Devin/Cyrus) approval. Use after reproduce-bug-in-sandbox produces a verdict.
 ---
 
 # Document a reproduced bug in GitHub (draft-and-confirm)
