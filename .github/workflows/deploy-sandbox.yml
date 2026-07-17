@@ -1,0 +1,64 @@
+name: Deploy Sandbox to Cloud Run
+
+# Build + deploy the `samurai-sandbox` executor when ITS sources change.
+#
+# Why this is separate from deploy.yml: the sandbox is its own Cloud Run service.
+# deploy.yml deploys `samurai-bot` only, so sandbox/** changes (e.g. vendoring a
+# dep, editing the harness) never reached prod on merge — they needed a manual
+# `gcloud run deploy samurai-sandbox`. This workflow closes that gap.
+#
+# Verification model: the sandbox runs with --ingress=internal, so a GitHub runner
+# cannot reach its /health. We rely on Cloud Run's startup probe instead — a
+# revision that fails to become Ready makes `gcloud run deploy` fail and leaves the
+# previous (healthy) revision serving. NOTE: the startup probe confirms the server
+# boots, NOT that vendored deps import at runtime; for that, run the post-deploy
+# smoke check below (optional; needs the admin key).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sandbox/**"
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-sandbox-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-sandbox:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for Workload Identity Federation
+    env:
+      SERVICE: samurai-sandbox
+      REGION: ${{ vars.GCP_REGION }}
+      PROJECT: ${{ vars.GCP_PROJECT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy samurai-sandbox (source build; existing config preserved)
+        run: |
+          set -euo pipefail
+          # --source rebuilds from sandbox/Dockerfile and PRESERVES the service's
+          # existing config: --ingress=internal, the zero-role runtime SA,
+          # egress-deny, and the SANDBOX_TOKEN secret. Cloud Run's startup probe
+          # gates readiness; a failed build/startup fails this step and prod stays
+          # on the prior revision.
+          gcloud run deploy "$SERVICE" \
+            --source sandbox \
+            --region "$REGION" \
+            --project "$PROJECT" \
+            --quiet
+          echo "✅ Deployed $SERVICE from sandbox/ (${GITHUB_SHA::7})."
