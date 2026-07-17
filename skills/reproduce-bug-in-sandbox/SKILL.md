@@ -32,12 +32,21 @@ it, say "I couldn't verify X" — do not invent it.
 
 ## Step 1 — Locate the seam and the deployed revision
 - Find the suspect function with `search_repo_code` / `read_repo_file_range`.
-- **Pin the DEPLOYED SHA, not HEAD.** The bug lives in what prod is running. Get
-  the deployed revision/image for the affected service (e.g. `virtualdojo-backend`
-  in `virtualdojo-fedramp-prod`) and read the source **at that revision**. If you
-  read HEAD/main, you may be testing code that isn't in prod — call that out.
-- Record the file path, line range, and SHA. You will put them in the script
-  header and the run description.
+- **Pin the DEPLOYED SHA, not `main`.** The bug lives in what prod is *running*,
+  which is often behind `main`. Resolve the deployed SHA concretely — do not assume
+  `main` == prod:
+  1. Get the serving revision + container image for the affected service, e.g.
+     `list_cloud_run_services` (or `check_gcp_metrics`) on `virtualdojo-backend` in
+     `virtualdojo-fedramp-prod` → note the image tag/digest.
+  2. Map that image to its commit SHA (the image tag usually IS the SHA, or use
+     `github_list_recent_commits` / the deploy run to confirm which commit shipped).
+  3. Read the source **at that SHA** (`read_repo_file_range` with the ref), not
+     `branch: main`.
+- If you cannot resolve the deployed SHA, you may fall back to `main` **but must
+  label the repro "against main HEAD, not confirmed-deployed"** and list it as a
+  confound in Step 7 — a `main` read is a hypothesis about prod, not a fact.
+- Record the file path, line range, and the exact SHA. They go in the script header
+  and the run description.
 
 ## Step 2 — GO/NO-GO gate (do this before writing anything)
 The sandbox is stdlib-only. Inspect the seam's imports and dependencies:
@@ -58,6 +67,21 @@ needs one more pure-Python dep, propose vendoring it (add a file to
 `sandbox/vendor/`) rather than hand-porting the logic.
 
 ## Step 3 — Bring the source in VERBATIM (do not retype from memory)
+
+**Behavior-level vs code-level repro — this is the difference between a hint and a
+verdict.** Calling a *library* directly (e.g. `simple_eval("a + b", names={...})`)
+only proves the **library** behaves a certain way on some inputs. It does NOT prove
+a bug in *our* code, because it skips whatever the product does around that call —
+input coercion, try/except, defaults, validation. In fact the product often already
+**catches and logs** these (a `WARNING`, not a crash), so a library-level repro can
+scream "bug!" for something the code already handles.
+
+Therefore, to reach a **CODE** verdict you MUST inline the **actual product function**
+(e.g. `formula_runtime._safe_eval_formula`, not raw `simple_eval`) at the deployed
+SHA, with its real guards/coercion, and drive it exactly as prod does. A
+library-level repro is allowed only as a quick behavior check and can NEVER be
+reported as "code bug confirmed."
+
 - Copy the exact source from the `read_repo_file_range` output **byte-for-byte**
   into the script. Do **not** paraphrase, reformat, "clean up", or fix anything —
   **especially not the line that looks buggy.** Silently correcting the bug while
@@ -126,6 +150,12 @@ A sandbox result is **not** ground truth. Report:
   real log line), not an incidental error from your stubbing.
 - Never upgrade a sandbox repro to "root cause confirmed in prod" — it confirms the
   behavior of the inlined logic at that SHA over that input, nothing more.
+- **CODE vs DATA gate:** you may only report **"code bug"** if you inlined the *actual
+  product function* (Step 3) with its real guards and it still misbehaves. If you
+  only ran the library directly, or the product path catches/logs the condition,
+  report **"behavior reproduced at the library level; product handling not verified"**
+  and, when the underlying value is a `None`/missing field, lean **DATA issue** —
+  do not assert a code bug you did not exercise.
 
 ## When to escalate to CI (Path B)
 Any NO-GO from Step 2, or any repro that needed heavy stubbing, becomes a **scrubbed
