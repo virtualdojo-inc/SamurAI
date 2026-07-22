@@ -877,26 +877,41 @@ def _select_prompt_sections(message: str, hints_override: str | None = None) -> 
             return hit[1]
 
     msg_lower = message.lower()
+    # Section order is tuned for Gemini IMPLICIT prompt caching: the large,
+    # request-invariant content goes FIRST so it forms a byte-stable prefix the
+    # model can cache across turns and users (a cache read is ~75-90% cheaper than
+    # fresh input). Per-message and volatile content goes AFTER, so a miss on it
+    # never invalidates the shared prefix. Order:
+    #   core -> skills catalog -> knowledge index   (stable prefix, ~every request)
+    #   -> keyword-matched sections                 (per-message)
+    #   -> tracker index -> learned hints           (volatile / self-tuned)
+    #   -> retrieved memories                       (appended per-user in call_model)
     parts = [PROMPT_SECTIONS["core"]["content"]]
-    for name, section in PROMPT_SECTIONS.items():
-        if name == "core":
-            continue
-        if any(kw in msg_lower for kw in section["keywords"]):
-            parts.append(section["content"])
     # Skills catalog + knowledge index (level-1 disclosure): always advertise
     # available skills/articles so the agent can pull their full bodies via
-    # get_skill / read_knowledge / search_wiki when relevant.
+    # get_skill / read_knowledge / search_wiki when relevant. Present on every
+    # request and slow-changing, so they belong in the cacheable prefix.
     catalog = skills_catalog_text()
     if catalog:
         parts.append(catalog)
     index = knowledge_index_text()
     if index:
         parts.append(index)
+    # Per-message domain sections (loaded by keyword match) — placed after the
+    # stable prefix, since which ones apply varies with the user's message.
+    for name, section in PROMPT_SECTIONS.items():
+        if name == "core":
+            continue
+        if any(kw in msg_lower for kw in section["keywords"]):
+            parts.append(section["content"])
+    # Volatile: the tracker-diagnostics index updates as diagnoses are computed,
+    # so keep it out of the cacheable prefix.
     tracker_index = tracker_diagnostics_index_text()
     if tracker_index:
         parts.append(tracker_index)
     # Learned operational guidance — the single mutable, self-tuned prompt layer
-    # (selftune). Injected LAST so it refines, never overrides, the frozen core.
+    # (selftune). Still injected AFTER the core so it refines, never overrides, the
+    # frozen core; keeping it late also keeps it out of the cached prefix.
     # hints_override lets the self-tuning loop evaluate a candidate doc against
     # the exact production prompt; None = use the live doc.
     hints = wrap_hints(hints_override) if hints_override is not None else learned_hints_text()
@@ -1203,6 +1218,32 @@ async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 6)
             delay *= 2
 
 
+def _log_cache_stats(response) -> None:
+    """Log implicit-cache hit rate from a model response (content-free).
+
+    langchain-google-genai reports Gemini's cached-prefix reads in
+    ``usage_metadata.input_token_details['cache_read']``. Logging input vs
+    cache_read tokens lets us measure how much of each request hit the cached
+    prefix — the signal for whether the prompt-ordering above is paying off.
+    Best-effort: never let telemetry break a turn.
+    """
+    try:
+        um = getattr(response, "usage_metadata", None)
+        if not um:
+            return
+        inp = int(um.get("input_tokens", 0) or 0)
+        details = um.get("input_token_details") or {}
+        cache_read = int(details.get("cache_read", 0) or 0)
+        if inp:
+            logger.info(
+                "[cache] input_tokens=%d cache_read=%d (%.0f%% cached) output_tokens=%d",
+                inp, cache_read, 100.0 * cache_read / inp,
+                int(um.get("output_tokens", 0) or 0),
+            )
+    except Exception as e:  # telemetry must never crash the turn
+        logger.debug("[cache] stats unavailable: %s", e)
+
+
 async def _build_graph(user_id: str = "default"):
     """Build a LangGraph agent with user-specific CRM and memory tools."""
     llm_flash = ChatGoogleGenerativeAI(model=vertex_config.SERVE_MODEL, **_GCP_KWARGS)
@@ -1307,7 +1348,9 @@ async def _build_graph(user_id: str = "default"):
         # AIMessage surfaced by trimming) that would 400 the whole turn.
         messages = _drop_empty_messages(messages)
 
-        return {"messages": [await _ainvoke_with_backoff(llm_with_tools, messages)]}
+        response = await _ainvoke_with_backoff(llm_with_tools, messages)
+        _log_cache_stats(response)
+        return {"messages": [response]}
 
     def should_continue(state: MessagesState):
         """Route after the agent node.
