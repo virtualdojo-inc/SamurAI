@@ -94,20 +94,26 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
 
     # DH Tech Issue Tracker triage: pre-compute fact-grounded diagnoses for
     # new/changed rows so they're ready when a team member engages. Read-only
-    # (never acts). Frequent during business hours — NOTE cron is UTC-only, so
-    # the default targets ~8am-5pm US-Central (M-F). Gated by TRACKER_TRIAGE_ENABLED.
+    # (never acts). Runs twice per business day (10:00 and 17:00 Eastern) to keep
+    # AI spend down — down from the old every-10-min business-hours cadence. The
+    # trigger is timezone-aware (TRACKER_TRIAGE_TZ, default America/New_York) so it
+    # tracks EST/EDT automatically instead of drifting an hour across DST.
+    # Gated by TRACKER_TRIAGE_ENABLED.
     from tracker_triage import triage_enabled
 
     if triage_enabled():
         _scheduler.add_job(
             _run_tracker_triage,
             CronTrigger.from_crontab(
-                os.environ.get("TRACKER_TRIAGE_CRON", "*/10 13-23 * * 1-5")
+                os.environ.get("TRACKER_TRIAGE_CRON", "0 10,17 * * 1-5"),
+                timezone=os.environ.get("TRACKER_TRIAGE_TZ", "America/New_York"),
             ),
             id="tracker_triage",
             replace_existing=True,
         )
-        logger.info("Tracker triage scheduled (business hours UTC, read-only).")
+        logger.info(
+            "Tracker triage scheduled (twice daily 10:00/17:00 America/New_York, read-only)."
+        )
 
     _scheduler.start()
     logger.info("Scheduler started with %d active tasks", len(tasks))
