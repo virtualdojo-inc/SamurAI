@@ -23,8 +23,11 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 # Regional, in-boundary endpoint — do not change to "global" for KB data.
 KB_VERTEX_LOCATION = os.environ.get("KB_VERTEX_LOCATION", "us-central1")
-# gemini-2.5-flash-lite is confirmed available at us-central1 for this project.
-KB_COMPILE_MODEL = os.environ.get("KB_COMPILE_MODEL", "gemini-2.5-flash-lite")
+# Bumped to the gemini-3.5-flash-lite generation (released 2026-07-21).
+# ⚠️ Verify this id serves at us-central1 for this project before deploying;
+# if not, roll KB_COMPILE_MODEL back to gemini-2.5-flash-lite (last known-good
+# regional id). Must stay a regionally-available, in-boundary model — never global.
+KB_COMPILE_MODEL = os.environ.get("KB_COMPILE_MODEL", "gemini-3.5-flash-lite")
 
 _llm: ChatGoogleGenerativeAI | None = None
 

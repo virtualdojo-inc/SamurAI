@@ -197,7 +197,7 @@ def backfill(
     # on this project's Vertex config. Flash-lite is not reliably available at
     # location=global across all Vertex projects.
     llm = ChatGoogleGenerativeAI(
-        model=os.environ.get("BACKFILL_MODEL", "gemini-3.5-flash"),
+        model=os.environ.get("BACKFILL_MODEL", "gemini-3.6-flash"),
         vertexai=True,
         project=os.environ.get("GCP_PROJECT_ID"),
         location=os.environ.get("GCP_LOCATION", "global"),
