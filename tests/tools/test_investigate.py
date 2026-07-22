@@ -344,3 +344,136 @@ async def test_investigate_runs_in_parallel_from_asyncio_gather(mock_llm):
     assert len(results) == 2
     # Both calls returned concrete answers (no timeouts or errors).
     assert all(r.startswith("answer-") for r in results), results
+
+
+# --- Self-contained question guard ---
+
+
+def test_unresolved_referent_flags_dangling_reference():
+    """The exact prod flail case: 'these fields' with no concrete identifier."""
+    from tools.investigate import _unresolved_referent
+
+    ref = _unresolved_referent(
+        "Are there any Alembic migrations adding these fields? Cite file:line."
+    )
+    assert ref is not None
+    assert "these fields" in ref.lower()
+
+
+def test_unresolved_referent_allows_anchored_references():
+    from tools.investigate import _unresolved_referent
+
+    # A dangling phrase is fine when the question also names the referent.
+    assert _unresolved_referent(
+        "Does this file app/services/sales_order_service.py handle null "
+        "order managers?"
+    ) is None
+    assert _unresolved_referent(
+        "Are there migrations adding these fields: open_market, cta_member_id?"
+    ) is None
+    assert _unresolved_referent(
+        "Is that function `get_current_user` imported anywhere else?"
+    ) is None
+    assert _unresolved_referent(
+        "Are these changes related to issue #1067?"
+    ) is None
+
+
+def test_unresolved_referent_allows_plain_questions():
+    from tools.investigate import _unresolved_referent
+
+    assert _unresolved_referent("Find the auth dependency used by route X.") is None
+    assert _unresolved_referent(
+        "Trace where config value KB_PIPELINE_CRON is set and read."
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_investigate_rejects_unresolved_referent_without_running(mock_llm):
+    """A non-self-contained question must be rejected before any model call."""
+    from tools.investigate import investigate
+
+    result = await investigate.ainvoke(
+        {"question": "Are there any validators for those columns? Cite evidence."}
+    )
+    assert "rejected" in result
+    assert "those columns" in result
+    assert "restate" in result.lower()
+    mock_llm.ainvoke.assert_not_called()
+
+
+# --- Hard tool-call budget ---
+
+
+@pytest.mark.asyncio
+async def test_investigator_tool_budget_forces_final_answer(mock_llm):
+    """A sub-agent that keeps requesting tools must be cut off at
+    INVESTIGATOR_MAX_TOOL_CALLS and forced to answer from gathered evidence
+    (invoked without tools), instead of looping to the recursion limit."""
+    from tools.investigate import INVESTIGATOR_MAX_TOOL_CALLS, investigate
+
+    llm_calls = 0
+
+    async def always_wants_tools(messages):
+        nonlocal llm_calls
+        llm_calls += 1
+        # The budget branch appends a "TOOL BUDGET EXHAUSTED" message and
+        # invokes the tool-free model; answer plainly when we see it.
+        if any(
+            "TOOL BUDGET EXHAUSTED" in str(getattr(m, "content", ""))
+            for m in messages
+        ):
+            return AIMessage(content="Forced answer from partial evidence.")
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "sync_repo",
+                    "args": {
+                        "repo": "virtualdojo-inc/virtualdojo",
+                        "branch": "main",
+                    },
+                    "id": f"call-{llm_calls}",
+                }
+            ],
+        )
+
+    mock_llm.ainvoke = always_wants_tools
+
+    with (
+        patch("tools.repo_sync._get_remote_sha", return_value="abc"),
+        patch("tools.repo_sync._get_local_sha", return_value="abc"),
+        patch("tools.github._github_token", return_value="fake"),
+    ):
+        result = await investigate.ainvoke({"question": "loop forever please"})
+
+    assert result == "Forced answer from partial evidence."
+    # Exactly budget-many tool rounds + the final forced answer.
+    assert llm_calls == INVESTIGATOR_MAX_TOOL_CALLS + 1
+
+
+@pytest.mark.asyncio
+async def test_investigate_logs_tool_call_args(mock_llm, capsys):
+    """sub_tool_calls lines must include (truncated) args, not just names —
+    without them, failed searches are undiagnosable from Cloud Logging."""
+    first = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "search_repo_code",
+                "args": {"query": "open_market", "file_pattern": "alembic/*.py"},
+                "id": "call-args-1",
+            }
+        ],
+    )
+    final = AIMessage(content="done")
+    mock_llm.ainvoke = AsyncMock(side_effect=[first, final])
+
+    from tools.investigate import investigate
+
+    await investigate.ainvoke({"question": "search for open_market usages"})
+
+    out = capsys.readouterr().out
+    assert "[investigate] sub_tool_calls:" in out
+    assert "open_market" in out
+    assert "alembic/*.py" in out
