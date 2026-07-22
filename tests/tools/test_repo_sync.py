@@ -113,6 +113,89 @@ def test_sync_repo_handles_clone_failure(mock_remote, mock_local, mock_run):
     assert "Error cloning" in result
 
 
+# --- Repo map ---
+
+
+def _make_fake_repo(local_dir):
+    os.makedirs(os.path.join(local_dir, "app", "services"), exist_ok=True)
+    os.makedirs(os.path.join(local_dir, "node_modules", "junk"), exist_ok=True)
+    with open(os.path.join(local_dir, "main.py"), "w") as f:
+        f.write("# entry\n")
+    with open(os.path.join(local_dir, "app", "config.py"), "w") as f:
+        f.write("X = 1\n")
+    with open(os.path.join(local_dir, "app", "services", "svc.py"), "w") as f:
+        f.write("Y = 2\n")
+    with open(os.path.join(local_dir, "node_modules", "junk", "big.js"), "w") as f:
+        f.write("junk\n")
+
+
+def test_build_repo_map_two_levels_with_counts(tmp_path):
+    from tools.repo_sync import _build_repo_map
+
+    _make_fake_repo(str(tmp_path))
+    result = _build_repo_map(str(tmp_path))
+
+    assert "app/ (2 files)" in result
+    assert "app/services/ (1 files)" in result
+    assert "Top-level files: main.py" in result
+    # Noise dirs are skipped entirely
+    assert "node_modules" not in result
+
+
+def test_build_repo_map_missing_dir_returns_empty():
+    from tools.repo_sync import _build_repo_map
+
+    assert _build_repo_map("/tmp/definitely/not/a/dir") == ""
+
+
+def test_sync_repo_up_to_date_includes_repo_map():
+    """The most common sync result ('Already up to date') carries the repo map
+    so every investigator gets navigation hints without extra tool calls."""
+    import tools.repo_sync as rs
+
+    repo = "virtualdojo-inc/virtualdojo"
+    local_dir = rs._repo_dir(repo, "main")
+    _make_fake_repo(local_dir)
+    rs._repo_map_cache.clear()
+
+    try:
+        with (
+            patch("tools.github._github_token", return_value="fake-token"),
+            patch("tools.repo_sync._get_remote_sha", return_value="same-sha"),
+            patch("tools.repo_sync._get_local_sha", return_value="same-sha"),
+        ):
+            result = rs.sync_repo.invoke({"repo": repo, "branch": "main"})
+
+        assert "Already up to date" in result
+        assert "Repo map" in result
+        assert "app/ (2 files)" in result
+    finally:
+        shutil.rmtree(local_dir)
+        rs._repo_map_cache.clear()
+
+
+def test_repo_map_cached_by_sha():
+    import tools.repo_sync as rs
+
+    repo = "virtualdojo-inc/virtualdojo"
+    local_dir = rs._repo_dir(repo, "main")
+    _make_fake_repo(local_dir)
+    rs._repo_map_cache.clear()
+
+    try:
+        first = rs._repo_map_text(repo, "main", "sha-1")
+        assert "app/" in first
+        # Change the tree; same SHA must return the cached map (no rebuild)
+        with open(os.path.join(local_dir, "app", "new.py"), "w") as f:
+            f.write("Z = 3\n")
+        assert rs._repo_map_text(repo, "main", "sha-1") == first
+        # New SHA rebuilds
+        assert "app/ (3 files)" in rs._repo_map_text(repo, "main", "sha-2")
+    finally:
+        shutil.rmtree(local_dir)
+        rs._repo_map_cache.clear()
+
+
 # --- read_repo_file ---
 
 
@@ -793,6 +876,147 @@ def test_search_repo_code_rejects_invalid_output_mode():
         }
     )
     assert "invalid output_mode" in result
+
+
+def test_search_repo_code_file_pattern_with_directory_prefix(tmp_path):
+    """A file_pattern containing a path ('sub/dir/*.py') must scope the search
+    to that directory instead of silently matching nothing.
+
+    grep --include matches basenames only, so the old code turned any
+    path-qualified pattern into a guaranteed 'No matches found' — observed in
+    prod as false negatives for terms that existed in the repo.
+    """
+    from tools.repo_sync import search_repo_code, _repo_dir
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    sub = os.path.join(local_dir, "alembic", "versions")
+    os.makedirs(sub, exist_ok=True)
+
+    inside = os.path.join(sub, "migration_a.py")
+    outside = os.path.join(local_dir, "other.py")
+    with open(inside, "w") as f:
+        f.write("SCOPED_TOKEN = 1\n")
+    with open(outside, "w") as f:
+        f.write("SCOPED_TOKEN = 2\n")
+
+    try:
+        result = search_repo_code.invoke(
+            {
+                "query": "SCOPED_TOKEN",
+                "repo": repo,
+                "branch": branch,
+                "file_pattern": "alembic/versions/*.py",
+            }
+        )
+        assert "migration_a.py" in result
+        assert "other.py" not in result
+    finally:
+        shutil.rmtree(local_dir)
+
+
+def test_search_repo_code_file_pattern_with_missing_directory(tmp_path):
+    """A path prefix pointing at a nonexistent directory returns a corrective
+    error, not a misleading 'No matches found'."""
+    from tools.repo_sync import search_repo_code, _repo_dir
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    os.makedirs(local_dir, exist_ok=True)
+
+    try:
+        result = search_repo_code.invoke(
+            {
+                "query": "anything",
+                "repo": repo,
+                "branch": branch,
+                "file_pattern": "no/such/dir/*.py",
+            }
+        )
+        assert "directory 'no/such/dir' not found" in result
+        assert "list_repo_files" in result
+    finally:
+        shutil.rmtree(local_dir)
+
+
+def test_search_repo_code_file_pattern_rejects_parent_traversal(tmp_path):
+    from tools.repo_sync import search_repo_code, _repo_dir
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    os.makedirs(local_dir, exist_ok=True)
+
+    try:
+        result = search_repo_code.invoke(
+            {
+                "query": "x",
+                "repo": repo,
+                "branch": branch,
+                "file_pattern": "../../../etc/*.conf",
+            }
+        )
+        assert "must not contain '..'" in result
+    finally:
+        shutil.rmtree(local_dir)
+
+
+def test_search_repo_code_glob_directory_segment_falls_back_to_root(tmp_path):
+    """'app/**/*.py' — the '**' segment can't be used as a path scope; the
+    search must still run (scoped to 'app', recursing) and find matches."""
+    from tools.repo_sync import search_repo_code, _repo_dir
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    deep = os.path.join(local_dir, "app", "services")
+    os.makedirs(deep, exist_ok=True)
+
+    with open(os.path.join(deep, "deep.py"), "w") as f:
+        f.write("DEEP_TOKEN = 1\n")
+
+    try:
+        result = search_repo_code.invoke(
+            {
+                "query": "DEEP_TOKEN",
+                "repo": repo,
+                "branch": branch,
+                "file_pattern": "app/**/*.py",
+            }
+        )
+        assert "deep.py" in result
+    finally:
+        shutil.rmtree(local_dir)
+
+
+def test_search_repo_code_no_match_mentions_directory_scope(tmp_path):
+    """When the search was directory-scoped, the no-match message says so, so
+    the model doesn't conclude the term is absent from the whole repo."""
+    from tools.repo_sync import search_repo_code, _repo_dir
+
+    repo = "virtualdojo-inc/virtualdojo"
+    branch = "main"
+    local_dir = _repo_dir(repo, branch)
+    sub = os.path.join(local_dir, "docs")
+    os.makedirs(sub, exist_ok=True)
+    with open(os.path.join(sub, "a.md"), "w") as f:
+        f.write("nothing\n")
+
+    try:
+        result = search_repo_code.invoke(
+            {
+                "query": "ABSENT_TOKEN",
+                "repo": repo,
+                "branch": branch,
+                "file_pattern": "docs/*.md",
+            }
+        )
+        assert "No matches found" in result
+        assert "under 'docs/'" in result
+    finally:
+        shutil.rmtree(local_dir)
 
 
 def test_search_repo_code_no_matches(tmp_path):

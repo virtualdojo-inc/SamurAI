@@ -29,6 +29,92 @@ _sync_locks_guard = threading.Lock()
 # the caller just synced when the model omits the kwarg in a parallel batch.
 _last_synced_branch: dict[str, str] = {}
 
+# --- Repo map ---
+# A compact two-level directory overview appended to sync_repo results so the
+# model can navigate straight to the right directory instead of exploring with
+# list_repo_files / broad greps. Cached per (repo, branch) and keyed by SHA so
+# it's computed at most once per synced revision.
+_MAP_SKIP_DIRS = {
+    "node_modules", "__pycache__", "dist", "build", ".git", ".venv", "venv",
+    ".tox", "coverage", ".pytest_cache",
+}
+_MAP_MAX_LINES = 80
+_MAP_TOP_FILES = 20
+_repo_map_cache: dict[tuple[str, str], tuple[str, str]] = {}
+
+
+def _count_files(path: str, cap: int = 9999) -> int:
+    n = 0
+    for _root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in _MAP_SKIP_DIRS and not d.startswith(".")]
+        n += len(files)
+        if n >= cap:
+            return cap
+    return n
+
+
+def _build_repo_map(local_dir: str) -> str:
+    """Two-level directory tree with per-directory recursive file counts."""
+    dir_lines: list[str] = []
+    top_files: list[str] = []
+    try:
+        entries = sorted(os.listdir(local_dir))
+    except OSError:
+        return ""
+    for entry in entries:
+        if entry.startswith(".") or entry in _MAP_SKIP_DIRS:
+            continue
+        full = os.path.join(local_dir, entry)
+        if os.path.isfile(full):
+            top_files.append(entry)
+            continue
+        dir_lines.append(f"{entry}/ ({_count_files(full)} files)")
+        try:
+            subs = sorted(os.listdir(full))
+        except OSError:
+            continue
+        for sub in subs:
+            if sub.startswith(".") or sub in _MAP_SKIP_DIRS:
+                continue
+            sub_full = os.path.join(full, sub)
+            if os.path.isdir(sub_full):
+                dir_lines.append(f"  {entry}/{sub}/ ({_count_files(sub_full)} files)")
+    if len(dir_lines) > _MAP_MAX_LINES:
+        omitted = len(dir_lines) - _MAP_MAX_LINES
+        dir_lines = dir_lines[:_MAP_MAX_LINES] + [
+            f"... ({omitted} more directories — use list_repo_files)"
+        ]
+    if top_files:
+        shown = ", ".join(top_files[:_MAP_TOP_FILES])
+        more = f", +{len(top_files) - _MAP_TOP_FILES} more" if len(top_files) > _MAP_TOP_FILES else ""
+        dir_lines.append(f"Top-level files: {shown}{more}")
+    return "\n".join(dir_lines)
+
+
+def _repo_map_text(repo: str, branch: str, sha: str) -> str:
+    key = (repo, branch)
+    hit = _repo_map_cache.get(key)
+    if hit is not None and hit[0] == sha:
+        return hit[1]
+    text = _build_repo_map(_repo_dir(repo, branch))
+    _repo_map_cache[key] = (sha, text)
+    return text
+
+
+def _with_repo_map(result: str, repo: str, branch: str, sha: str) -> str:
+    """Append the repo map to a successful sync_repo result (best-effort)."""
+    try:
+        map_text = _repo_map_text(repo, branch, sha)
+    except Exception:  # the map is a hint, never fail a sync over it
+        map_text = ""
+    if not map_text:
+        return result
+    return (
+        f"{result}\n\n"
+        f"Repo map (directories, 2 levels, recursive file counts — go straight "
+        f"to the right one instead of exploring):\n{map_text}"
+    )
+
 
 def _get_sync_lock(repo: str, branch: str) -> threading.Lock:
     key = (repo, branch)
@@ -150,11 +236,12 @@ def sync_repo(
 
         if local_sha == remote_sha:
             _last_synced_branch[repo] = branch
-            return (
+            return _with_repo_map(
                 f"Already up to date.\n"
                 f"Repo: {repo} ({branch})\n"
                 f"SHA: {remote_sha[:8]}\n"
-                f"Local: {local_dir}"
+                f"Local: {local_dir}",
+                repo, branch, remote_sha,
             )
 
         # Clone or re-clone
@@ -184,11 +271,12 @@ def sync_repo(
 
             _last_synced_branch[repo] = branch
             logger.info("Synced %s/%s to %s (SHA: %s)", repo, branch, local_dir, remote_sha[:8])
-            return (
+            return _with_repo_map(
                 f"Synced successfully.\n"
                 f"Repo: {repo} ({branch})\n"
                 f"SHA: {remote_sha[:8]}\n"
-                f"Local: {local_dir}"
+                f"Local: {local_dir}",
+                repo, branch, remote_sha,
             )
 
         except subprocess.TimeoutExpired:
@@ -342,6 +430,9 @@ def search_repo_code(
         branch: Branch name. Defaults to the most-recently-synced branch for
             this repo, or 'main' if none has been synced this session.
         file_pattern: Optional glob to filter files (e.g. '*.py', '*.vue').
+            May include a directory prefix (e.g. 'alembic/versions/*.py') —
+            the path part scopes the search to that directory and the last
+            segment filters file names.
         context_lines: Lines of surrounding context per match (grep -C).
             Only applies when output_mode='content'. Default 2.
         output_mode: 'content' (default — matched lines + context),
@@ -371,6 +462,35 @@ def search_repo_code(
     if not os.path.exists(local_dir):
         return _not_synced_message(repo, branch)
 
+    # grep --include matches file NAMES only — a glob containing a path
+    # (e.g. 'alembic/versions/*.py') silently matches nothing and reads as
+    # "no matches" to the model. Split such patterns into a directory scope
+    # plus a basename glob.
+    search_root = local_dir
+    include_glob = file_pattern
+    if file_pattern and "/" in file_pattern:
+        dir_part, _, include_glob = file_pattern.rpartition("/")
+        scope_segments: list[str] = []
+        for seg in dir_part.split("/"):
+            if not seg or seg == ".":
+                continue
+            if seg == "..":
+                return "Error: file_pattern must not contain '..'."
+            if any(ch in seg for ch in "*?["):
+                # Glob directory segment (e.g. 'app/**/x') — stop narrowing
+                # here; grep -r recurses below search_root anyway.
+                break
+            scope_segments.append(seg)
+        if scope_segments:
+            candidate = os.path.join(local_dir, *scope_segments)
+            if not os.path.isdir(candidate):
+                return (
+                    f"Error: directory '{'/'.join(scope_segments)}' not found in "
+                    f"{repo} ({branch}). Check the path with list_repo_files, or "
+                    f"drop the directory prefix from file_pattern."
+                )
+            search_root = candidate
+
     if output_mode == "files_with_matches":
         cmd = ["grep", "-rl"]
     elif output_mode == "count":
@@ -380,9 +500,9 @@ def search_repo_code(
         if context_lines and context_lines > 0:
             cmd += ["-C", str(context_lines)]
 
-    if file_pattern:
-        cmd += ["--include", file_pattern]
-    cmd += [query, local_dir]
+    if include_glob:
+        cmd += ["--include", include_glob]
+    cmd += [query, search_root]
 
     try:
         result = subprocess.run(
@@ -393,7 +513,10 @@ def search_repo_code(
         )
 
         if result.returncode == 1:
-            return f"No matches found for '{query}' in {repo} ({branch})."
+            scope = ""
+            if search_root != local_dir:
+                scope = f" under '{os.path.relpath(search_root, local_dir)}/'"
+            return f"No matches found for '{query}' in {repo} ({branch}){scope}."
 
         if result.returncode != 0:
             return f"Search error: {result.stderr[:200]}"
