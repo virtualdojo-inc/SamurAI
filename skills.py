@@ -153,6 +153,12 @@ def _load_bucket_skills() -> list[dict]:
         parsed = _parse_skill_text(text, path_name)
         if parsed is not None:
             out.append(parsed)
+    # Precedence on a name clash: a hand-authored top-level skill
+    # (``support/skills/<name>.md``, written by save_skill) beats a synced
+    # catalog skill (``support/skills/synced/<name>.md``, written by
+    # kb/sync_skills). _load_catalog applies bucket skills last-wins, so we emit
+    # synced entries FIRST and top-level LAST — the local human override wins.
+    out.sort(key=lambda s: 0 if "/synced/" in str(s.get("dir", "")) else 1)
     return out
 
 

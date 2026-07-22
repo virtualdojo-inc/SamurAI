@@ -78,6 +78,20 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
         )
         logger.info("KB engineering pipeline scheduled (daily 9am, in-boundary Gemini).")
 
+    # Skills catalog sync: pull approved skills from virtualdojo-skills into the
+    # in-boundary bucket SamurAI serves (support/skills/synced/). Read-only inward,
+    # runs in-process (never a GitHub runner). Gated by SKILLS_SYNC_ENABLED.
+    from kb.sync_skills import sync_enabled as skills_sync_enabled
+
+    if skills_sync_enabled():
+        _scheduler.add_job(
+            _run_skill_sync,
+            CronTrigger.from_crontab(os.environ.get("SKILLS_SYNC_CRON", "*/30 * * * *")),
+            id="skills_sync",
+            replace_existing=True,
+        )
+        logger.info("Skills catalog sync scheduled (in-boundary, read-only pull).")
+
     # Prompt self-tuning loop: propose→evaluate→promote edits to the mutable
     # learned_hints.md, gated by an objective eval set. Adaptive cadence is
     # self-managed inside run_tuning_cycle. Gated by KB_TUNE_ENABLED.
@@ -155,6 +169,20 @@ async def _run_kb_engineering_pipeline() -> None:
     except Exception as e:  # never let a pipeline run crash the scheduler
         logger.error(
             "[kb.run] engineering pipeline failed: %s: %s",
+            type(e).__name__, e, exc_info=True,
+        )
+
+
+async def _run_skill_sync() -> None:
+    """Pull approved skills into the bucket, off the event loop (blocking GCS/GitHub I/O)."""
+    from kb.sync_skills import run_skill_sync
+
+    try:
+        async with _BG_PIPELINE_LOCK:
+            await asyncio.to_thread(run_skill_sync)
+    except Exception as e:  # never let a sync run crash the scheduler
+        logger.error(
+            "[skills.sync] catalog sync failed: %s: %s",
             type(e).__name__, e, exc_info=True,
         )
 

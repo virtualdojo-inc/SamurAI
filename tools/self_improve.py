@@ -31,6 +31,13 @@ def _run_engineering_pipeline_background() -> None:
     run_engineering_pipeline(force=True)
 
 
+def _run_skill_sync_background() -> None:
+    from kb.sync_skills import run_skill_sync
+
+    # force=True: a deliberate human trigger bypasses the SKILLS_SYNC_ENABLED switch.
+    run_skill_sync(force=True)
+
+
 @tool
 def trigger_engineering_compile(reason: str = "") -> str:
     """Manually run SamurAI's in-boundary ENGINEERING knowledge sync now.
@@ -84,4 +91,29 @@ def trigger_wiki_compile(reason: str = "") -> str:
         return f"Could not start the knowledge-base compile: {type(e).__name__}: {e}"
 
 
-SELF_IMPROVE_TOOLS = [trigger_wiki_compile, trigger_engineering_compile]
+@tool
+def trigger_skill_sync(reason: str = "") -> str:
+    """Manually sync approved skills from the virtualdojo-skills catalog now.
+
+    Pulls approved SKILL.md files from the private virtualdojo-inc/virtualdojo-skills
+    repo into SamurAI's in-boundary skills bucket (support/skills/synced/), so a
+    newly-approved skill becomes available without a redeploy. Read-only inward
+    (fetches already-sanitized files via the GitHub API); runs in-process inside the
+    FedRAMP boundary, never on a GitHub runner. Safe/read-only — no approval needed.
+
+    Args:
+        reason: Optional note on why it's being triggered (for the run log).
+    """
+    try:
+        t = threading.Thread(target=_run_skill_sync_background, daemon=True)
+        t.start()
+        return (
+            "Started the in-boundary skills catalog sync (pull approved skills from "
+            "virtualdojo-skills into support/skills/synced/) in the background. "
+            f"Reason: {reason or '(none)'}. New skills appear within the skills-cache TTL."
+        )
+    except Exception as e:
+        return f"Could not start the skills sync: {type(e).__name__}: {e}"
+
+
+SELF_IMPROVE_TOOLS = [trigger_wiki_compile, trigger_engineering_compile, trigger_skill_sync]
