@@ -266,6 +266,11 @@ def get_skill(name: str) -> str:
     catalog = load_skill_catalog()
     for s in catalog:
         if s["name"] == name:
+            try:  # names+counts-only usage telemetry; never break the tool
+                import skill_usage
+                skill_usage.record(name)
+            except Exception:
+                pass
             return s["body"]
     available = ", ".join(s["name"] for s in catalog) or "(none)"
     return f"No skill named '{name}'. Available skills: {available}"

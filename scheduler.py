@@ -92,6 +92,20 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
         )
         logger.info("Skills catalog sync scheduled (in-boundary, read-only pull).")
 
+    # Skills usage telemetry: batch the in-memory get_skill counter into one labeled
+    # skill-usage issue (the bot is contents:read, so it emits via the issue bridge).
+    # Gated by SKILLS_USAGE_ENABLED.
+    from skill_usage import usage_enabled as skills_usage_enabled
+
+    if skills_usage_enabled():
+        _scheduler.add_job(
+            _run_skill_usage_flush,
+            CronTrigger.from_crontab(os.environ.get("SKILLS_USAGE_CRON", "0 8 * * *")),
+            id="skills_usage_flush",
+            replace_existing=True,
+        )
+        logger.info("Skills usage telemetry flush scheduled (names+counts via issue bridge).")
+
     # Skills capture: distill reusable skills from SamurAI's own conversation log,
     # in-boundary on Vertex Gemini, sanitize, and file labeled skill-draft issues for
     # review. Gated by SKILLS_DISTILL_ENABLED.
@@ -211,6 +225,19 @@ async def _run_skill_distill() -> None:
     except Exception as e:  # never let a distill run crash the scheduler
         logger.error(
             "[skills.distill] capture run failed: %s: %s",
+            type(e).__name__, e, exc_info=True,
+        )
+
+
+async def _run_skill_usage_flush() -> None:
+    """Emit batched skill-usage telemetry off the event loop (blocking GitHub I/O)."""
+    from skill_usage import emit_usage
+
+    try:
+        await asyncio.to_thread(emit_usage)
+    except Exception as e:  # never let telemetry crash the scheduler
+        logger.error(
+            "[skills.usage] flush failed: %s: %s",
             type(e).__name__, e, exc_info=True,
         )
 
