@@ -1225,6 +1225,12 @@ def _log_cache_stats(response) -> None:
     ``usage_metadata.input_token_details['cache_read']``. Logging input vs
     cache_read tokens lets us measure how much of each request hit the cached
     prefix — the signal for whether the prompt-ordering above is paying off.
+
+    Emitted via print() like the rest of the [agent]/[investigate] telemetry:
+    the app never configures a logging handler, so logger.info records are
+    dropped (this line was invisible in Cloud Logging when it shipped as
+    logger.info), and logger.warning would land on stderr, which Cloud Logging
+    ingests at error severity and would pollute severity>=WARNING filters.
     Best-effort: never let telemetry break a turn.
     """
     try:
@@ -1235,13 +1241,14 @@ def _log_cache_stats(response) -> None:
         details = um.get("input_token_details") or {}
         cache_read = int(details.get("cache_read", 0) or 0)
         if inp:
-            logger.info(
-                "[cache] input_tokens=%d cache_read=%d (%.0f%% cached) output_tokens=%d",
-                inp, cache_read, 100.0 * cache_read / inp,
-                int(um.get("output_tokens", 0) or 0),
+            print(
+                f"[cache] input_tokens={inp} cache_read={cache_read} "
+                f"({100.0 * cache_read / inp:.0f}% cached) "
+                f"output_tokens={int(um.get('output_tokens', 0) or 0)}",
+                flush=True,
             )
-    except Exception as e:  # telemetry must never crash the turn
-        logger.debug("[cache] stats unavailable: %s", e)
+    except Exception:  # telemetry must never crash the turn
+        pass
 
 
 async def _build_graph(user_id: str = "default"):

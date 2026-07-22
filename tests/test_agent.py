@@ -803,3 +803,52 @@ async def test_spawn_background_runs_and_swallows_errors(mock_llm):
         await aio.sleep(0.01)
     assert ran == [{"a": 1}]
     assert not agent._background_tasks  # done tasks are discarded
+
+
+# --- Cache telemetry (_log_cache_stats) ---
+
+
+def test_log_cache_stats_prints_to_stdout(mock_llm, capsys):
+    """[cache] telemetry must go to stdout via print(), not logger.info.
+
+    The app never configures a logging handler, so logger.info records are
+    dropped — the line was invisible in Cloud Logging when it first shipped.
+    logger.warning is also wrong: stderr is ingested at error severity and
+    would pollute severity>=WARNING filters.
+    """
+    import agent
+
+    response = MagicMock()
+    response.usage_metadata = {
+        "input_tokens": 1000,
+        "output_tokens": 50,
+        "input_token_details": {"cache_read": 750},
+    }
+
+    agent._log_cache_stats(response)
+
+    out = capsys.readouterr().out
+    assert "[cache] input_tokens=1000 cache_read=750 (75% cached) output_tokens=50" in out
+
+
+def test_log_cache_stats_silent_without_usage_metadata(mock_llm, capsys):
+    import agent
+
+    response = MagicMock()
+    response.usage_metadata = None
+    agent._log_cache_stats(response)
+
+    no_input = MagicMock()
+    no_input.usage_metadata = {"input_tokens": 0, "output_tokens": 5}
+    agent._log_cache_stats(no_input)
+
+    assert "[cache]" not in capsys.readouterr().out
+
+
+def test_log_cache_stats_never_raises(mock_llm):
+    """Telemetry must never break a turn, even on malformed metadata."""
+    import agent
+
+    bad = MagicMock()
+    bad.usage_metadata = {"input_tokens": "garbage", "input_token_details": []}
+    agent._log_cache_stats(bad)  # must not raise
