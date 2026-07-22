@@ -45,6 +45,13 @@ def _run_skill_distill_background() -> None:
     run_skill_distill(force=True)
 
 
+def _run_skill_eval_background() -> None:
+    from kb.evaluate_skills import run_skill_evaluation
+
+    # force=True: a deliberate human trigger bypasses the SKILLS_EVAL_ENABLED switch.
+    run_skill_evaluation(force=True)
+
+
 @tool
 def trigger_engineering_compile(reason: str = "") -> str:
     """Manually run SamurAI's in-boundary ENGINEERING knowledge sync now.
@@ -149,9 +156,35 @@ def trigger_skill_distill(reason: str = "") -> str:
         return f"Could not start skill capture: {type(e).__name__}: {e}"
 
 
+@tool
+def trigger_skill_eval(reason: str = "") -> str:
+    """Manually run the skill-catalog evaluation now.
+
+    Joins the approved catalog with usage counts (telemetry/leaderboard.md) and files a
+    `skill-eval` report issue in virtualdojo-skills flagging dead (never-triggered),
+    valuable (high-usage), and likely-duplicate skills — as PROPOSALS for a maintainer.
+    In-boundary, read-only against GitHub; never retires/merges anything itself.
+    Safe/read-only — no approval needed.
+
+    Args:
+        reason: Optional note on why it's being triggered (for the run log).
+    """
+    try:
+        t = threading.Thread(target=_run_skill_eval_background, daemon=True)
+        t.start()
+        return (
+            "Started the skill-catalog evaluation in the background. Reason: "
+            f"{reason or '(none)'}. A skill-eval report issue will appear in "
+            "virtualdojo-skills with dead/valuable/duplicate recommendations."
+        )
+    except Exception as e:
+        return f"Could not start skill evaluation: {type(e).__name__}: {e}"
+
+
 SELF_IMPROVE_TOOLS = [
     trigger_wiki_compile,
     trigger_engineering_compile,
     trigger_skill_sync,
     trigger_skill_distill,
+    trigger_skill_eval,
 ]

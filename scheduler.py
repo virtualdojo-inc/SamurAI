@@ -120,6 +120,20 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
         )
         logger.info("Skills capture/distill scheduled (in-boundary Gemini, review-gated).")
 
+    # Skills catalog evaluation: weekly, join catalog + leaderboard → flag dead/
+    # valuable/duplicate skills and file a skill-eval report issue. In-boundary,
+    # read-only against GitHub. Gated by SKILLS_EVAL_ENABLED.
+    from kb.evaluate_skills import eval_enabled as skills_eval_enabled
+
+    if skills_eval_enabled():
+        _scheduler.add_job(
+            _run_skill_evaluation,
+            CronTrigger.from_crontab(os.environ.get("SKILLS_EVAL_CRON", "0 9 * * 1")),
+            id="skills_eval",
+            replace_existing=True,
+        )
+        logger.info("Skills catalog evaluation scheduled (weekly, in-boundary read-only).")
+
     # Prompt self-tuning loop: propose→evaluate→promote edits to the mutable
     # learned_hints.md, gated by an objective eval set. Adaptive cadence is
     # self-managed inside run_tuning_cycle. Gated by KB_TUNE_ENABLED.
@@ -238,6 +252,19 @@ async def _run_skill_usage_flush() -> None:
     except Exception as e:  # never let telemetry crash the scheduler
         logger.error(
             "[skills.usage] flush failed: %s: %s",
+            type(e).__name__, e, exc_info=True,
+        )
+
+
+async def _run_skill_evaluation() -> None:
+    """Evaluate the skill catalog off the event loop (blocking GitHub I/O)."""
+    from kb.evaluate_skills import run_skill_evaluation
+
+    try:
+        await asyncio.to_thread(run_skill_evaluation)
+    except Exception as e:  # never let evaluation crash the scheduler
+        logger.error(
+            "[skills.eval] evaluation failed: %s: %s",
             type(e).__name__, e, exc_info=True,
         )
 
