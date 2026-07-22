@@ -38,6 +38,13 @@ def _run_skill_sync_background() -> None:
     run_skill_sync(force=True)
 
 
+def _run_skill_distill_background() -> None:
+    from kb.distill_skills import run_skill_distill
+
+    # force=True: a deliberate human trigger bypasses the SKILLS_DISTILL_ENABLED switch.
+    run_skill_distill(force=True)
+
+
 @tool
 def trigger_engineering_compile(reason: str = "") -> str:
     """Manually run SamurAI's in-boundary ENGINEERING knowledge sync now.
@@ -116,4 +123,35 @@ def trigger_skill_sync(reason: str = "") -> str:
         return f"Could not start the skills sync: {type(e).__name__}: {e}"
 
 
-SELF_IMPROVE_TOOLS = [trigger_wiki_compile, trigger_engineering_compile, trigger_skill_sync]
+@tool
+def trigger_skill_distill(reason: str = "") -> str:
+    """Manually run SamurAI's in-boundary skill capture now.
+
+    Distills reusable skills from SamurAI's recent conversation log (in-boundary on
+    Vertex Gemini), runs the sanitization gate (deterministic PII/secret/tenant-denylist
+    + an in-boundary LLM check), and files labeled `skill-draft` issues in
+    virtualdojo-skills for human review (a workflow there turns each into a draft PR).
+    Runs entirely inside the FedRAMP boundary; no external LLM, no GitHub runner. It files
+    review drafts (issues) — only trigger with Devin or Cyrus's explicit approval.
+
+    Args:
+        reason: Optional note on why it's being triggered (for the run log).
+    """
+    try:
+        t = threading.Thread(target=_run_skill_distill_background, daemon=True)
+        t.start()
+        return (
+            "Started the in-boundary skill capture (distill recent conversations on "
+            "Vertex Gemini → sanitize → file skill-draft issues) in the background. "
+            f"Reason: {reason or '(none)'}. Drafts appear as issues/PRs in virtualdojo-skills."
+        )
+    except Exception as e:
+        return f"Could not start skill capture: {type(e).__name__}: {e}"
+
+
+SELF_IMPROVE_TOOLS = [
+    trigger_wiki_compile,
+    trigger_engineering_compile,
+    trigger_skill_sync,
+    trigger_skill_distill,
+]

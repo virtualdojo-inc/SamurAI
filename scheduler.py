@@ -92,6 +92,20 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
         )
         logger.info("Skills catalog sync scheduled (in-boundary, read-only pull).")
 
+    # Skills capture: distill reusable skills from SamurAI's own conversation log,
+    # in-boundary on Vertex Gemini, sanitize, and file labeled skill-draft issues for
+    # review. Gated by SKILLS_DISTILL_ENABLED.
+    from kb.distill_skills import distill_enabled as skills_distill_enabled
+
+    if skills_distill_enabled():
+        _scheduler.add_job(
+            _run_skill_distill,
+            CronTrigger.from_crontab(os.environ.get("SKILLS_DISTILL_CRON", "30 8 * * *")),
+            id="skills_distill",
+            replace_existing=True,
+        )
+        logger.info("Skills capture/distill scheduled (in-boundary Gemini, review-gated).")
+
     # Prompt self-tuning loop: propose→evaluate→promote edits to the mutable
     # learned_hints.md, gated by an objective eval set. Adaptive cadence is
     # self-managed inside run_tuning_cycle. Gated by KB_TUNE_ENABLED.
@@ -183,6 +197,20 @@ async def _run_skill_sync() -> None:
     except Exception as e:  # never let a sync run crash the scheduler
         logger.error(
             "[skills.sync] catalog sync failed: %s: %s",
+            type(e).__name__, e, exc_info=True,
+        )
+
+
+async def _run_skill_distill() -> None:
+    """Distill skills from the conversation log off the event loop (blocking Gemini/GCS I/O)."""
+    from kb.distill_skills import run_skill_distill
+
+    try:
+        async with _BG_PIPELINE_LOCK:
+            await asyncio.to_thread(run_skill_distill)
+    except Exception as e:  # never let a distill run crash the scheduler
+        logger.error(
+            "[skills.distill] capture run failed: %s: %s",
             type(e).__name__, e, exc_info=True,
         )
 
