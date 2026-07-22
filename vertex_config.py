@@ -6,22 +6,31 @@ The chat / serving path historically ran on the Vertex ``global`` endpoint becau
 endpoint** ``aiplatform.us.rep.googleapis.com`` (``locations/us``), which keeps
 inference in-US (FedRAMP data-residency; VPC-SC compatible).
 
-Verified live 2026-07-12 against ``virtualdojo-samurai``: the REP ``locations/us``
-endpoint serves exactly two models for this project —
+Verified live 2026-07-22 against ``virtualdojo-samurai`` (generateContent probes
+on the REP endpoint): the REP ``locations/us`` endpoint serves for this project —
   - ``gemini-3.5-flash``        -> the SERVE tier (agent, verifier, judge stage-2, …)
-  - ``gemini-3.1-flash-lite``   -> the LITE tier (synth, judge stage-1)
-It does NOT serve the 2.5 line, so the lite tier's model id changes from
-``gemini-2.5-flash-lite`` -> ``gemini-3.1-flash-lite`` when on REP. It also serves
-no embedding/image model — see the NOTE below.
+  - ``gemini-3.5-flash-lite``   -> the LITE tier (synth, judge stage-1);
+                                   newly served on REP (it was NOT on 2026-07-12)
+  - ``gemini-3.1-flash-lite``   -> previous LITE tier, still served (rollback target)
+  - ``gemini-3.6-flash``        -> 404 — released 2026-07-21, NOT yet on REP.
+                                   Re-probe before bumping the SERVE tier to it
+                                   (see PR #42); do NOT serve it via ``global``
+                                   for customer data — that breaks data-residency.
+The REP endpoint does NOT serve the 2.5 line and serves no embedding/image model —
+see the NOTE below.
 
-Everything here is env-overridable so a rollback to ``global`` is a config change,
-not a code change / redeploy:
+Everything here is env-overridable so a rollback is a config change, not a code
+change / redeploy:
   ``SAMURAI_VERTEX_LOCATION``  default ``us``       (set ``global`` to roll back)
   ``SAMURAI_VERTEX_ENDPOINT``  default the REP url  (set ``""`` for the default frontend)
   ``SAMURAI_SERVE_MODEL``      default ``gemini-3.5-flash``
-  ``SAMURAI_LITE_MODEL``       default ``gemini-3.1-flash-lite``
+  ``SAMURAI_LITE_MODEL``       default ``gemini-3.5-flash-lite``
 
-To roll the serving path back to global in one step:
+To roll the LITE tier back to the previous REP-verified model (stay in-boundary):
+  SAMURAI_LITE_MODEL=gemini-3.1-flash-lite
+
+To roll the whole serving path back to global in one step (last resort — NOT
+data-resident):
   SAMURAI_VERTEX_LOCATION=global  SAMURAI_VERTEX_ENDPOINT=  SAMURAI_LITE_MODEL=gemini-2.5-flash-lite
 
 NOTE — deliberately NOT covered here: embeddings + the KB/memory pipeline. They
@@ -40,7 +49,7 @@ VERTEX_ENDPOINT = os.environ.get(
 
 # Model ids for the two serving tiers. Must exist at the configured endpoint.
 SERVE_MODEL = os.environ.get("SAMURAI_SERVE_MODEL", "gemini-3.5-flash")
-LITE_MODEL = os.environ.get("SAMURAI_LITE_MODEL", "gemini-3.1-flash-lite")
+LITE_MODEL = os.environ.get("SAMURAI_LITE_MODEL", "gemini-3.5-flash-lite")
 
 
 def vertex_kwargs(**extra) -> dict:
