@@ -94,7 +94,7 @@ switch) and the `ANTHROPIC_API_KEY` secret. See "Skills and self-improvement".
 ## Tech stack
 
 - **Runtime**: Python 3.12, aiohttp, Microsoft Bot Framework SDK
-- **AI**: LangGraph agent with Google Gemini (`gemini-3.5-flash`), LangChain tools
+- **AI**: LangGraph agent with Google Gemini (`gemini-3.6-flash`), LangChain tools
 - **Scheduling**: APScheduler (AsyncIOScheduler) for background tasks
 - **Persistence**: SQLite on GCS FUSE mount (`/data`) for tasks, conversation refs, team roster
 - **Memory**: LangMem three-tier memory (core/team/user) with background extraction
@@ -311,10 +311,13 @@ in GitHub Actions. (The bucket's own `README.md` carries the authoritative rules
   via the playbook's issue refs + the GitHub tools); facts about the product
   should come from docs/code, not the issue log.
 - **In-boundary engine** (`kb/gemini.py`): regional **us-central1** Vertex Gemini
-  (`KB_COMPILE_MODEL`, default `gemini-2.5-flash-lite`); refuses the `global`
+  (`KB_COMPILE_MODEL`, default `gemini-3.5-flash-lite`); refuses the `global`
   endpoint for KB data; there is deliberately no Anthropic client. (Vertex model
-  availability for this project: `gemini-3.5-flash` global-only, `gemini-2.5-flash`
-  + `-lite` at us-central1, `gemini-2.0-flash-lite` decommissioned.)
+  availability for this project: the 3.6 flash generation — `gemini-3.6-flash` /
+  `gemini-3.5-flash-lite`, released 2026-07-21 — is the new default but its
+  regional/REP `us-central1` + `locations/us` availability is UNVERIFIED; the last
+  confirmed-good pair was `gemini-3.5-flash` (global) + `gemini-2.5-flash`/`-lite`
+  at us-central1; `gemini-2.0-flash-lite` decommissioned. Verify before deploy.)
 
 ### Runs reliably in-process on the serving instance
 A Cloud Run deploy/drain will cancel in-flight background work, so the compile is

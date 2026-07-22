@@ -436,7 +436,7 @@ async def test_background_extractor_uses_vertex_chat_client():
     chat_cls.assert_called_once()
     kwargs = chat_cls.call_args.kwargs
     assert kwargs.get("vertexai") is True
-    assert kwargs.get("model") == "gemini-2.5-flash-lite"
+    assert kwargs.get("model") == "gemini-3.5-flash-lite"
     assert kwargs.get("project") == "vd-test"
     assert kwargs.get("location") == "us-east1"
 

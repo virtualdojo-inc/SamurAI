@@ -1030,7 +1030,7 @@ async def _retrieve_memories_cached(user_id: str, last_human) -> str:
     return result
 
 
-# gemini-3.5-flash has a 1,048,576-token context window. Long, tool-heavy
+# gemini-3.6-flash has a 1,048,576-token context window. Long, tool-heavy
 # conversations (history + tool traces + memory injections + checkpoint state)
 # can blow past it, hard-crashing the turn with GoogleContextOverflowError.
 # Trim oldest history down to this budget before each call.

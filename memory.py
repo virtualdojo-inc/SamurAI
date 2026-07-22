@@ -79,7 +79,7 @@ def _create_extractor_llm():
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite",
+        model="gemini-3.5-flash-lite",
         vertexai=True,
         project=os.environ.get("GCP_PROJECT_ID"),
         location=os.environ.get("GCP_LOCATION", "us-central1"),

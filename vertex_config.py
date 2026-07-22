@@ -1,28 +1,39 @@
 """Central Vertex AI endpoint + model configuration (single source of truth).
 
 The chat / serving path historically ran on the Vertex ``global`` endpoint because
-``gemini-3.5-flash`` is only served there for some projects. This project
+the flash line was only served there for some projects. This project
 (``virtualdojo-samurai``) can instead serve from the **US data-residency REP
 endpoint** ``aiplatform.us.rep.googleapis.com`` (``locations/us``), which keeps
 inference in-US (FedRAMP data-residency; VPC-SC compatible).
 
-Verified live 2026-07-12 against ``virtualdojo-samurai``: the REP ``locations/us``
-endpoint serves exactly two models for this project —
-  - ``gemini-3.5-flash``        -> the SERVE tier (agent, verifier, judge stage-2, …)
-  - ``gemini-3.1-flash-lite``   -> the LITE tier (synth, judge stage-1)
-It does NOT serve the 2.5 line, so the lite tier's model id changes from
-``gemini-2.5-flash-lite`` -> ``gemini-3.1-flash-lite`` when on REP. It also serves
-no embedding/image model — see the NOTE below.
+The serving tiers were bumped to the Gemini 3.6 flash generation (released
+2026-07-21):
+  - ``gemini-3.6-flash``        -> the SERVE tier (agent, verifier, judge stage-2, …)
+  - ``gemini-3.5-flash-lite``   -> the LITE tier (synth, judge stage-1)
 
-Everything here is env-overridable so a rollback to ``global`` is a config change,
-not a code change / redeploy:
+⚠️ REP ``locations/us`` availability of these two ids is NOT yet verified for this
+project. As of the last live check (2026-07-12) the REP endpoint served exactly
+``gemini-3.5-flash`` (SERVE) + ``gemini-3.1-flash-lite`` (LITE); the 3.6 flash
+generation is one day old and new models typically reach REP/regional residency
+endpoints after ``global``. BEFORE deploying, confirm both ids serve on
+``aiplatform.us.rep.googleapis.com`` (``locations/us``) for ``virtualdojo-samurai``
+— e.g. ``curl`` a ``:generateContent`` probe or check the project's model garden.
+If they do not serve yet, roll the defaults back to the last known-good pair
+(see below); do NOT fall back to ``global`` for customer data — that breaks
+data-residency.
+
+Everything here is env-overridable so a rollback is a config change, not a code
+change / redeploy:
   ``SAMURAI_VERTEX_LOCATION``  default ``us``       (set ``global`` to roll back)
   ``SAMURAI_VERTEX_ENDPOINT``  default the REP url  (set ``""`` for the default frontend)
-  ``SAMURAI_SERVE_MODEL``      default ``gemini-3.5-flash``
-  ``SAMURAI_LITE_MODEL``       default ``gemini-3.1-flash-lite``
+  ``SAMURAI_SERVE_MODEL``      default ``gemini-3.6-flash``
+  ``SAMURAI_LITE_MODEL``       default ``gemini-3.5-flash-lite``
 
-To roll the serving path back to global in one step:
-  SAMURAI_VERTEX_LOCATION=global  SAMURAI_VERTEX_ENDPOINT=  SAMURAI_LITE_MODEL=gemini-2.5-flash-lite
+To roll the SERVING TIERS back to the last REP-verified pair (stay in-boundary):
+  SAMURAI_SERVE_MODEL=gemini-3.5-flash  SAMURAI_LITE_MODEL=gemini-3.1-flash-lite
+
+To roll the whole serving path back to global (last resort — NOT data-resident):
+  SAMURAI_VERTEX_LOCATION=global  SAMURAI_VERTEX_ENDPOINT=  SAMURAI_SERVE_MODEL=gemini-3.5-flash  SAMURAI_LITE_MODEL=gemini-2.5-flash-lite
 
 NOTE — deliberately NOT covered here: embeddings + the KB/memory pipeline. They
 already run at ``us-central1`` (in-US) on their own env vars (``GCP_LOCATION`` /
@@ -39,8 +50,10 @@ VERTEX_ENDPOINT = os.environ.get(
 ).strip()
 
 # Model ids for the two serving tiers. Must exist at the configured endpoint.
-SERVE_MODEL = os.environ.get("SAMURAI_SERVE_MODEL", "gemini-3.5-flash")
-LITE_MODEL = os.environ.get("SAMURAI_LITE_MODEL", "gemini-3.1-flash-lite")
+# ⚠️ REP locations/us availability of the 3.6 flash generation is unverified —
+# see the module docstring before deploying.
+SERVE_MODEL = os.environ.get("SAMURAI_SERVE_MODEL", "gemini-3.6-flash")
+LITE_MODEL = os.environ.get("SAMURAI_LITE_MODEL", "gemini-3.5-flash-lite")
 
 
 def vertex_kwargs(**extra) -> dict:

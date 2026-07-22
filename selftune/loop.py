@@ -33,7 +33,7 @@ STATE_PATH = Path(DATA_DIR) / "selftune" / "tune_state.json"
 MIN_CASES = int(os.environ.get("KB_TUNE_MIN_CASES", "15"))
 CONVERGED_STREAK = int(os.environ.get("KB_TUNE_CONVERGED_STREAK", "5"))
 MAX_EVAL_CASES = int(os.environ.get("KB_TUNE_MAX_CASES", "60"))
-EVAL_MODEL = os.environ.get("KB_TUNE_EVAL_MODEL", "gemini-3.5-flash")  # choice A: production
+EVAL_MODEL = os.environ.get("KB_TUNE_EVAL_MODEL", "gemini-3.6-flash")  # choice A: production
 K_CANDIDATES = int(os.environ.get("KB_TUNE_CANDIDATES", "3"))  # propose N, gate the best
 
 # Diversity steers so K candidates explore different edits (EvoPrompt-style, no
