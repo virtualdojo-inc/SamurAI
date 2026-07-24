@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import time
+from typing import NamedTuple
 
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode
@@ -1213,13 +1214,38 @@ def _compaction_enabled() -> bool:
     return os.environ.get("SAMURAI_COMPACT_MODE", "on").lower() != "off"
 
 
-def _compaction_settings() -> tuple[int, int, int]:
-    """(trigger_tokens, keep_tokens, trigger_msgs) — env-overridable at call time
-    so tests and ops can tune thresholds without a redeploy."""
-    trigger_tokens = int(os.environ.get("SAMURAI_COMPACT_TRIGGER_TOKENS", "120000"))
-    keep_tokens = int(os.environ.get("SAMURAI_COMPACT_KEEP_TOKENS", "48000"))
-    trigger_msgs = int(os.environ.get("SAMURAI_COMPACT_TRIGGER_MSGS", "80"))
-    return trigger_tokens, keep_tokens, trigger_msgs
+class CompactionSettings(NamedTuple):
+    trigger_tokens: int
+    keep_tokens: int
+    trigger_msgs: int
+    summary_max_chars: int
+
+
+def _compaction_settings() -> CompactionSettings:
+    """Compaction thresholds — read from env at call time so ops can tune them
+    without a redeploy.
+
+    Defaults are deliberately set so the compacted checkpoint stays BELOW
+    ``_MAX_INPUT_TOKENS`` (300k): the stored window oscillates between
+    ``keep_tokens`` (150k) and ``trigger_tokens`` (200k), so ``trim_messages``
+    in call_model never has to silently truncate a compacted thread — the model
+    sees the whole stored history plus the summary. That is the property that
+    makes compaction accuracy-neutral: it replaces SILENT lossy truncation at
+    300k (the pre-compaction behavior on runaway threads) with a summarized,
+    fully-visible window.
+
+    ``trigger_msgs`` only forces the cut to be EVALUATED on row-heavy threads;
+    the cut itself is governed by ``keep_tokens``, so a thread with many small
+    messages evaluates to a no-op (cheap — no model call).
+    """
+    return CompactionSettings(
+        trigger_tokens=int(os.environ.get("SAMURAI_COMPACT_TRIGGER_TOKENS", "200000")),
+        keep_tokens=int(os.environ.get("SAMURAI_COMPACT_KEEP_TOKENS", "150000")),
+        trigger_msgs=int(os.environ.get("SAMURAI_COMPACT_TRIGGER_MSGS", "400")),
+        summary_max_chars=int(
+            os.environ.get("SAMURAI_COMPACT_SUMMARY_MAX_CHARS", "6000")
+        ),
+    )
 
 
 def _choose_compaction_cut(
@@ -1287,8 +1313,99 @@ SUMMARY_SYSTEM_PROMPT = (
     "- Drop pleasantries, resolved dead-ends, and verbatim tool output.\n"
     "- Be concise — a few short bullet groups, not a transcript. Do not exceed "
     "what's needed to continue the conversation coherently.\n"
+    "- HARD LIMIT: stay under {max_chars} characters. The summary is re-injected "
+    "into every later turn and is re-summarized as the thread grows, so length "
+    "you add here is paid forever. When you are at the limit, DROP the oldest "
+    "and least actionable material rather than compressing everything into "
+    "vagueness — specifics that survive are worth more than complete coverage.\n"
     "- Output the summary text only, no preamble."
 )
+
+
+def _cap_summary(text: str, max_chars: int) -> str:
+    """Hard-bound the rolling summary.
+
+    The prompt asks the model to stay under budget, but a prompt is a request,
+    not a guarantee — and this text is both re-injected into EVERY later turn
+    and fed back into the next compaction as `prev_summary`. Without an
+    enforced cap a thread that compacts repeatedly can ratchet the summary
+    (and therefore every subsequent prompt) upward without bound. Truncate at a
+    paragraph or sentence boundary so the stored summary never ends mid-word.
+    """
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    head = text[:max_chars]
+    for sep, keep_sep in (("\n", 0), (". ", 1)):
+        idx = head.rfind(sep)
+        # Only accept a boundary in the back half, so we never discard most of
+        # the summary chasing a tidy cut point.
+        if idx >= max_chars // 2:
+            head = head[: idx + keep_sep]
+            break
+    return head.rstrip() + "\n[summary truncated to stay within the compaction budget]"
+
+
+async def _compact_state(state, llm) -> dict:
+    """Core of the `compact` graph node, module-level so it is unit-testable
+    (the node itself is a closure over the graph's models).
+
+    Returns a state update that removes the compacted-out messages and stores
+    the refreshed rolling summary, or ``{}`` for "nothing to do". Never raises:
+    the reply has already been produced by the time this runs, so a
+    summarization failure must degrade to "keep the full history this turn"
+    rather than break the turn.
+    """
+    if not _compaction_enabled():
+        return {}
+    messages = state["messages"]
+    cfg = _compaction_settings()
+    cut = _choose_compaction_cut(
+        messages,
+        trigger_tokens=cfg.trigger_tokens,
+        keep_tokens=cfg.keep_tokens,
+        trigger_msgs=cfg.trigger_msgs,
+    )
+    if cut <= 0:
+        return {}
+    to_drop = messages[:cut]
+    drop_ids = [m.id for m in to_drop if getattr(m, "id", None)]
+    if not drop_ids:
+        return {}
+
+    prev_summary = (state.get("summary") or "").strip()
+    try:
+        transcript = _render_messages_for_summary(to_drop)
+        summary_messages = [
+            SystemMessage(
+                content=SUMMARY_SYSTEM_PROMPT.format(max_chars=cfg.summary_max_chars)
+            ),
+            HumanMessage(
+                content=(
+                    (f"EXISTING SUMMARY (extend it, don't drop facts):\n"
+                     f"{prev_summary}\n\n" if prev_summary else "")
+                    + f"NEW MESSAGES TO FOLD IN:\n{transcript}"
+                )
+            ),
+        ]
+        resp = await _ainvoke_with_backoff(llm, summary_messages)
+        new_summary = _cap_summary(_text_of(resp.content), cfg.summary_max_chars)
+    except Exception as e:
+        # Keep the full history this turn; the next terminal hop retries.
+        logger.warning("[compact] summarization failed, skipping: %s", e)
+        return {}
+    if not new_summary:
+        return {}
+
+    print(
+        f"[compact] dropped={len(drop_ids)} kept={len(messages) - len(drop_ids)} "
+        f"summary_chars={len(new_summary)}",
+        flush=True,
+    )
+    return {
+        "messages": [RemoveMessage(id=i) for i in drop_ids],
+        "summary": new_summary,
+    }
 
 
 async def _ainvoke_with_backoff(llm_with_tools, messages, max_attempts: int = 6):
@@ -1511,56 +1628,11 @@ async def _build_graph(user_id: str = "default"):
         """Terminal hop: bound the persisted checkpoint for this thread.
 
         Summarizes the oldest turns into the rolling `summary` and emits
-        RemoveMessage for them so the stored checkpoint stays small. No-op when
-        disabled or under threshold. Failures are swallowed (compaction must
-        never break a turn) — the reply has already been produced upstream.
+        RemoveMessage for them so the stored checkpoint stays small. Logic lives
+        in the module-level _compact_state so it can be tested without building
+        a graph; the node just supplies the summarization model.
         """
-        if not _compaction_enabled():
-            return {}
-        messages = state["messages"]
-        trigger_tokens, keep_tokens, trigger_msgs = _compaction_settings()
-        cut = _choose_compaction_cut(
-            messages,
-            trigger_tokens=trigger_tokens,
-            keep_tokens=keep_tokens,
-            trigger_msgs=trigger_msgs,
-        )
-        if cut <= 0:
-            return {}
-        to_drop = messages[:cut]
-        drop_ids = [m.id for m in to_drop if getattr(m, "id", None)]
-        if not drop_ids:
-            return {}
-        prev_summary = (state.get("summary") or "").strip()
-        try:
-            transcript = _render_messages_for_summary(to_drop)
-            summary_messages = [
-                SystemMessage(content=SUMMARY_SYSTEM_PROMPT),
-                HumanMessage(
-                    content=(
-                        (f"EXISTING SUMMARY (extend it, don't drop facts):\n"
-                         f"{prev_summary}\n\n" if prev_summary else "")
-                        + f"NEW MESSAGES TO FOLD IN:\n{transcript}"
-                    )
-                ),
-            ]
-            resp = await _ainvoke_with_backoff(llm_synth, summary_messages)
-            new_summary = _text_of(resp.content).strip()
-        except Exception as e:
-            # Keep the full history this turn; the next terminal hop retries.
-            logger.warning("[compact] summarization failed, skipping: %s", e)
-            return {}
-        if not new_summary:
-            return {}
-        print(
-            f"[compact] dropped={len(drop_ids)} kept={len(messages) - len(drop_ids)} "
-            f"summary_chars={len(new_summary)}",
-            flush=True,
-        )
-        return {
-            "messages": [RemoveMessage(id=i) for i in drop_ids],
-            "summary": new_summary,
-        }
+        return await _compact_state(state, llm_synth)
 
     graph = StateGraph(AgentState)
     graph.add_node("agent", call_model)
