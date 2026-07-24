@@ -129,62 +129,75 @@ async def init_scheduler(adapter, app_id: str) -> AsyncIOScheduler:
 _BG_PIPELINE_LOCK = asyncio.Lock()
 
 
-async def _run_kb_pipeline() -> None:
-    """Run the in-boundary KB pipeline off the event loop (it does blocking I/O)."""
-    from kb.run import run_support_pipeline
+async def _run_under_pipeline_lock(job_name: str, body) -> None:
+    """Run a heavy background pipeline body under the single-flight lock.
 
+    NON-BLOCKING by design: if another heavy pipeline already holds the lock,
+    log and return IMMEDIATELY instead of awaiting it. A blocking ``async with``
+    kept the job alive as an APScheduler "running instance" for the entire time
+    it sat waiting on the lock — so when its own cron fired again before the lock
+    freed, ``max_instances=1`` skipped that fire ("maximum number of running
+    instances reached"), which is exactly what filled the 2026-07 logs. Deferring
+    is safe: ``coalesce=True`` plus the next scheduled fire re-runs it, and the KB
+    compile is checkpoint-as-you-go, so a skipped tick simply resumes next time.
+
+    ``body`` is a zero-arg callable returning an awaitable (a coroutine or a
+    ``asyncio.to_thread(...)`` future), so both async pipelines and blocking ones
+    run off the event loop through the same defer/lock/error path.
+
+    Race note: on a single event loop there is NO suspension point between the
+    ``.locked()`` check and acquiring an un-held ``asyncio.Lock`` (acquire returns
+    without awaiting when the lock is free), so this check-then-acquire cannot be
+    interleaved by another coroutine here — it is race-free.
+    """
+    if _BG_PIPELINE_LOCK.locked():
+        logger.info(
+            "[bg] %s deferred: another background pipeline is running", job_name
+        )
+        return
     try:
         async with _BG_PIPELINE_LOCK:
-            await asyncio.to_thread(run_support_pipeline)
+            await body()
     except Exception as e:  # never let a pipeline run crash the scheduler
         # exc_info=True so the FULL traceback lands in Cloud Logging — without
         # it we only get "<Type>: <msg>" and the real failure stays hidden.
         logger.error(
-            "[kb.run] support pipeline failed: %s: %s",
-            type(e).__name__, e, exc_info=True,
+            "[bg] %s failed: %s: %s", job_name, type(e).__name__, e, exc_info=True
         )
+
+
+async def _run_kb_pipeline() -> None:
+    """Run the in-boundary KB pipeline off the event loop (it does blocking I/O)."""
+    from kb.run import run_support_pipeline
+
+    await _run_under_pipeline_lock(
+        "kb_support_pipeline", lambda: asyncio.to_thread(run_support_pipeline)
+    )
 
 
 async def _run_kb_engineering_pipeline() -> None:
     """Run the in-boundary engineering-knowledge sync off the event loop."""
     from kb.run import run_engineering_pipeline
 
-    try:
-        async with _BG_PIPELINE_LOCK:
-            await asyncio.to_thread(run_engineering_pipeline)
-    except Exception as e:  # never let a pipeline run crash the scheduler
-        logger.error(
-            "[kb.run] engineering pipeline failed: %s: %s",
-            type(e).__name__, e, exc_info=True,
-        )
+    await _run_under_pipeline_lock(
+        "kb_engineering_pipeline", lambda: asyncio.to_thread(run_engineering_pipeline)
+    )
 
 
 async def _run_tuning_cycle() -> None:
     """Run the prompt self-tuning cycle off the event loop."""
     from selftune.loop import run_tuning_cycle
 
-    try:
-        async with _BG_PIPELINE_LOCK:
-            await asyncio.to_thread(run_tuning_cycle)
-    except Exception as e:  # never let a tuning run crash the scheduler
-        logger.error(
-            "[selftune] cycle failed: %s: %s",
-            type(e).__name__, e, exc_info=True,
-        )
+    await _run_under_pipeline_lock(
+        "selftune_cycle", lambda: asyncio.to_thread(run_tuning_cycle)
+    )
 
 
 async def _run_tracker_triage() -> None:
     """Diagnose new/changed DH Tech Issue Tracker rows; park the results."""
     from tracker_triage import run_triage_batch
 
-    try:
-        async with _BG_PIPELINE_LOCK:
-            await run_triage_batch()
-    except Exception as e:  # never let a triage run crash the scheduler
-        logger.error(
-            "[tracker.triage] batch failed: %s: %s",
-            type(e).__name__, e, exc_info=True,
-        )
+    await _run_under_pipeline_lock("tracker_triage", run_triage_batch)
 
 
 def _register_job(task: dict) -> None:

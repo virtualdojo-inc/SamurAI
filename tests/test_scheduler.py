@@ -708,31 +708,31 @@ class TestResolveConversationRef:
         mock_adapter.continue_conversation.assert_called_once()
 
 
-# ── background-pipeline serialization (2026-07 429-storm fix) ─────────────
+# ── background-pipeline serialization + non-blocking defer ────────────────
+# Both call Gemini; overlapping runs saturated the model quota (429 storms) and
+# starved live requests into Cloud Run 504s, so at most one heavy pipeline may
+# run at a time. The lock is NON-BLOCKING: a pipeline that fires while another
+# holds the lock DEFERS (returns immediately) instead of queueing behind it —
+# queueing kept the job alive as an APScheduler "running instance" and tripped
+# max_instances=1 into "skipped" storms. coalesce + the next fire re-run it.
 
 
 @pytest.mark.asyncio
-async def test_background_pipelines_are_serialized(monkeypatch):
-    """The KB compile and the tracker triage must not run concurrently — both
-    call Gemini, and overlapping runs saturated the model quota (429 storms)
-    and starved live requests into Cloud Run 504s."""
+async def test_background_pipelines_do_not_run_concurrently(monkeypatch):
+    """Firing two heavy pipelines at once must not run both concurrently — the
+    second sees the lock held and defers, so exactly one runs this tick."""
     import asyncio
-    import time as _time
 
     import kb.run as kb_run
     import tracker_triage
 
-    intervals: list[tuple[str, float, float]] = []
+    ran: list[str] = []
 
     def fake_support_pipeline():
-        t0 = _time.monotonic()
-        _time.sleep(0.1)
-        intervals.append(("kb", t0, _time.monotonic()))
+        ran.append("kb")
 
     async def fake_triage_batch():
-        t0 = _time.monotonic()
-        await asyncio.sleep(0.1)
-        intervals.append(("triage", t0, _time.monotonic()))
+        ran.append("triage")
 
     monkeypatch.setattr(kb_run, "run_support_pipeline", fake_support_pipeline)
     monkeypatch.setattr(tracker_triage, "run_triage_batch", fake_triage_batch)
@@ -742,6 +742,58 @@ async def test_background_pipelines_are_serialized(monkeypatch):
         scheduler_module._run_tracker_triage(),
     )
 
-    assert len(intervals) == 2
-    first, second = sorted(intervals, key=lambda x: x[1])
-    assert first[2] <= second[1], f"pipelines overlapped: {intervals}"
+    # The first to acquire the lock runs; the other defers rather than queueing.
+    assert ran == ["kb"], f"expected only the lock-winner to run, got {ran}"
+    assert not scheduler_module._BG_PIPELINE_LOCK.locked()
+
+
+@pytest.mark.asyncio
+async def test_pipelines_run_when_lock_is_free(monkeypatch):
+    """Fired sequentially (lock free each time), every pipeline runs normally."""
+    import kb.run as kb_run
+    import tracker_triage
+
+    ran: list[str] = []
+    monkeypatch.setattr(kb_run, "run_support_pipeline", lambda: ran.append("kb"))
+
+    async def fake_triage_batch():
+        ran.append("triage")
+
+    monkeypatch.setattr(tracker_triage, "run_triage_batch", fake_triage_batch)
+
+    await scheduler_module._run_kb_pipeline()
+    await scheduler_module._run_tracker_triage()
+
+    assert ran == ["kb", "triage"]
+
+
+@pytest.mark.asyncio
+async def test_run_under_pipeline_lock_defers_when_held():
+    """The helper returns immediately without running the body if the lock is
+    already held — it must NOT block waiting for it."""
+    ran = False
+
+    async def body():
+        nonlocal ran
+        ran = True
+
+    await scheduler_module._BG_PIPELINE_LOCK.acquire()
+    try:
+        await scheduler_module._run_under_pipeline_lock("test_job", body)
+    finally:
+        scheduler_module._BG_PIPELINE_LOCK.release()
+
+    assert ran is False
+
+
+@pytest.mark.asyncio
+async def test_run_under_pipeline_lock_swallows_body_errors():
+    """A failing pipeline body must not crash the scheduler or leave the lock
+    held (which would wedge every future pipeline into permanent deferral)."""
+
+    async def body():
+        raise RuntimeError("boom")
+
+    await scheduler_module._run_under_pipeline_lock("test_job", body)
+
+    assert not scheduler_module._BG_PIPELINE_LOCK.locked()
