@@ -1219,6 +1219,7 @@ class CompactionSettings(NamedTuple):
     keep_tokens: int
     trigger_msgs: int
     summary_max_chars: int
+    max_summarize_tokens: int
 
 
 def _compaction_settings() -> CompactionSettings:
@@ -1244,6 +1245,9 @@ def _compaction_settings() -> CompactionSettings:
         trigger_msgs=int(os.environ.get("SAMURAI_COMPACT_TRIGGER_MSGS", "400")),
         summary_max_chars=int(
             os.environ.get("SAMURAI_COMPACT_SUMMARY_MAX_CHARS", "6000")
+        ),
+        max_summarize_tokens=int(
+            os.environ.get("SAMURAI_COMPACT_MAX_SUMMARIZE_TOKENS", "60000")
         ),
     )
 
@@ -1346,6 +1350,43 @@ def _cap_summary(text: str, max_chars: int) -> str:
     return head.rstrip() + "\n[summary truncated to stay within the compaction budget]"
 
 
+def _select_summarizable_tail(to_drop, max_tokens: int) -> int:
+    """Index into `to_drop` splitting it into [discard unsummarized | summarize].
+
+    The drop region is UNBOUNDED — steady-state compaction drops only the delta
+    between trigger and keep (~50k tokens), but the FIRST compaction of a thread
+    that is already runaway drops everything older than the keep window. On the
+    2.5M-token thread from the 2026-07 logs that is a ~2M-token transcript in a
+    single summarization call: past the model's context window, so the call
+    raises, the error is swallowed, and the thread NEVER compacts — the feature
+    silently no-ops on exactly the threads it exists for.
+
+    So bound the payload: summarize the NEWEST slice that fits `max_tokens`
+    (nearest the kept window, most likely to still matter) and remove anything
+    older without summarizing it. Discarding that tail is not a context
+    regression — messages beyond `_MAX_INPUT_TOKENS` were ALREADY invisible to
+    the model, since call_model trims to that budget before every request. This
+    also makes catch-up converge in ONE pass instead of stalling forever.
+
+    In steady state the whole drop region fits the budget and nothing is
+    discarded unsummarized; this path only engages on catch-up.
+    """
+    n = len(to_drop)
+    total = 0
+    start = n
+    for i in range(n - 1, -1, -1):
+        t = _approx_tokens(to_drop[i])
+        # Always take at least the newest message, even if it alone busts the
+        # budget — otherwise a single huge message would summarize nothing.
+        if start < n and total + t > max_tokens:
+            break
+        total += t
+        start = i
+        if total >= max_tokens:
+            break
+    return start
+
+
 async def _compact_state(state, llm) -> dict:
     """Core of the `compact` graph node, module-level so it is unit-testable
     (the node itself is a closure over the graph's models).
@@ -1373,9 +1414,15 @@ async def _compact_state(state, llm) -> dict:
     if not drop_ids:
         return {}
 
+    # Bound the summarization payload so a runaway thread can't produce a call
+    # bigger than the model's context window (see _select_summarizable_tail).
+    split = _select_summarizable_tail(to_drop, cfg.max_summarize_tokens)
+    to_summarize = to_drop[split:]
+    discarded_unsummarized = split
+
     prev_summary = (state.get("summary") or "").strip()
     try:
-        transcript = _render_messages_for_summary(to_drop)
+        transcript = _render_messages_for_summary(to_summarize)
         summary_messages = [
             SystemMessage(
                 content=SUMMARY_SYSTEM_PROMPT.format(max_chars=cfg.summary_max_chars)
@@ -1397,8 +1444,12 @@ async def _compact_state(state, llm) -> dict:
     if not new_summary:
         return {}
 
+    # discarded_unsummarized > 0 means this was a catch-up pass on an already-
+    # runaway thread; it should be 0 in steady state. Logged so a silent,
+    # unbounded history discard can never happen without a trace.
     print(
         f"[compact] dropped={len(drop_ids)} kept={len(messages) - len(drop_ids)} "
+        f"summarized={len(to_summarize)} discarded_unsummarized={discarded_unsummarized} "
         f"summary_chars={len(new_summary)}",
         flush=True,
     )

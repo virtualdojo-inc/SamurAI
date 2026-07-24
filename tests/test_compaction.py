@@ -148,6 +148,76 @@ def test_compacted_window_stays_under_inference_trim_budget(monkeypatch):
     assert cfg.trigger_tokens < agent_module._MAX_INPUT_TOKENS
 
 
+# ── _select_summarizable_tail (bounded summarization payload) ─────────────
+
+
+def _fat_thread(turns, chars):
+    msgs = []
+    for i in range(turns):
+        msgs.append(_human("x" * chars, i))
+        msgs.append(_ai("y" * chars, i))
+    return msgs
+
+
+def test_steady_state_summarizes_the_whole_drop_region():
+    """When the drop region fits the per-pass budget (normal organic growth),
+    nothing may be discarded unsummarized."""
+    to_drop = _fat_thread(20, 300)
+    split = agent_module._select_summarizable_tail(to_drop, 100_000)
+    assert split == 0
+
+
+def test_catch_up_bounds_the_summarization_payload():
+    """A runaway thread's first compaction must NOT build one giant call. Before
+    this bound, a 2.5M-token thread produced a ~2M-token summarization request —
+    past the model's context window, so it raised, the error was swallowed, and
+    the thread never compacted at all."""
+    to_drop = _fat_thread(1500, 2340)  # ~2.3M est tokens, like the logged thread
+    budget = 60_000
+    split = agent_module._select_summarizable_tail(to_drop, budget)
+
+    assert split > 0, "expected the ancient tail to be discarded unsummarized"
+    to_summarize = to_drop[split:]
+    est = agent_module._approx_tokens(to_summarize)
+    assert est <= budget * 1.1, f"payload {est} exceeded budget {budget}"
+    # And the slice kept is the NEWEST one, nearest the retained window.
+    assert to_summarize[-1] is to_drop[-1]
+
+
+def test_always_summarizes_at_least_one_message():
+    """A single message larger than the whole budget must still be summarized,
+    not silently skipped into a no-op."""
+    huge = [_human("z" * 500_000, 0)]
+    assert agent_module._select_summarizable_tail(huge, 1000) == 0
+
+
+def test_summarizable_tail_handles_empty_region():
+    assert agent_module._select_summarizable_tail([], 1000) == 0
+
+
+@pytest.mark.asyncio
+async def test_compact_state_bounds_the_prompt_on_a_runaway_thread(monkeypatch):
+    """End-to-end: the transcript actually handed to the model is bounded, and
+    the removal still covers the ENTIRE drop region (so the thread converges in
+    one pass rather than stalling)."""
+    monkeypatch.delenv("SAMURAI_COMPACT_MODE", raising=False)
+    monkeypatch.setenv("SAMURAI_COMPACT_MAX_SUMMARIZE_TOKENS", "20000")
+
+    msgs = _fat_thread(1200, 2340)  # far past any threshold
+    llm = _FakeLLM("caught up")
+    update = await agent_module._compact_state({"messages": msgs}, llm)
+
+    assert update, "runaway thread must compact, not silently no-op"
+    prompt = llm.calls[0][-1].content
+    assert len(prompt) < 400_000, f"summarization prompt too big: {len(prompt)} chars"
+
+    removed = {m.id for m in update["messages"]}
+    kept = [m for m in msgs if m.id not in removed]
+    cfg = agent_module._compaction_settings()
+    # Converged in ONE pass: what remains is at/below the keep window.
+    assert agent_module._approx_tokens(kept) <= cfg.trigger_tokens
+
+
 # ── _cap_summary ──────────────────────────────────────────────────────────
 
 
